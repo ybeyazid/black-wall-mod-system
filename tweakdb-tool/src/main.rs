@@ -17,6 +17,7 @@ mod kraken;
 mod names;
 mod template;
 mod toml;
+mod tweak_source;
 mod tweakdb;
 mod tweakxl;
 mod ui;
@@ -49,6 +50,7 @@ USO:
     tweakdb-tool check  <changeset> [<file|ep1>]
     tweakdb-tool apply-yaml <arquivo.yaml> [<file|ep1>] [-o <saida>] [--check]
     tweakdb-tool apply-toml <arquivo.toml> [<file|ep1>] [-o <saida>] [--check]
+    tweakdb-tool apply-tweak <arquivo.tweak> [<file|ep1>] [-o <saida>] [--check]
     tweakdb-tool install [<patched.bin>] [ep1]
     tweakdb-tool uninstall [ep1]
     tweakdb-tool backup  [ep1]
@@ -99,6 +101,11 @@ COMANDOS:
     apply-toml Igual ao apply-yaml, mas em TOML (front-end nativo, zero-dep). Record
                = [Items.MeuItem]; flat = `chave = valor`; `'$base' = '...'`; op de
                array = item `{ '!append' = 'X' }` num array. Mesma engine/saida.
+    apply-tweak Formato-texto NATIVO `.tweak` do TweakXL (3ª via de autoria, distinta
+               de YAML/TOML): `package Nome` opcional, `using A, B` opcional,
+               `Items.Novo : Items.Base { int dano = 50; tags += \"X\"; }` (grupos com
+               herança opcional, flats tipados `=`/`+=`/`-=`). Fora do escopo: valor
+               INLINE (grupo aninhado) e pacotes de schema (RTDB)/query.
     install    Copia um tweakdb editado para o lugar que o JOGO lê (r6/cache/).
                Sem arquivo, instala o `<...>.patched.bin` padrão. Salva o pristino
                (.orig) na 1ª vez e NUNCA o sobrescreve. Valide o efeito in-game.
@@ -154,6 +161,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "check" | "validate" => cmd_check(&args[1..]),
         "apply-yaml" | "yaml" => cmd_apply_yaml(&args[1..]),
         "apply-toml" | "toml" => cmd_apply_toml(&args[1..]),
+        "apply-tweak" | "tweak" => cmd_apply_tweak(&args[1..]),
         "install" => cmd_install(&args[1..]),
         "uninstall" | "restore" => cmd_uninstall(&args[1..]),
         "backup" => cmd_backup(&args[1..]),
@@ -1186,6 +1194,39 @@ fn cmd_apply_toml(args: &[String]) -> Result<(), String> {
     apply_decl(args, "apply-toml", crate::toml::parse)
 }
 
+/// `apply-tweak <arquivo.tweak> [db] [-o out] [--check]` — TweakXL `#48`, a 3ª via de autoria
+/// (formato-texto nativo, distinto de YAML/TOML). Ao contrário de `apply_decl`, não passa pelo
+/// `Node`/`template::expand` (o `.tweak` não tem `$instances`, e `tweak_source::parse` já produz
+/// `Vec<Op>` direto) — o resto (abrir DB, aplicar, reportar, gravar) é idêntico, por isso
+/// compartilha [`apply_ops_and_report`] com `apply_decl`.
+fn cmd_apply_tweak(args: &[String]) -> Result<(), String> {
+    let mut pos: Vec<&str> = Vec::new();
+    let mut out_path: Option<PathBuf> = None;
+    let mut check_only = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--output" => out_path = Some(PathBuf::from(it.next().ok_or("-o exige um caminho")?)),
+            "--check" => check_only = true,
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            other if !other.starts_with('-') => pos.push(other),
+            other => return Err(format!("opção desconhecida em apply-tweak: '{other}'")),
+        }
+    }
+    let src_path = *pos.first().ok_or("apply-tweak exige <arquivo.tweak>")?;
+    let file = pos.get(1).copied();
+
+    let text = std::fs::read_to_string(src_path).map_err(|e| format!("lendo {src_path}: {e}"))?;
+    let ops = crate::tweak_source::parse(&text)?;
+    if ops.is_empty() {
+        return Err(format!("{src_path} não produziu nenhuma operação"));
+    }
+    apply_ops_and_report("apply-tweak", src_path, file, out_path, check_only, ops)
+}
+
 /// Núcleo comum de `apply-yaml`/`apply-toml`: lê o arquivo declarativo, parseia
 /// pelo `parse` dado (YAML ou TOML → mesma AST), interpreta e aplica no Model.
 fn apply_decl(
@@ -1219,7 +1260,19 @@ fn apply_decl(
     if ops.is_empty() {
         return Err(format!("{src_path} não produziu nenhuma operação"));
     }
+    apply_ops_and_report(cmd, src_path, file, out_path, check_only, ops)
+}
 
+/// Cauda comum de `apply-yaml`/`apply-toml`/`apply-tweak`: abre o DB, aplica a `Vec<Op>` já
+/// interpretada no `Model`, reporta ok/erro por operação, e grava (a menos que `--check`).
+fn apply_ops_and_report(
+    cmd: &str,
+    src_path: &str,
+    file: Option<&str>,
+    out_path: Option<PathBuf>,
+    check_only: bool,
+    ops: Vec<crate::tweakxl::Op>,
+) -> Result<(), String> {
     let names = load_names(false).ok_or_else(|| format!("{cmd} precisa da lista de nomes (tweakdbstr.kark)"))?;
     let in_path = resolve_file(file);
     let db = open(file)?;
@@ -1419,6 +1472,9 @@ mod tests {
             | EditOp::Remove(v)
             | EditOp::AppendFrom(v)
             | EditOp::PrependFrom(v) => v,
+            // `!remove-all` não tem valor (limpa o array inteiro) — só alcançável via YAML
+            // (`emit_array_ops`), o parser de changeset `+=`/`-=`/`=` da CLI nunca constrói isto.
+            EditOp::RemoveAll => "",
         }
     }
     fn is_append(e: &ChangeEdit) -> bool {

@@ -7,7 +7,7 @@
 100% Rust + redscript. No virtual machine, no Wine, no Windows streaming — the
 mods run directly inside the native macOS build of the game.
 
-> **Status: BETA 0.1.3** — early but real. This README is honest about what
+> **Status: BETA 0.1.4** — early but real. This README is honest about what
 > works today versus what is on the roadmap. Single-player only.
 
 ---
@@ -15,7 +15,7 @@ mods run directly inside the native macOS build of the game.
 ## What it does
 
 BWMS is a native runtime and a set of data tools for the Apple Silicon build of
-the game. As of 0.1.3:
+the game. As of 0.1.4:
 
 - **In-game console + ImGui overlay** — a developer console rendered over the
   game via a Metal-based ImGui overlay. It is a **native command console, not a
@@ -148,18 +148,33 @@ or run `extras/DESINSTALAR.command`.
 ## Repository layout
 
 ```
-cp77-console/            The runtime dylib (in-game console + ImGui overlay)
+cp77-console/            The runtime dylib (in-game console, ImGui overlay, native bridges)
 bwms-core/               Shared library (classify / theme / apply core)
 bwms/                    Unified command-line tool
-archive-tool/            Read / extract .archive containers
+bwms-hashes/             Single source of truth for hashing (leaf crate)
+bwms-catalog/            Coverage catalogue + native-symbol checks
+bwms-scoreboard/         Parser for the coverage scoreboard
+archive-tool/            Read / extract .archive containers (RDAR / CR2W / Kraken)
 tweakdb-tool/            Read / edit tweakdb.bin
 input-loader/            Merge keybind / input definitions
 mac-mod-manager/         Install / list / remove mods
-r6/scripts/blackwall-mods/   redscript sources (compiled at install time)
-example-rust-plugin/     Example native plugin
-INSTALAR.command         End-user installer (entry point)
-bwms-install.sh          Installer script (terminal / scriptable)
+bwms-helper/             Small privileged-free helper used by the installer
+bwms-proceed/            Boot / input helper used by the automated test harness
+example-plugin/          Example native plugin (C ABI), for third-party authors
+                         (was `example-rust-plugin/` up to 0.1.3)
+r6/scripts/blackwall-mods/
+                         redscript sources, compiled at install time — the same
+                         set the released package ships (production only; no test
+                         or diagnostic files). The path mirrors where they land
+                         inside the game.
+docs/                    Modder API, third-party mod sources, public changelog
+INSTALAR.command         End-user installer (double-click entry point)
+bwms-install.sh          Same installer, for terminal / scripting
 ```
+
+Every crate is its own workspace (`cargo build --release` inside it). The runtime dylib is the
+one exception — build it with `cp77-console/build-core.sh`, never bare `cargo build`, because
+macOS 26+ needs a symbol-table alignment fix that the script applies.
 
 ---
 

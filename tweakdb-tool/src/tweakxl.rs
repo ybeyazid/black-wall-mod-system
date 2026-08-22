@@ -40,6 +40,10 @@ pub enum EditOp {
     PrependOnce(String),
     /// `-= valor` / `!remove` — remove os elementos iguais (igualdade de bytes).
     Remove(String),
+    /// `!remove-all` — limpa o array INTEIRO, incondicionalmente (`TweakChangeset::
+    /// RemoveAllElements`, fonte real: `entry.deleteAll = true`, SEM valor nenhum — distinto de
+    /// `!remove`, que só tira elementos IGUAIS a um valor dado).
+    RemoveAll,
     /// `!append-from` / `!merge` — anexa ao FIM os elementos de outro flat array
     /// (pelo nome). O TweakXL trata `!merge` e `!append-from` como o mesmo op.
     AppendFrom(String),
@@ -47,30 +51,146 @@ pub enum EditOp {
     PrependFrom(String),
 }
 
+/// Versão do jogo suportada pelo BWMS (`CLAUDE.md`/`crashreport.rs`: "v2.31", golden version
+/// já usada pelo gate de boot). `TweakContext.hpp` real constrói o triplet a partir do
+/// `Core::SemvVer` do produto (major.minor.patch, cast pra `uint8_t`) — o CP2077 não publica
+/// um componente patch oficial, então usamos `.0`.
+pub(crate) const GAME_VERSION: (u32, u32, u32) = (2, 31, 0);
+
 /// Contexto da interpretação: a origem (caminho do arquivo, p/ o hash do nome
-/// inline) e o contador por-hash que espelha o `m_inlineIndexSuffix` do TweakXL.
+/// inline), o contador por-hash que espelha o `m_inlineIndexSuffix` do TweakXL, e
+/// `is_ep1`/`game_version` — avaliação real de `$dlc: EP1`/`$game` (2026-08-05, achado de
+/// auditoria: o código antigo IGNORAVA `$game`/`$dlc` mesmo em runtime, onde dá pra saber de
+/// verdade — um mod gateado `$dlc: EP1` aplicava sempre, sem checar se Phantom Liberty está
+/// instalado; um mod gateado `$game: ">=3.0"` aplicava numa versão do jogo que não suporta).
+/// Fonte de verdade real do TweakXL (`TweakContext.hpp`): `CheckInstalledDLC(cond)` só retorna
+/// true se `cond=="EP1"` E `IsEP1()` (native global real do jogo, `orphans.script:39008`) for
+/// true, ou se `cond` for vazio; `CheckGameVersion(cond)` chama `semver::range::satisfies` (grade
+/// NPM completa: `^`/`~`/`x`/hífen/`||`). Implementamos aqui o SUBCONJUNTO real de uso — operador
+/// de comparação único (`>=`/`<=`/`>`/`<`/`=`) ou versão nua (match parcial por componente
+/// especificado, ex.: `"2"` casa qualquer `2.x.x`, `"2.31"` casa qualquer `2.31.x`) — documentado
+/// como simplificação deliberada (ver [`check_game_version`]), não a grade NPM inteira (`^`/`~`/
+/// `x`/hífen/`||` nunca vistos em nenhum `.xl`/`.yaml` real do projeto).
 struct Ctx<'a> {
     source: &'a str,
     inline_counter: HashMap<String, u32>,
+    is_ep1: bool,
+    game_version: (u32, u32, u32),
 }
 
-/// Interpreta um documento já parseado em uma lista ordenada de ops.
+/// Avalia uma condição `$game` (string do YAML) contra a versão do jogo. Suporta:
+/// - operador de comparação + versão (`">=2.0"`, `"<=2.31.0"`, `">2.0"`, `"<3.0"`, `"=2.31"`):
+///   compara o TRIPLET completo (componentes ausentes na versão-alvo viram 0).
+/// - versão nua sem operador (`"2"`, `"2.31"`, `"2.31.0"`): match PARCIAL — só os componentes
+///   informados precisam bater (`"2"` casa qualquer versão com major==2).
+///
+/// NÃO implementa a grade NPM completa que `semver::range::satisfies` (real) suporta (`^`/`~`/
+/// `x`/hífen-range/`||` OR/espaço-AND) — nenhum `.xl`/`.yaml` do corpus deste projeto usa essas
+/// formas, e sem exemplo real pra testar contra, implementar às cegas arriscaria parsear errado
+/// silenciosamente (categoria de bug que este próprio fix existe pra evitar). Condição vazia ou
+/// não-reconhecível (não bate nenhum padrão acima) passa sempre (`true`) — mesmo fallback seguro
+/// que o projeto já usa pra `$dlc` com condição vazia.
+fn check_game_version(cond: &str, game: (u32, u32, u32)) -> bool {
+    let cond = cond.trim();
+    if cond.is_empty() {
+        return true;
+    }
+    for op in [">=", "<=", ">", "<", "="] {
+        if let Some(rest) = cond.strip_prefix(op) {
+            let target = parse_version_triplet(rest.trim());
+            return match op {
+                ">=" => game >= target,
+                "<=" => game <= target,
+                ">" => game > target,
+                "<" => game < target,
+                "=" => game == target,
+                _ => unreachable!(),
+            };
+        }
+    }
+    // Versão nua: match parcial só nos componentes informados.
+    let parts: Vec<&str> = cond.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 || !parts.iter().all(|p| p.parse::<u32>().is_ok()) {
+        return true; // não reconhecível — mesmo fallback seguro do resto da função
+    }
+    let major: u32 = parts[0].parse().unwrap();
+    if major != game.0 {
+        return false;
+    }
+    if let Some(minor_s) = parts.get(1) {
+        let minor: u32 = minor_s.parse().unwrap();
+        if minor != game.1 {
+            return false;
+        }
+        if let Some(patch_s) = parts.get(2) {
+            let patch: u32 = patch_s.parse().unwrap();
+            if patch != game.2 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn parse_version_triplet(s: &str) -> (u32, u32, u32) {
+    let mut parts = s.trim().splitn(3, '.');
+    let major = parts.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+    (major, minor, patch)
+}
+
+/// Interpreta um documento já parseado em uma lista ordenada de ops. `$dlc: EP1` NUNCA passa
+/// (sem contexto de instalação real) — use [`interpret_from_ctx`] pra avaliação real.
 pub fn interpret(root: &Node) -> Result<Vec<Op>, String> {
     interpret_from(root, "")
 }
 
 /// Como [`interpret`], mas recebe a ORIGEM (caminho do arquivo) — entra no hash
-/// do nome sintético dos records inline, igual ao `m_path` do TweakXL.
+/// do nome sintético dos records inline, igual ao `m_path` do TweakXL. `$dlc: EP1` sempre
+/// passa (compat com chamadores antigos/offline, que não sabem se EP1 está instalado).
 pub fn interpret_from(root: &Node, source: &str) -> Result<Vec<Op>, String> {
+    interpret_from_ctx(root, source, true)
+}
+
+/// Como [`interpret_from`], mas com avaliação REAL de `$dlc: EP1` — `is_ep1` deve vir de
+/// `IsEP1()` (native do jogo) quando chamado do runtime ao vivo (`cp77-console`); offline,
+/// passar `true` preserva o comportamento antigo (sem contexto de instalação real).
+pub fn interpret_from_ctx(root: &Node, source: &str, is_ep1: bool) -> Result<Vec<Op>, String> {
     let Kind::Map(entries) = &root.kind else {
         return Err("o documento precisa ser um mapa de records/flats".into());
     };
-    let mut ctx = Ctx { source, inline_counter: HashMap::new() };
+    let mut ctx = Ctx { source, inline_counter: HashMap::new(), is_ep1, game_version: GAME_VERSION };
     let mut ops = Vec::new();
     for (key, node) in entries {
         process_entry(key, node, true, &mut ops, &mut ctx)?;
     }
     Ok(ops)
+}
+
+/// Espelha `App::YamlReader::CheckConditions` real (`YamlReader.cpp:87-114`): olha `$game`/`$dlc`
+/// nas entradas do node e devolve `false` se algum falhar — quem chama deve pular o node INTEIRO
+/// (record ou bloco de props), não só a chave da condição (bug antigo: só a chave era ignorada,
+/// os irmãos continuavam sendo processados incondicionalmente).
+fn check_conditions(entries: &[(String, Node)], ctx: &Ctx) -> bool {
+    for (k, v) in entries {
+        if k == "$dlc" {
+            if let Kind::Scalar(cond) = &v.kind {
+                let ok = if cond == "EP1" { ctx.is_ep1 } else { cond.is_empty() };
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        if k == "$game" {
+            if let Kind::Scalar(cond) = &v.kind {
+                if !check_game_version(cond, ctx.game_version) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn process_entry(path: &str, node: &Node, top: bool, ops: &mut Vec<Op>, ctx: &mut Ctx) -> Result<(), String> {
@@ -88,6 +208,12 @@ fn process_map(path: &str, node: &Node, top: bool, ops: &mut Vec<Op>, ctx: &mut 
     let Kind::Map(entries) = &node.kind else {
         return Ok(());
     };
+
+    // `CheckConditions` real: se `$game`/`$dlc` falhar, o node INTEIRO é pulado (record ou bloco
+    // de props) — checado ANTES de qualquer ramo (record/scalar/aninhado), igual ao original.
+    if !check_conditions(entries, ctx) {
+        return Ok(());
+    }
 
     if node.get("$base").is_some() || node.get("$type").is_some() {
         if top {
@@ -116,10 +242,10 @@ fn process_map(path: &str, node: &Node, top: bool, ops: &mut Vec<Op>, ctx: &mut 
         }
     }
 
-    // Caminho aninhado: cada filho vira um flat `path.filho`.
+    // Caminho aninhado: cada filho vira um flat `path.filho`. `$game`/`$dlc` já foram
+    // AVALIADOS lá em cima (check_conditions) — aqui só pulamos as chaves em si (não são props).
     for (k, v) in entries {
         if k == "$game" || k == "$dlc" {
-            // Condições de game/DLC: offline aplicamos sempre (não dá pra avaliar).
             continue;
         }
         if k.starts_with('$') {
@@ -242,6 +368,12 @@ fn emit_array_ops(path: &str, items: &[Node], ops: &mut Vec<Op>, ctx: &mut Ctx) 
             .tag
             .as_deref()
             .ok_or_else(|| format!("'{path}': item sem tag numa lista de operações (!append etc.)"))?;
+        // `!remove-all` (fonte real: `YamlReader.cpp::RemoveAllOp`) IGNORA o valor do item — a
+        // única tag desta família sem operando. As outras exigem um valor escalar.
+        if tag == "!remove-all" {
+            ops.push(Op::Edit { flat: path.to_string(), op: EditOp::RemoveAll });
+            continue;
+        }
         let v = it
             .as_str()
             .ok_or_else(|| format!("'{path}': operação '{tag}' espera valor escalar (ou record inline)"))?
@@ -251,7 +383,7 @@ fn emit_array_ops(path: &str, items: &[Node], ops: &mut Vec<Op>, ctx: &mut Ctx) 
             "!append-once" => EditOp::AppendOnce(v),
             "!prepend" => EditOp::Prepend(v),
             "!prepend-once" => EditOp::PrependOnce(v),
-            "!remove" | "!remove-all" => EditOp::Remove(v),
+            "!remove" => EditOp::Remove(v),
             "!append-from" | "!merge" => EditOp::AppendFrom(v),
             "!prepend-from" => EditOp::PrependFrom(v),
             other => return Err(format!("'{path}': tag de array desconhecida '{other}'")),
@@ -312,6 +444,7 @@ mod tests {
             EditOp::Prepend(v) => format!("prepend {v}"),
             EditOp::PrependOnce(v) => format!("prepend-once {v}"),
             EditOp::Remove(v) => format!("remove {v}"),
+            EditOp::RemoveAll => "remove-all".to_string(),
             EditOp::AppendFrom(v) => format!("append-from {v}"),
             EditOp::PrependFrom(v) => format!("prepend-from {v}"),
         }
@@ -340,6 +473,19 @@ mod tests {
                 "edit Items.A.tags append-from Items.C.tags", // !merge === !append-from
             ]
         );
+    }
+
+    #[test]
+    fn tag_remove_all_ignora_o_valor_do_item_e_nao_exige_um() {
+        // Fonte real (`YamlReader.cpp::RemoveAllOp`) chama `RemoveAllElements(flatId)` direto,
+        // SEM ler `itemData` — nenhum valor associado, diferente de `!remove`. O parser não pode
+        // exigir escalar aqui (item #30, TweakXL #46-#48).
+        let s = run("Items.A:\n  tags:\n    - !remove-all\n");
+        assert_eq!(s, vec!["edit Items.A.tags remove-all"]);
+        // Mesmo com um valor presente no item (alguns mods escrevem `!remove-all ~` por hábito
+        // de copiar a forma de `!remove`), o valor é ignorado — nunca deve dar erro de parse.
+        let s2 = run("Items.A:\n  tags:\n    - !remove-all Y\n");
+        assert_eq!(s2, vec!["edit Items.A.tags remove-all"]);
     }
 
     #[test]
@@ -376,5 +522,66 @@ mod tests {
         let a = run("Items.A:\n  ref:\n    $type: gamedataX_Record\n    v: 1\n");
         let b = run("Items.A:\n  ref:\n    $type: gamedataX_Record\n    v: 1\n");
         assert_eq!(a, b);
+    }
+
+    // --- $game (2026-08-05, achado de auditoria: $game era sempre ignorado mesmo em runtime) ---
+
+    #[test]
+    fn game_version_operador_comparacao() {
+        let g = GAME_VERSION; // (2, 31, 0)
+        assert!(check_game_version(">=2.0", g));
+        assert!(check_game_version(">=2.31.0", g));
+        assert!(!check_game_version(">=3.0", g));
+        assert!(check_game_version("<=2.31.0", g));
+        assert!(!check_game_version("<=2.30", g));
+        assert!(check_game_version(">2.0", g));
+        assert!(!check_game_version(">2.31.0", g)); // igual não é maior
+        assert!(check_game_version("<3.0", g));
+        assert!(!check_game_version("<2.31", g));
+        assert!(check_game_version("=2.31.0", g));
+        assert!(!check_game_version("=2.30.0", g));
+    }
+
+    #[test]
+    fn game_version_nua_match_parcial() {
+        let g = GAME_VERSION; // (2, 31, 0)
+        assert!(check_game_version("2", g)); // só major
+        assert!(!check_game_version("1", g));
+        assert!(check_game_version("2.31", g)); // major+minor
+        assert!(!check_game_version("2.30", g));
+        assert!(check_game_version("2.31.0", g)); // exato
+        assert!(!check_game_version("2.31.1", g));
+    }
+
+    #[test]
+    fn game_version_vazia_ou_nao_reconhecivel_passa_sempre() {
+        let g = GAME_VERSION;
+        assert!(check_game_version("", g));
+        assert!(check_game_version("latest", g)); // grade NPM não suportada, fallback seguro
+    }
+
+    #[test]
+    fn dlc_e_game_bloqueiam_o_node_inteiro() {
+        // $dlc: EP1 sem EP1 instalado (is_ep1=false) -> node inteiro pulado, zero ops.
+        let root = yaml::parse("Items.A:\n  $dlc: EP1\n  damage: 10\n").unwrap();
+        let root = crate::template::expand(&root).unwrap();
+        let ops = interpret_from_ctx(&root, "test.yaml", false).unwrap();
+        assert!(summarize(&ops).is_empty(), "ops: {:?}", summarize(&ops));
+
+        // $dlc: EP1 com EP1 instalado (is_ep1=true) -> passa.
+        let ops2 = interpret_from_ctx(&root, "test.yaml", true).unwrap();
+        assert_eq!(summarize(&ops2), vec!["edit Items.A.damage = 10"]);
+
+        // $game fora do range da versão suportada -> node inteiro pulado.
+        let root3 = yaml::parse("Items.A:\n  $game: \">=3.0\"\n  damage: 10\n").unwrap();
+        let root3 = crate::template::expand(&root3).unwrap();
+        let ops3 = interpret_from_ctx(&root3, "test.yaml", true).unwrap();
+        assert!(summarize(&ops3).is_empty(), "ops: {:?}", summarize(&ops3));
+
+        // $game dentro do range -> passa.
+        let root4 = yaml::parse("Items.A:\n  $game: \">=2.0\"\n  damage: 10\n").unwrap();
+        let root4 = crate::template::expand(&root4).unwrap();
+        let ops4 = interpret_from_ctx(&root4, "test.yaml", true).unwrap();
+        assert_eq!(summarize(&ops4), vec!["edit Items.A.damage = 10"]);
     }
 }

@@ -28,6 +28,16 @@ native func BwmsMenuReadySplashOff() -> Bool;
 @addField(SingleplayerMenuGameController) let m_bwmsContinued: Bool;
 @addField(SingleplayerMenuGameController) let m_bwmsMetaReady: Bool;
 
+// 2026-07-28: índice de save configurável (RE do dia: boots nesta máquina variam de 86s a 1h+
+// dependendo de quão densa é a região do mapa em que o save mais recente (index 0) está — I/O
+// genuinamente lento do SSD externo pra setores de mundo, não bug. `LoadModdedSave(saveId)` já
+// aceitava um índice desde sempre (`saves: [String]` de OnSavesForLoadReady, ordenado mais-recente-
+// primeiro, mesmo array que alimenta a lista visual do menu) — só nunca tinha sido exposto.
+// Marcador ~/.bwms-autocontinue-saveindex (conteúdo = número decimal) escolhe qual carregar; ausente
+// ou inválido = 0 (comportamento de sempre, o mais recente). Ver DATABASE.md pra próxima sessão
+// testar índices >0 (saves mais antigos) atrás desta mesma trava, procurando um que carregue rápido.
+native func BwmsAutoContinueSaveIndex() -> Int32;
+
 @addMethod(SingleplayerMenuGameController)
 public func BwmsDoContinue() -> Void {
   BwmsAcFired();
@@ -38,7 +48,24 @@ public func BwmsDoContinue() -> Void {
   let nextLoadingTypeEvt: ref<inkSetNextLoadingScreenEvent> = new inkSetNextLoadingScreenEvent();
   nextLoadingTypeEvt.SetNextLoadingScreenType(inkLoadingScreenType.FastTravel);
   this.QueueBroadcastEvent(nextLoadingTypeEvt);
-  if this.m_isModded {
+  // 2026-07-29: achado ao vivo — `m_isModded` é a flag de METADADO DO SAVE (info.isModded, gravada
+  // quando o save foi CRIADO), não o estado atual da sessão; num save real do usuário veio `false`,
+  // fazendo o índice configurável cair sempre no ramo `else` (LoadLastCheckpoint, sem índice, sempre
+  // o mais recente) mesmo com um índice != 0 pedido. `LoadModdedSave(saveId)` é a native REAL (aceita
+  // qualquer índice) — não depende de `m_isModded`, essa flag só gateia a escolha vanilla entre as 2
+  // APIs. Fix: só cair no branch vanilla (preservando o comportamento default byte-a-byte) quando o
+  // índice pedido é 0 (sem marcador ou marcador=0); um índice != 0 sempre usa LoadModdedSave, mesmo
+  // com m_isModded=false — é a ÚNICA API com índice, e é native (não deveria se importar com a flag
+  // de metadado do save alvo).
+  let idx: Int32 = BwmsAutoContinueSaveIndex();
+  if idx < 0 || idx >= this.m_savesCount {
+    idx = 0;
+  };
+  if idx != 0 {
+    Print("[autocontinue] LoadModdedSave(idx=" + ToString(idx) + " de " + ToString(this.m_savesCount) + " saves, override de índice, m_isModded=" + ToString(this.m_isModded) + ")");
+    this.LoadModdedSave(idx);
+  } else if this.m_isModded {
+    Print("[autocontinue] LoadModdedSave(idx=0, comportamento default)");
     this.LoadModdedSave(0);
   } else {
     this.GetSystemRequestsHandler().LoadLastCheckpoint(false);

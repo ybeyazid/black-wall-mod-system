@@ -138,6 +138,658 @@ public class BwmsEquipPoller extends DelayCallback {
   }
 }
 
+// axl-garment-apply: gatilho de EQUIPAR item ÚNICO, SÍNCRONO, SEM agendamento (2026-07-29).
+// `BwmsEquipPoller` acima tem crash PRÓPRIO documentado (~1min55s de execução sustentada via
+// `ds.DelayCallback(this, 0.3)` recorrente, sessão 2026-07-15) — NÃO usar pra forçar equip
+// pros hooks de "estado de item" do garment. Esta função reusa a MESMA lógica de `EquipRequest`
+// já provada end-to-end (Skill 2, 2026-07-15), mas dispara 1 VEZ SÓ via `callg`/canal (comando
+// `equiponce` em lib.rs), sem NENHUM DelayCallback/reagendamento — evita por completo o padrão
+// temporal que causou o crash do poller (o crash era da INFRAESTRUTURA de poller recorrente, não
+// do EquipRequest em si, que já rodou com sucesso quando não estava crashando).
+public static func BwmsForceEquipOnce(game: GameInstance) -> Void {
+  let want: Int32 = BwmsEquipState();
+  if want <= 0 {
+    Print("[equiponce] BwmsEquipState()<=0, nada a fazer (setar ~/.bwms-equip=1/2/3 antes)");
+    return;
+  };
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiponce] player indefinido");
+    return;
+  };
+  let id: TweakDBID = TDBID.None();
+  if want == 1 { id = t"Items.GOG_DLC_Jacket_Legendary"; };
+  if want == 2 { id = t"Items.Fixer_01_Set_TShirt"; };
+  if want == 3 { id = t"Items.Coat_04_rich_02_Crafting"; };
+  if !TDBID.IsValid(id) {
+    Print("[equiponce] sel=" + ToString(want) + " sem item mapeado");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(id);
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if IsDefined(es) {
+    es.QueueRequest(req);
+    Print("[equiponce] EquipRequest enfileirado 1x, sem agendamento (sel=" + ToString(want) + ")");
+  } else {
+    Print("[equiponce] EquipmentSystem.GetInstance falhou");
+  };
+}
+
+// axl-transmog-apply / axl-garment-apply (2026-08-02, pesquisa continuada via /goal): via NOVA,
+// contorna `EquipmentSystem::QueueRequest` por completo em vez de tentar mitigar o crash dele.
+// RE offline (mesma sessão) fechou `QueueRequest` como beco-sem-saída: `CClassFunction::GetInvokable()`
+// retorna NULL pro descritor RTTI específico dessa função (bit4 de `unkAC`/+0xAC setado, hipótese forte
+// = "requer despacho assíncrono via job/fila do motor, não invocável direto do interpretador" — ver
+// HISTORICO.md 2026-08-02 cont.3-6). MAS a cadeia real do jogo (`equipmentSystem.script:839-948`,
+// `EquipVisuals`→`ChangeAppearanceToItem`) mostra que a mutação visual em si roda numa função DIFERENTE,
+// numa classe DIFERENTE: `TransactionSystem.ChangeItemAppearanceByItemID(obj, itemID, newItemID)`
+// (`orphans.script:18053`, native PÚBLICA — não passa pelo `QueueRequest`/`GetInvokable()` quebrado,
+// é um `CClassFunction` descriptor SEPARADO). `TransactionSystem` (`gameTransactionSystem`) já tem
+// vtable mapeada no projeto (`0x1072173a0`, achada pra `GetVisualTags`, DATABASE.md) — categoria de
+// função "consumidora" (não "Find"/resolver em mapa racy), mesma categoria já PROVADA segura várias
+// vezes (`LoadAppearance`, `ReassembleAppearance`, `RegisterPart`, `GetVisualTags`). Hipótese: chamar
+// isso direto pode disparar a cadeia de troca de aparência (incl. `AppearanceChanger::SelectAppearanceName`
+// em C++, o hook pendente de `axl-transmog-apply`) SEM tocar `QueueRequest` nenhuma vez.
+// AINDA NÃO TESTADO AO VIVO (memória do sistema crítica no momento em que foi escrito — `Pages free`
+// ~5-6 mil, mesmo padrão que já causou crashes de boot documentados; só compilado+deployado, gated,
+// igual ao `equiponce`). Comando de canal: `transmogtry` (lib.rs).
+// FIX (2026-08-03): `BwmsTransmogTryOnce` (abaixo) crashou no 1º teste ao vivo de verdade —
+// ANTES até do 1º `Print`, então antes de `ChangeItemAppearanceByItemID`. Suspeito:
+// `EquipmentSystem.GetData(player)` + `ed.GetActiveItem(area)` (1-arg, método de
+// `EquipmentSystemPlayerData`) é caminho NUNCA testado nesta sessão — `EquipmentSystem.GetActiveItem
+// (owner, area)` (2-arg, direto na classe `EquipmentSystem`) já é PROVADO seguro (usado por
+// `BwmsCheckEquipSlot`, chamado com sucesso repetidas vezes). Esta versão evita `GetData`/`ed`
+// por completo, usando só chamadas já confirmadas seguras.
+public static func BwmsTransmogTryV2(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[transmogtryv2] player indefinido");
+    return;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[transmogtryv2] EquipmentSystem.GetInstance falhou");
+    return;
+  };
+  // OuterChest (jacket) transmogrificado pra parecer a T-shirt — visualmente BEM diferente
+  // (ao contrário de InnerChest→T-shirt quando o InnerChest JÁ é a T-shirt, que é um no-op
+  // visual e explica por que SelectAppearanceName não disparou na 1ª tentativa).
+  let oldItem: ItemID = es.GetActiveItem(player, gamedataEquipmentArea.OuterChest);
+  if !ItemID.IsValid(oldItem) {
+    Print("[transmogtryv2] sem item ativo em OuterChest, nada pra transmogrificar");
+    return;
+  };
+  let newItem: ItemID = ItemID.CreateQuery(t"Items.Fixer_01_Set_TShirt");
+  let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(game);
+  if !IsDefined(ts) {
+    Print("[transmogtryv2] GetTransactionSystem falhou");
+    return;
+  };
+  Print("[transmogtryv2] pré-chamada: ts/player/oldItem/newItem prontos, chamando ChangeItemAppearanceByItemID AGORA");
+  ts.ChangeItemAppearanceByItemID(player, oldItem, newItem);
+  Print("[transmogtryv2] pós-chamada: ChangeItemAppearanceByItemID retornou, zero crash");
+}
+
+public static func BwmsTransmogTryOnce(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[transmogtry] player indefinido");
+    return;
+  };
+  let ed: ref<EquipmentSystemPlayerData> = EquipmentSystem.GetData(player);
+  if !IsDefined(ed) {
+    Print("[transmogtry] EquipmentSystem.GetData falhou");
+    return;
+  };
+  let oldItem: ItemID = ed.GetActiveItem(gamedataEquipmentArea.OuterChest);
+  if !ItemID.IsValid(oldItem) {
+    Print("[transmogtry] sem item ativo em OuterChest, nada pra transmogrificar (equipe algo antes)");
+    return;
+  };
+  // Item-alvo diferente do atual, mesmo catálogo já usado em BwmsEquipPoller/BwmsForceEquipOnce
+  // (sel=2, já confirmado válido no TweakDB deste save).
+  let newId: TweakDBID = t"Items.Fixer_01_Set_TShirt";
+  if !TDBID.IsValid(newId) {
+    Print("[transmogtry] TDBID novo inválido");
+    return;
+  };
+  let newItem: ItemID = ItemID.FromTDBID(newId);
+  let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(game);
+  if !IsDefined(ts) {
+    Print("[transmogtry] GetTransactionSystem falhou");
+    return;
+  };
+  // Traço cirúrgico (2026-08-03): equiponce (baseline) confirma o ambiente saudável — precisa achar
+  // se ChangeItemAppearanceByItemID é o ponto exato de crash (igual QueueRequest) ou se é antes.
+  Print("[transmogtry] pré-chamada: ts/player/oldItem/newItem prontos, chamando ChangeItemAppearanceByItemID AGORA");
+  ts.ChangeItemAppearanceByItemID(player, oldItem, newItem);
+  Print("[transmogtry] pós-chamada: ChangeItemAppearanceByItemID retornou, zero crash");
+}
+
+// axl-garment-apply / axl-transmog-apply (2026-08-02, /goal): 2ª via nova, mais direta que a do
+// `BwmsTransmogTryOnce` acima. RE dedicada desta sessão achou o endereço C++ CRU de
+// `EquipmentSystem::QueueRequest` (0x103b1f624, herdado de `ScriptableSystem` — ver register.rs/
+// HISTORICO.md 2026-08-02 cont.12). `BwmsQueueRequestRaw(sys, req)` (native Rust) chama esse endereço
+// DIRETO via transmute, contornando por completo o dispatcher RTTI/`GetInvokable()` (a causa raiz
+// EXATA do crash do `es.QueueRequest(req)` normal — RE em cont.3-6). Monta o MESMO `EquipRequest`
+// já provado (Skill 2, 2026-07-15), mas despacha pela via raw em vez da chamada de método normal.
+native func BwmsQueueRequestRaw(sys: ref<IScriptable>, req: ref<IScriptable>) -> Bool;
+
+// 2026-08-03 (/goal): teste MÍNIMO/ISOLADO — `equiprawv2` crashou mesmo depois do fix de `ret_type`.
+// Hipótese: `call_func` NUNCA invocou uma função redscript retornando `ref<T>` neste projeto antes
+// (todo exemplo -> ref<T> só é chamado de DENTRO de outro script, nunca do nosso `call_func`) — pode
+// ser essa combinação em si que é o problema, não `EquipmentSystem`/`GetPlayerSystem`. Esta função
+// não faz NADA além de retornar `null` — isola a teoria por completo. Comando: `rettest`.
+public static func BwmsTestReturnsRef(game: GameInstance) -> ref<IScriptable> {
+  Print("[rettest] BwmsTestReturnsRef chamado, retornando null");
+  return null;
+}
+
+// Isolamento por etapas (2026-08-03): `rettest` (acima) PASSOU (zero crash) — refuta a teoria de
+// "call_func→redscript→ref<T> é sempre quebrado". O bug tem que estar em algo específico da cadeia
+// GetPlayerSystem/EquipmentSystem.GetInstance, só quando a função externa não é Void. Isolando
+// incrementalmente: rettest2=só GetPlayerSystem · rettest3=+GetLocalPlayerControlledGameObject ·
+// rettest4=+EquipmentSystem.GetInstance(descarta, retorna null) · rettest5=retorna es DE VERDADE.
+public static func BwmsTestRef2(game: GameInstance) -> ref<IScriptable> {
+  let ps: ref<PlayerSystem> = GameInstance.GetPlayerSystem(game);
+  Print("[rettest2] GetPlayerSystem ok=" + ToString(IsDefined(ps)) + ", retornando null");
+  return null;
+}
+
+public static func BwmsTestRef3(game: GameInstance) -> ref<IScriptable> {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  Print("[rettest3] player ok=" + ToString(IsDefined(player)) + ", retornando null");
+  return null;
+}
+
+public static func BwmsTestRef4(game: GameInstance) -> ref<IScriptable> {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  Print("[rettest4] es ok=" + ToString(IsDefined(es)) + ", DESCARTANDO, retornando null");
+  return null;
+}
+
+public static func BwmsTestRef5(game: GameInstance) -> ref<IScriptable> {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  Print("[rettest5] es ok=" + ToString(IsDefined(es)) + ", retornando ES DE VERDADE agora");
+  return es;
+}
+
+// 2026-08-03 (/goal, achado ao vivo): `equipctxonce`/`equiprawonce` (via `BwmsQueueRequestCtx`/`Raw`
+// chamados de DENTRO do bytecode de `BwmsForceEquipCtx`/`Raw`) crasham no MESMO endereço de sempre
+// (`0x1021730ec`) ANTES de qualquer log nosso aparecer — nem o Print imediatamente antes da chamada,
+// nem o log de ENTRADA do trampolim Rust. Isso aponta pro DESPACHO do native (2 params `handle`)
+// quando invocado ANINHADO de bytecode já em execução como o problema, não a lógica interna dele.
+// **Via nova: eliminar o aninhamento por completo.** Estas 2 funções só CONSTROEM e RETORNAM `es`/`req`
+// (zero chamada a native de 2-handle-params dentro delas) — chamadas TOP-LEVEL, separadas, direto do
+// Rust (mesmo padrão já provado de `give`/`GetGame`). O `transmute` pro endereço cru roda inteiramente
+// do lado Rust (`run_cmd`), sem NENHUM native aninhado no meio. Comando de canal: `equiprawv2`.
+public static func BwmsPrepEquipSys(game: GameInstance) -> ref<EquipmentSystem> {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv2] BwmsPrepEquipSys: player indefinido");
+    return null;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[equiprawv2] BwmsPrepEquipSys: EquipmentSystem.GetInstance falhou");
+  };
+  return es;
+}
+
+public static func BwmsPrepEquipReq(game: GameInstance) -> ref<EquipRequest> {
+  let want: Int32 = BwmsEquipState();
+  if want <= 0 {
+    Print("[equiprawv2] BwmsPrepEquipReq: BwmsEquipState()<=0");
+    return null;
+  };
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv2] BwmsPrepEquipReq: player indefinido");
+    return null;
+  };
+  let id: TweakDBID = TDBID.None();
+  if want == 1 { id = t"Items.GOG_DLC_Jacket_Legendary"; };
+  if want == 2 { id = t"Items.Fixer_01_Set_TShirt"; };
+  if want == 3 { id = t"Items.Coat_04_rich_02_Crafting"; };
+  if !TDBID.IsValid(id) {
+    Print("[equiprawv2] BwmsPrepEquipReq: sel=" + ToString(want) + " sem item mapeado");
+    return null;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(id);
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  Print("[equiprawv2] BwmsPrepEquipReq: req pronto, sel=" + ToString(want));
+  return req;
+}
+
+// equiprawv5 (2026-08-03): verificação DEFINITIVA se `QueueRequest` (via frame real, bypass
+// GetInvokable) de fato adicionou/equipou o item — lê a quantidade real via TransactionSystem,
+// a mesma API pública já usada por `give`/`transmogtry`. Comando de canal: `callg BwmsCheckItemQty()`.
+public static func BwmsCheckItemQty(game: GameInstance) -> Int32 {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv5-check] player indefinido");
+    return -1;
+  };
+  let ts = GameInstance.GetTransactionSystem(game);
+  if !IsDefined(ts) {
+    Print("[equiprawv5-check] GetTransactionSystem falhou");
+    return -2;
+  };
+  // FIX (2026-08-03): `FromTDBID` gera um SEED ALEATÓRIO novo a cada chamada (ItemID = TDBID +
+  // seed de instância, não só o TDBID) — comparar contra isso NUNCA bate com o que o player
+  // realmente possui. `CreateQuery` é o ID "curinga" (sem seed específico) certo pra consultas
+  // de posse/quantidade por TIPO, independente de qual instância aleatória foi dada.
+  let id: ItemID = ItemID.CreateQuery(t"Items.Fixer_01_Set_TShirt");
+  let qty: Int32 = ts.GetItemQuantity(player, id);
+  Print("[equiprawv5-check] qty=" + ToString(qty));
+  return qty;
+}
+
+// equiprawv6 (2026-08-03): `BwmsCheckItemQty` (TransactionSystem) ficou em 0 mesmo com
+// `equiprawv6` retornando ZERO CRASH via ADDR_EXEC completo e todos os campos de req
+// confirmados byte-exatos (itemID/owner/addToInventory/slotIndex, ver dump [equiprawv6-diag]).
+// Checagem alternativa: `EquipmentSystem.IsEquipped` lê o estado REAL de equipamento
+// (EquipmentSystemPlayerData), independente do TransactionSystem — T-shirt = slot InnerChest.
+// Comando de canal: `callg BwmsCheckEquipSlot()`.
+public static func BwmsCheckEquipSlot(game: GameInstance) -> Bool {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv6-check] player indefinido");
+    return false;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[equiprawv6-check] EquipmentSystem.GetInstance falhou");
+    return false;
+  };
+  let id: ItemID = ItemID.CreateQuery(t"Items.Fixer_01_Set_TShirt");
+  let equipped: Bool = es.IsEquipped(player, id, gamedataEquipmentArea.InnerChest);
+  let active: ItemID = es.GetActiveItem(player, gamedataEquipmentArea.InnerChest);
+  let activeIsTShirt: Bool = ItemID.IsOfTDBID(active, t"Items.Fixer_01_Set_TShirt");
+  let activeValid: Bool = ItemID.IsValid(active);
+  Print("[equiprawv6-check] equipped=" + ToString(equipped) + " activeValid=" + ToString(activeValid) + " activeIsTShirt=" + ToString(activeIsTShirt));
+  return equipped;
+}
+
+// equiprawv7 (2026-08-03): achado-chave — o padrão CANÔNICO real (`equipAction.script:6-9`,
+// `EquipAction.CompleteAction`) só seta `itemID`+`owner` (NUNCA `addToInventory`/`slotIndex`) e
+// chama `EquipmentSystem.GetInstance(obj).QueueRequest(req)` DIRETO via bytecode — não via
+// transmute/frame sintético. Isso só nunca funcionou porque `GetInvokable()` retorna null (fix
+// já instalado por `equiprawv6` antes desta chamada, mesmo boot). Segunda causa de falha achada
+// agora: `ItemID.FromTDBID` gera um SEED ALEATÓRIO novo a cada chamada — o item dado por `give`
+// (outro seed) nunca bate com um itemID recém-sintetizado. `ItemID.CreateQuery` é o ID "curinga"
+// certo pra equipar QUALQUER instância possuída do tipo, replicando o padrão real de UI (equipar
+// por tipo, não por instância exata). Requer que o player JÁ POSSUA o item (via `give` antes).
+public static func BwmsEquipViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv7] player indefinido");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.Fixer_01_Set_TShirt");
+  req.owner = player;
+  Print("[equiprawv7] req pronto (padrão canônico, só itemID+owner) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[equiprawv7] QueueRequest retornou — ZERO CRASH, via bytecode canônica completa!");
+}
+
+// codeware-213-complex-outfit (2026-08-19): item #213/VisualController — depCount/looseDepCount
+// (appearanceDependency) seguem 0 com a TShirt (item de teste simples demais, achado explicado em
+// codeware-visualcontroller-smoke.reds). Este helper equipa um item MAIS RICO (Coat_04_rich_02_
+// Crafting — TweakDB confirmado: tag "Rich"/"Streetwear", 2 appearanceSuffixes vs 1 da TShirt,
+// mais provável de ter dependência de aparência/garment real populada). Diferente de
+// `BwmsEquipViaQuery` (usa `ItemID.CreateQuery`, exige posse PRÉVIA — só funciona pra itens já no
+// inventário, como a TShirt inicial), este item NÃO é possuído por padrão — usa o padrão já
+// canônico e provado de `BwmsEquipPoller`/`BwmsForceEquipOnce` (`bwms-tppcam.reds` acima):
+// `ItemID.FromTDBID` (sintetiza ItemID novo, não exige posse) + `req.addToInventory=true` (dá o
+// item automaticamente como parte do próprio EquipRequest).
+public static func BwmsEquipComplexOutfitViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equipcomplex] player indefinido");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(t"Items.Coat_04_rich_02_Crafting");
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  Print("[equipcomplex] req pronto (Coat_04_rich_02_Crafting, FromTDBID+addToInventory=true) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[equipcomplex] QueueRequest retornou — ZERO CRASH");
+}
+
+// item #54 (2026-08-18, "tentativa 4" — a recomendação explícita deixada pela tentativa 3, ver
+// `archivexl-54-scanspawningslots-smoke.reds`): as 3 tentativas anteriores de disparar
+// `IsSlotSpawningAnyItem` nunca observaram uma transição GENUÍNA vazio->ocupado — a tentativa 2
+// mirou um item GOG-exclusivo (no-op silencioso nesta instalação Steam) e a tentativa 3 mirou um
+// item que JÁ estava ativo desde o aquecimento do boot (re-equip IDEMPOTENTE, sem transição real
+// de estado). Pra forçar uma transição real, este helper DESEQUIPA primeiro (`UnequipRequest`,
+// mesma família `PlayerScriptableSystemRequest`/`IScriptable` já usada com segurança por
+// `EquipRequest`/`EquipVisualsRequest` nesta mesma sessão — zero categoria de risco nova, nunca
+// declara classe própria, só instancia+seta campos numa classe VANILLA já existente e despacha
+// via `EquipmentSystem.QueueRequest`, o mesmo bytecode-dispatch canônico já provado dezenas de
+// vezes). `UnequipRequest` é chaveada por ÁREA (`areaType: gamedataEquipmentArea`), não por
+// itemID — `slotIndex` fica no default `-1` (`@default(UnequipRequest, -1)` na fonte real,
+// preenchido automaticamente pelo compilador ao instanciar) e `force` fica `false` (default
+// implícito de `Bool`), replicando o caminho comum de desequipar pela UI (sem forçar remoção de
+// item "preso"). Alvo = `InnerChest` (a mesma área da T-shirt já usada em `BwmsEquipViaQuery`,
+// mantendo o par equip/unequip no MESMO item pra comparação direta).
+public static func BwmsUnequipViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[unequiprawv1] player indefinido");
+    return;
+  };
+  let req: ref<UnequipRequest> = new UnequipRequest();
+  req.owner = player;
+  req.areaType = gamedataEquipmentArea.InnerChest;
+  req.force = false;
+  Print("[unequiprawv1] req pronto (UnequipRequest, owner+InnerChest, force=false) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[unequiprawv1] QueueRequest retornou — ZERO CRASH, via bytecode canônica completa!");
+}
+
+// axl-29-equipcyber (2026-08-14): teste DECISIVO do item #29 (`ComputePuppetArmsState`,
+// archivexl-puppetstate-armsdetect.reds) — mesmo padrão canônico do `equiprawv7`
+// (itemID via CreateQuery + owner, QueueRequest via bytecode, fix de GetInvokable já instalado
+// globalmente), mas com `Items.MantisBlades` (cyberware de braço REAL, TDBID confirmado offline
+// contra `Items.MantisBlades.itemType == ItemType.Cyb_MantisBlades`, `cp77-symbols/tweakdb-base.tsv`)
+// no lugar da T-shirt. Precisa de `give Items.MantisBlades` ANTES (posse real via `GiveItem`,
+// mesmo requisito documentado desde 2026-08-03 — `CreateQuery` só resolve item já possuído).
+public static func BwmsEquipCyberwareViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equipcyber] player indefinido");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.MantisBlades");
+  req.owner = player;
+  Print("[equipcyber] req pronto (Items.MantisBlades, padrão canônico) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[equipcyber] QueueRequest retornou — ZERO CRASH, via bytecode canônica completa!");
+}
+
+// axl-29-drawcyber (2026-08-18): teste DECISIVO #2 do item ArchiveXL #29 — achado honesto de
+// 2026-08-14 (proofs/2026-08-14-archivexl-29-armsdetect-DECISIVO-tentado-INCONCLUSIVO.log)
+// confirmou que `equipcyber` (EquipRequest) MOVE o item pra `gamedataEquipmentArea.RightArm`
+// (posse/instalação real, confirmado via `scanslots`) mas NÃO popula `AttachmentSlots.
+// WeaponRight` (a slot que `ComputePuppetArmsState` lê) — essa slot só reflete a arma
+// DESEMBAINHADA/em uso, estado distinto de "instalado". Lendo a fonte real
+// (`cyberpunk/systems/equipmentSystem.script:2157`, `EquipmentSystemPlayerData::DrawItem`)
+// achei o mecanismo REAL que popula essa slot: monta um `EquipmentSystemWeaponManipulationRequest`
+// internamente e chama `SetSlotActiveItem(EquipmentManipulationRequestSlot.Right, itemToDraw)`
+// (caso `gamedataEquipmentArea.ArmsCW`, exatamente a área do Mantis Blades). O request
+// REDSCRIPT-facing que dispara isso é `DrawItemRequest{itemID, owner, equipAnimationType}`
+// (`orphans.script:38763`, handler `OnDrawItemRequest` → `this.DrawItem(request.itemID,...)`),
+// despachado pelo MESMO `EquipmentSystem.QueueRequest` bytecode canônico já provado seguro (zero
+// crash) por `EquipRequest`/`EquipVisualsRequest`/`UnequipRequest` nesta e em sessões anteriores
+// (fix de GetInvokable já instalado globalmente, idempotente). Direcionado por ITEM ID
+// específico (`Items.MantisBlades`, não "1º disponível"/"último usado" — ambos ambíguos contra
+// o inventário real do save) — zero ambiguidade sobre QUAL arma é sacada.
+//
+// Global (não método de classe bare) DE PROPÓSITO — achado de metodologia de 2026-08-14: classes
+// redscript "bare" com só métodos static (`public class X { static func... }`, sem parent
+// nativo) não são enumeráveis via `resolve_in_class`/`funclistdump`, então não são re-chamáveis
+// via console depois do 1º `OnGameAttached`. Globais soltas (`register::get_function`+`callg`,
+// mesmo padrão já provado 100% por `equipcyber`/`scanslots`/`scanspawn`) não sofrem disso.
+public static func BwmsDrawCyberwareAndCheckArms(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[drawcyber] player indefinido");
+    return;
+  };
+  let req: ref<DrawItemRequest> = new DrawItemRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.MantisBlades");
+  req.owner = player;
+  req.equipAnimationType = gameEquipAnimationType.Default;
+  Print("[drawcyber] DrawItemRequest pronto (Items.MantisBlades) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[drawcyber] QueueRequest retornou — ZERO CRASH, via bytecode canônica completa!");
+  let state: PuppetArmsState = ArchiveXLPuppetState.ComputePuppetArmsState(player);
+  // Marcador 9613 (distinto de 9611/9612 já usados pelo smoke test original do item #29) —
+  // sucesso da chamada em si (não confundir com o resultado do enum, linha seguinte).
+  BwmsVariantLog(ToVariant(true), ToVariant(9613));
+  BwmsVariantLog(ToVariant(true), ToVariant(EnumInt(state)));
+}
+
+// axl-transmog-apply (2026-08-05): mesmo padrão canônico do equiprawv7 (itemID+owner, QueueRequest
+// via bytecode, fix de GetInvokable já instalado globalmente pra QUALQUER request que passe por
+// EquipmentSystem.QueueRequest — não é específico de EquipRequest), mas com `EquipVisualsRequest`
+// em vez de `EquipRequest`. `OnEquipVisualsRequest` (equipmentSystem.script:3502) chama
+// `this.EquipVisuals(request.itemID)` direto — dispara `ChangeAppearanceToItem` sem precisar da UI
+// real de Wardrobe/espelho, testável 100% pelo canal. Requer que o item já esteja EQUIPADO num
+// slot ocupado (senão ChangeAppearanceToItem cai no ramo GivePreview, não no de transmog real).
+public static func BwmsVisualEquipViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[transmogviaquery] player indefinido");
+    return;
+  };
+  let req: ref<EquipVisualsRequest> = new EquipVisualsRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.Fixer_01_Set_TShirt");
+  req.owner = player;
+  Print("[transmogviaquery] req pronto (EquipVisualsRequest, itemID+owner) — chamando QueueRequest via bytecode...");
+  EquipmentSystem.GetInstance(player).QueueRequest(req);
+  Print("[transmogviaquery] QueueRequest retornou — ZERO CRASH");
+}
+
+// Task #15 (2026-08-03): equipar em `Face` (óculos) em vez de `InnerChest` — slot tipicamente
+// VAZIO no V base (ao contrário de InnerChest/OuterChest, que o save já tem algo), pra testar se
+// `GarmentAssemblerState::AddItem` (nunca disparado ainda, só `ChangeItem`/`RemoveItem`) dispara
+// quando o slot-alvo é genuinamente novo. `Items.Glasses_01_basic_01` — item real do TweakDB
+// (achado via `tweakdb-tool find Glasses`), nunca usado neste projeto antes.
+// Task #17 (2026-08-03): `AddItem` ainda sem confirmação — hipótese nova: InnerChest/OuterChest
+// (categoria "clothing", dispararam Change/RemoveItem) vs Head (categoria "acessório", disparou
+// ChangeCustomItem) sugerem que a escolha Add/Change/Custom depende da CATEGORIA do slot, não só
+// da posse. `Outfit` (área 27) é o único slot tipo-clothing genuinamente vazio achado via
+// `scanslots` — testando com o mesmo item de jaqueta já catalogado (`Items.GOG_DLC_Jacket_Legendary`).
+public static func BwmsEquipOutfitViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equipoutfit] player indefinido");
+    return;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  let before: ItemID = es.GetActiveItem(player, gamedataEquipmentArea.Outfit);
+  Print("[equipoutfit] antes: Outfit válido=" + ToString(ItemID.IsValid(before)));
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.GOG_DLC_Jacket_Legendary");
+  req.owner = player;
+  Print("[equipoutfit] req pronto (Outfit, jaqueta) — chamando QueueRequest via bytecode...");
+  es.QueueRequest(req);
+  Print("[equipoutfit] QueueRequest retornou — ZERO CRASH!");
+}
+
+public static func BwmsEquipGlassesViaQuery(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equipglasses] player indefinido");
+    return;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  // Achado (scanslots): Face JÁ tinha algo; Head/Gadget/PersonalLink/QuickSlot/Splinter/
+  // PlayerTattoo/SilverhandArm/LeftArm/Outfit estão genuinamente VAZIOS neste save. Tentando
+  // Head (chapéu) com o item de óculos mesmo — se o slot não bater, deve ser no-op seguro
+  // (mesmo comportamento observado até agora: mismatch nunca crashou, só não fez efeito).
+  // FIX (2026-08-03): óculos em Head não disparou NENHUM hook (0/5) — provavelmente mismatch de
+  // TIPO de item rejeitado antes de chegar no garment assembler. `Items.Hat_01_basic_01` é o item
+  // REAL (achado via tweakdb-tool find "Items.Hat_") pro slot Head.
+  let before: ItemID = es.GetActiveItem(player, gamedataEquipmentArea.Head);
+  Print("[equipglasses] antes: Head válido=" + ToString(ItemID.IsValid(before)));
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.CreateQuery(t"Items.Hat_01_basic_01");
+  req.owner = player;
+  Print("[equipglasses] req pronto (Head, item novo, HAT desta vez) — chamando QueueRequest via bytecode...");
+  es.QueueRequest(req);
+  Print("[equipglasses] QueueRequest retornou — ZERO CRASH!");
+}
+
+// Task #15 (2026-08-03, achado: Face NÃO estava vazio, hipótese refutada) — varre várias áreas
+// de uma vez (read-only, zero risco) pra achar uma genuinamente vazia sem gastar mais boots
+// tentando um item por vez às cegas.
+public static func BwmsScanEmptySlots(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[scanslots] player indefinido");
+    return;
+  };
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  let areas: array<gamedataEquipmentArea>;
+  ArrayPush(areas, gamedataEquipmentArea.Head);
+  ArrayPush(areas, gamedataEquipmentArea.Gadget);
+  ArrayPush(areas, gamedataEquipmentArea.PersonalLink);
+  ArrayPush(areas, gamedataEquipmentArea.QuickSlot);
+  ArrayPush(areas, gamedataEquipmentArea.Splinter);
+  ArrayPush(areas, gamedataEquipmentArea.PlayerTattoo);
+  ArrayPush(areas, gamedataEquipmentArea.SilverhandArm);
+  ArrayPush(areas, gamedataEquipmentArea.LeftArm);
+  ArrayPush(areas, gamedataEquipmentArea.RightArm);
+  ArrayPush(areas, gamedataEquipmentArea.Legs);
+  ArrayPush(areas, gamedataEquipmentArea.Feet);
+  ArrayPush(areas, gamedataEquipmentArea.Outfit);
+  let i: Int32 = 0;
+  while i < ArraySize(areas) {
+    let it: ItemID = es.GetActiveItem(player, areas[i]);
+    Print("[scanslots] area=" + ToString(EnumInt(areas[i])) + " valido=" + ToString(ItemID.IsValid(it)));
+    i += 1;
+  };
+}
+
+// ArchiveXL `#54` (AttachmentSlots.IsSlotEmpty/IsSlotSpawning) — sessão dedicada 2026-08-12
+// (catálogo exaustivo, `CATALOGO-EXAUSTIVO-ARCHIVEXL.md`). "Vazio?" já foi respondido acima
+// (`BwmsScanEmptySlots`, via `EquipmentSystem.GetActiveItem`+`ItemID.IsValid`, 2026-08-03) —
+// mas "vazio" != "spawnando" (estado TRANSIENTE distinto: um item sendo instanciado/anexado ao
+// slot, ainda não considerado "ocupado" pelo `GetActiveItem`, mas também não mais "vazio" de
+// verdade). Achado (leitura de `cp77-symbols/redscript-src/orphans.script:18100-18157`, dentro
+// da MESMA classe `TransactionSystem extends ITransactionSystem` já usada em outros mods deste
+// projeto): `IsSlotSpawningAnyItem(obj: ref<GameObject>, slotID: TweakDBID) -> Bool` é NATIVA
+// VANILLA já exposta ao redscript (`public final native func`, linha 18157) — a MESMA capacidade
+// prática de `Raw::AttachmentSlots::IsSlotSpawning` (RawFunc do ArchiveXL, endereço Mac nunca
+// achado nem por RE dedicada), via um caminho de mais alto nível que o motor já expõe sem
+// precisar de RE nenhuma (zero endereço nativo, zero hook — mesmo padrão EQUIVALENTE já usado
+// pro "vazio?" 9 dias antes). Slots via TweakDBID (não `gamedataEquipmentArea`, categoria
+// diferente de `BwmsScanEmptySlots` acima) — mesmos slots já nomeados em
+// `enablers/ArchiveXL/src/App/Extensions/Attachment/Extension.cpp`
+// (HeadSlot/FaceSlot/TorsoSlot/ChestSlot/LegsSlot/FeetSlot) + Outfit/WeaponRight pra cobertura
+// extra. Read-only (nenhum dos 2 nativos muta estado) — comparável em risco a `BwmsScanEmptySlots`.
+public static func BwmsScanSpawningSlots(game: GameInstance) -> Void {
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[scanspawn] player indefinido");
+    return;
+  };
+  let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(game);
+  if !IsDefined(ts) {
+    Print("[scanspawn] GetTransactionSystem falhou");
+    return;
+  };
+  let slots: array<TweakDBID>;
+  ArrayPush(slots, t"AttachmentSlots.Head");
+  ArrayPush(slots, t"AttachmentSlots.Eyes");
+  ArrayPush(slots, t"AttachmentSlots.Torso");
+  ArrayPush(slots, t"AttachmentSlots.Chest");
+  ArrayPush(slots, t"AttachmentSlots.Legs");
+  ArrayPush(slots, t"AttachmentSlots.Feet");
+  ArrayPush(slots, t"AttachmentSlots.Outfit");
+  ArrayPush(slots, t"AttachmentSlots.WeaponRight");
+  let i: Int32 = 0;
+  while i < ArraySize(slots) {
+    let spawning: Bool = ts.IsSlotSpawningAnyItem(player, slots[i]);
+    let empty: Bool = ts.IsSlotEmpty(player, slots[i]);
+    Print("[scanspawn] slot#" + ToString(i) + " spawning=" + ToString(spawning) + " empty=" + ToString(empty));
+    i += 1;
+  };
+}
+
+public static func BwmsForceEquipRaw(game: GameInstance) -> Void {
+  let want: Int32 = BwmsEquipState();
+  if want <= 0 {
+    Print("[equiprawonce] BwmsEquipState()<=0, nada a fazer (setar ~/.bwms-equip=1/2/3 antes)");
+    return;
+  };
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawonce] player indefinido");
+    return;
+  };
+  let id: TweakDBID = TDBID.None();
+  if want == 1 { id = t"Items.GOG_DLC_Jacket_Legendary"; };
+  if want == 2 { id = t"Items.Fixer_01_Set_TShirt"; };
+  if want == 3 { id = t"Items.Coat_04_rich_02_Crafting"; };
+  if !TDBID.IsValid(id) {
+    Print("[equiprawonce] sel=" + ToString(want) + " sem item mapeado");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(id);
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[equiprawonce] EquipmentSystem.GetInstance falhou");
+    return;
+  };
+  // 2026-08-03: traço passo-a-passo (achado: nem o log Rust de tramp_queue_request_raw nem o
+  // Print de sucesso abaixo apareceram nos 2 crashes ao vivo — precisa isolar se o crash é
+  // ANTES do dispatch pra BwmsQueueRequestRaw ou DENTRO dele).
+  Print("[equiprawonce] pré-chamada: es e req prontos, chamando BwmsQueueRequestRaw agora");
+  let ok: Bool = BwmsQueueRequestRaw(es, req);
+  Print("[equiprawonce] pós-chamada: BwmsQueueRequestRaw retornou ok=" + ToString(ok) + " (sel=" + ToString(want) + ", via RAW, bypassa GetInvokable)");
+}
+
+// axl-garment-apply / axl-transmog-apply (2026-08-02, /goal): 3ª via, achado pelo agente que desmontou
+// GetInvokable() em si (0x100339b2c — stub que SEMPRE retorna null; a causa real de "funciona vs
+// crasha" é o `ctx` explícito no fast-path do caller, não um campo do descritor). Chama QueueRequest
+// via `rtti::call_func` NOSSO (não bytecode redscript aninhado), com `ctx` = instância EquipmentSystem
+// explícita — mesmo padrão já provado do `give` (TransactionSystem::GiveItem, ctx=tx explícito).
+native func BwmsQueueRequestCtx(sys: ref<IScriptable>, req: ref<IScriptable>) -> Bool;
+
+public static func BwmsForceEquipCtx(game: GameInstance) -> Void {
+  let want: Int32 = BwmsEquipState();
+  if want <= 0 {
+    Print("[equipctxonce] BwmsEquipState()<=0, nada a fazer (setar ~/.bwms-equip=1/2/3 antes)");
+    return;
+  };
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equipctxonce] player indefinido");
+    return;
+  };
+  let id: TweakDBID = TDBID.None();
+  if want == 1 { id = t"Items.GOG_DLC_Jacket_Legendary"; };
+  if want == 2 { id = t"Items.Fixer_01_Set_TShirt"; };
+  if want == 3 { id = t"Items.Coat_04_rich_02_Crafting"; };
+  if !TDBID.IsValid(id) {
+    Print("[equipctxonce] sel=" + ToString(want) + " sem item mapeado");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(id);
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[equipctxonce] EquipmentSystem.GetInstance falhou");
+    return;
+  };
+  let ok: Bool = BwmsQueueRequestCtx(es, req);
+  Print("[equipctxonce] BwmsQueueRequestCtx ok=" + ToString(ok) + " (sel=" + ToString(want) + ", via call_func com ctx explícito)");
+}
+
 public class BwmsTppPoller extends DelayCallback {
   let m_game: GameInstance;
   let m_last: Int32;
@@ -171,7 +823,10 @@ public class BwmsTppPoller extends DelayCallback {
       // de verdade, força a rotação da câmera FPP pra baixo + aplica o offset máximo — só pra
       // provar/refutar visualmente se o torso (anexado via ActivateTPPRepresentation) aparece.
       // Reusa BwmsCamBack/BwmsCamZ (já existentes) como o offset a aplicar no pitch forçado.
-      if BwmsForceLook() == 1 {
+      // Lido em LOCAL antes de comparar (2026-08-21): comparar o retorno de um native INLINE é a
+      // forma quebrada já documentada (2026-07-15) e foi a causa do triplo impossível do `#18`.
+      let fl: Int32 = BwmsForceLook();
+      if fl == 1 {
         let pp: ref<PlayerPuppet> = player as PlayerPuppet;
         if IsDefined(pp) {
           let cam: ref<FPPCameraComponent> = pp.GetFPPCameraComponent();
@@ -351,7 +1006,9 @@ func BwmsBootFullbody(game: GameInstance) -> Void {
 // O dylib resolve esta global (get_function) e chama via call_func passando a GameInstance real —
 // mesmo caminho já provado de BwmsBootFullbody.
 func BwmsTppRefire(game: GameInstance) -> Void {
-  if BwmsTppState() != 1 { return; };
+  // Lido em LOCAL antes de comparar (2026-08-21) — ver nota acima.
+  let tppSt: Int32 = BwmsTppState();
+  if tppSt != 1 { return; };
   let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
   if IsDefined(player) {
     // PLANO B (2026-07-16, gated `no_reactivate=1`): hipótese = segurar `isTPP`=true continuamente
@@ -513,4 +1170,51 @@ public func BwmsGetSceneTier(game: GameInstance) -> Int32 {
   let tier: Int32 = PlayerPuppet.GetSceneTier(pp);
   Print(s"[scenetier] tier=\(tier) (0=free-roam real, 1-5=cena/animação roteirizada, 6=nadando)");
   return tier;
+}
+
+// axl-garment-apply / axl-transmog-apply (2026-08-03, /goal): 4ª via — evita os 2 bugs reais já
+// diagnosticados nesta madrugada (HISTORICO.md cont.17/19). Constrói es+req NUM SÓ lugar (zero 2ª
+// call_func TOP-LEVEL) e captura os ponteiros via 2 natives ANINHADAS de 1-arg-handle cada
+// (BwmsCaptureEs/Req — mesmo shape seguro de BwmsCallMethod), em vez de passar 2 handles numa
+// chamada só (o que crashava em equiprawonce/equipctxonce). Retorna Void — nem essa função em si
+// dispara o bug de "2ª call_func retornando ref<T>". Rust lê os atomics DEPOIS que este call_func
+// único retorna, e faz o transmute pro endereço cru inteiramente do lado Rust.
+native func BwmsCaptureEs(es: ref<IScriptable>) -> Void;
+native func BwmsCaptureReq(req: ref<IScriptable>) -> Void;
+
+public static func BwmsPrepAndCapture(game: GameInstance) -> Void {
+  Print("[equiprawv3] ENTROU em BwmsPrepAndCapture (1ª linha, antes de qualquer coisa)");
+  let want: Int32 = BwmsEquipState();
+  if want <= 0 {
+    Print("[equiprawv3] BwmsEquipState()<=0, nada a fazer (setar ~/.bwms-equip=1/2/3 antes)");
+    return;
+  };
+  let player: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+  if !IsDefined(player) {
+    Print("[equiprawv3] player indefinido");
+    return;
+  };
+  let id: TweakDBID = TDBID.None();
+  if want == 1 { id = t"Items.GOG_DLC_Jacket_Legendary"; };
+  if want == 2 { id = t"Items.Fixer_01_Set_TShirt"; };
+  if want == 3 { id = t"Items.Coat_04_rich_02_Crafting"; };
+  if !TDBID.IsValid(id) {
+    Print("[equiprawv3] sel=" + ToString(want) + " sem item mapeado");
+    return;
+  };
+  let req: ref<EquipRequest> = new EquipRequest();
+  req.itemID = ItemID.FromTDBID(id);
+  req.owner = player;
+  req.addToInventory = true;
+  req.slotIndex = -1;
+  let es: ref<EquipmentSystem> = EquipmentSystem.GetInstance(player);
+  if !IsDefined(es) {
+    Print("[equiprawv3] EquipmentSystem.GetInstance falhou");
+    return;
+  };
+  Print("[equiprawv3] pré-captura: es e req prontos, capturando es agora");
+  BwmsCaptureEs(es);
+  Print("[equiprawv3] es capturado, capturando req agora");
+  BwmsCaptureReq(req);
+  Print("[equiprawv3] req capturado, retornando (Void) — Rust faz o transmute a seguir");
 }

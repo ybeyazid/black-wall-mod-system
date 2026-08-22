@@ -289,7 +289,23 @@ pub fn classify(root: &Path) -> ModReport {
     let class = class_of(&files);
     let deps = detect_deps(&files);
     let compat = compat_of(class, &deps);
-    let notes = analyze_xl(root, &files);
+    let mut notes = analyze_xl(root, &files);
+    // 2026-08-05 (achado de auditoria): `.tweak` (DSL declarativa do TweakXL, formato diferente
+    // de YAML) era classificado junto de `.yaml`/`.yml` como se fosse suportado — mas o runtime
+    // (`mod_pipeline.rs::apply_mod_tweaks`) só lê YAML; um `.tweak` instalava sem erro e nunca
+    // aplicava nada. Aviso explícito aqui pra não repetir a falha muda na origem.
+    let tweak_files: Vec<&str> = files
+        .iter()
+        .filter(|f| f.kind == FileKind::Tweak && f.rel.extension().and_then(|s| s.to_str()).map(|e| e.eq_ignore_ascii_case("tweak")).unwrap_or(false))
+        .filter_map(|f| f.rel.to_str())
+        .collect();
+    if !tweak_files.is_empty() {
+        notes.push(format!(
+            "AVISO: {} arquivo(s) .tweak (DSL declarativa do TweakXL, ex. '{}') — formato ainda NÃO suportado por este runtime (só .yaml/.yml aplicam); vai instalar mas NÃO vai fazer efeito nenhum.",
+            tweak_files.len(),
+            tweak_files[0]
+        ));
+    }
     ModReport { name, class, compat, files, deps, risks, notes }
 }
 

@@ -25,7 +25,7 @@ const ADDR_RECORD_EXISTS: u64 = 0x1_02b7_63fc; // RecordExists(TweakDB* x0, Twea
 // ===== hashes — FONTE ÚNICA no crate `bwms-hashes` (a MESMA impl do tweakdb-tool offline;
 // antes era cópia byte-a-byte aqui). `tweak_db_id` = CRC32(nome)|(len<<32); `record_type_key` =
 // murmur3(miolo de gamedata(.*)_Record, seed 0x5EEDBA5E). =====
-pub use bwms_hashes::{record_type_key, tweak_db_id};
+pub use bwms_hashes::{record_type_key, tweak_db_id, tweak_db_id_derive};
 
 static CREATED: AtomicBool = AtomicBool::new(false);
 
@@ -75,6 +75,194 @@ pub unsafe fn create_record_rt(class_name: &str, new_name: &str) {
     ));
 }
 
+/// `TweakDBManager.RegisterEnum(id: TweakDBID)` — espelho mínimo do `TweakDBReflection::RegisterEnum`
+/// real (fonte vendorizada `enablers/TweakXL/.../ScriptManager.cpp:116-122`: `s_manager->
+/// RegisterEnum(aRecordID)`, bookkeeping puro, sem side-effect visível fora da própria reflection).
+/// BWMS não tem consumidor downstream desse registro ainda (nenhum sistema de reflection de TweakDB
+/// próprio que precise saber "este ID é um enum") — mantemos um espelho simples (HashSet) só pra
+/// que a chamada não seja no-op silencioso e para servir de base se um consumidor real aparecer.
+static REGISTERED_ENUMS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+
+pub fn register_enum_id(id: u64) -> bool {
+    if let Ok(mut g) = REGISTERED_ENUMS.lock() {
+        g.get_or_insert_with(std::collections::HashSet::new).insert(id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Núcleo de `CreateRecord` por ID+typeHash JÁ RESOLVIDOS (sem derivar de string) — usado pela
+/// API redscript `TweakDBManager.CreateRecord(id: TweakDBID, type: CName)`. Devolve `true` só se
+/// `RecordExists` confirmar depois — mesma dupla validação (antes=false/depois=true) de
+/// `create_record_rt`, mas SEM logging verboso a cada chamada (uso em produção, não prova pontual)
+/// e sem depender de string alguma (o `type_hash` chega pronto, já derivado de um CName resolvido
+/// pelo chamador via `crate::cname::resolve_cname` — ver `tramp_tdbm_createrecord`).
+pub unsafe fn create_record_by_id(type_hash: u32, id: u64) -> bool {
+    let t = match singleton() {
+        Some(s) => s as *mut c_void,
+        None => return false,
+    };
+    // Mesmo GATE de `create_record_rt`: só prossegue com o TweakDB REALMENTE carregado.
+    let loaded = crate::gum::is_readable((t as *const u8).add(0x38) as *const c_void, 1)
+        && *(t as *const u8).add(0x38) == 1;
+    if !loaded {
+        return false;
+    }
+    let exists: extern "C" fn(*mut c_void, u64) -> u8 = std::mem::transmute(crate::rebase(ADDR_RECORD_EXISTS));
+    if exists(t, id) != 0 {
+        return false; // já existe — CreateRecord real também aborta nesse caso
+    }
+    let create: extern "C" fn(*mut c_void, u32, u64) = std::mem::transmute(crate::rebase(ADDR_CREATE_RECORD));
+    create(t, type_hash, id);
+    let ok = exists(t, id) != 0;
+    crate::log(&format!("[tdbmanager] CreateRecord(id={id:#x}, typeHash={type_hash:#010x}) -> {ok}"));
+    ok
+}
+
+/// `resolve_getter_flat` por ID (sem precisar do nome-string do record source) — usa
+/// `tweak_db_id_derive` (`bwms-hashes`, PROVADO por teste: `derive(id("base"),".suf") ==
+/// id("base.suf")`) em vez de `tweak_db_id(format!("{record}.{name}"))`. Mesmo algoritmo de
+/// `resolve_getter_flat`, só a fonte do id de busca muda.
+unsafe fn resolve_getter_flat_by_id(t: *mut u8, source_id: u64, getter: &str) -> Option<(String, *mut u64)> {
+    for name in [lower_first(getter), getter.to_string()] {
+        if name.is_empty() {
+            continue;
+        }
+        let flat_id = bwms_hashes::tweak_db_id_derive(source_id, &format!(".{name}"));
+        if let Some(ep) = find_flat_entry_by_id(t, flat_id) {
+            return Some((name, ep));
+        }
+    }
+    None
+}
+
+/// `CloneRecord(id: TweakDBID, base: TweakDBID) -> Bool` — item TweakXL #44/#45 (`PENDENCIAS-
+/// UNIFICADAS.md`): a via redscript real, só com IDs (sem nome nenhum, ao contrário de
+/// `clone_record_api`/`inherit_flats_rt`, que exigem `class_name`/`source`/`clone` como string).
+/// Deriva TUDO do `base` já vivo (mesma técnica de `update_record_by_id`: `get_record_instance` +
+/// `class_of` + `type_name_hash` + `resolve_cname` pro nome da classe/type_hash) e usa
+/// `tweak_db_id_derive` (em vez de concatenar string + rehash) pra computar os novos flat-ids do
+/// clone — a peça que faltava pra generalizar `inherit_flats_rt` sem nome. Mesmo algoritmo de
+/// merge/grow sob `mutex00` já provado lá, adaptado pra fonte de id.
+pub unsafe fn clone_record_by_id(reg: &crate::rtti::Registry, id: u64, base: u64) -> bool {
+    let t = match singleton() {
+        Some(s) => s,
+        None => return false,
+    };
+    let base_existing = get_record_instance(t, base);
+    if base_existing.is_null() || !crate::gum::is_readable(base_existing as *const c_void, 0x40) {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}): base não achado"));
+        return false;
+    }
+    let native_type = crate::rtti::class_of(base_existing as *mut c_void);
+    let name_hash = crate::rtti::type_name_hash(native_type);
+    let class_name = crate::cname::resolve_cname(name_hash);
+    if class_name.is_empty() {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}): não resolveu o nome do tipo"));
+        return false;
+    }
+    let type_hash = record_type_key(&class_name);
+    // 1) cria o record NOVO (vazio) do mesmo tipo do base.
+    if !create_record_by_id(type_hash, id) {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}): CreateRecord('{class_name}') falhou"));
+        return false;
+    }
+    // 2) herda os flats do base (mesmo algoritmo de `inherit_flats_rt`, ids em vez de nomes).
+    let cls = reg.class_by_name(&class_name);
+    if cls.is_null() {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): classe '{class_name}' não achada no registry (record criado, flats NÃO herdados)"));
+        return true; // CreateRecord já teve sucesso; herança de flat é best-effort
+    }
+    let (entries, size0, cap, _sp) = flats_header(t);
+    if entries.is_null() || size0 == 0 || size0 > 10_000_000 {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): array de flats inválido (record criado, flats NÃO herdados)"));
+        return true;
+    }
+    let getters = enum_record_getters(cls);
+    let mut news: Vec<u64> = Vec::new();
+    for g in &getters {
+        if let Some((_pname, ep)) = resolve_getter_flat_by_id(t, base, g) {
+            let src_entry = ep.read_unaligned();
+            let new_id = tweak_db_id_derive(id, &format!(".{_pname}"));
+            news.push(id_key40(new_id) | (src_entry & 0xFFFF_FF00_0000_0000));
+        }
+    }
+    if news.is_empty() {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}): nenhum flat do base achado — record criado sem herança"));
+        return true;
+    }
+    news.sort_by(|a, b| match (id_key_lt(*a, *b), id_key_lt(*b, *a)) {
+        (true, _) => std::cmp::Ordering::Less,
+        (_, true) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
+    news.dedup_by(|a, b| id_key40(*a) == id_key40(*b));
+    news.retain(|&e| !flat_key_present(entries, size0, e));
+    let add = news.len();
+    if add == 0 {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): flats já presentes — nada a herdar"));
+        return true;
+    }
+    if size0 + add > cap {
+        // GROW — mesmo algoritmo de `inherit_flats_rt` (ver lá pro comentário linha-a-linha).
+        let cur_trailer = ((entries as u64) + cap as u64 * 8 + 7) & !7;
+        if !crate::gum::is_readable(cur_trailer as *const c_void, 8) {
+            crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): grow abortado (trailer ilegível)"));
+            return true;
+        }
+        let alloc_vft = rd_u64(cur_trailer as *const u8);
+        let new_cap = size0 + add + 256;
+        let mut buf: Vec<u64> = vec![0u64; new_cap + 1];
+        std::ptr::copy_nonoverlapping(entries as *const u64, buf.as_mut_ptr(), size0);
+        buf[new_cap] = alloc_vft;
+        let new_entries = Box::leak(buf.into_boxed_slice()).as_mut_ptr();
+        merge_insert_from_end(new_entries, size0, &news);
+        if !mutex00_lock(t) {
+            crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): mutex00 ocupado no grow — abortado"));
+            return true;
+        }
+        let (entries2, size2, cap2, _sp2) = flats_header(t);
+        if entries2 != entries || size2 != size0 || cap2 != cap {
+            mutex00_unlock(t);
+            crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): flats mudou sob o lock — abortado sem publicar"));
+            return true;
+        }
+        let fa = t.add(FLATS_OFF + 0x08) as *mut u32;
+        let fb = t.add(FLATS_OFF + 0x0C) as *mut u32;
+        let (size_ptr, cap_ptr) = if (fa.read_unaligned() as usize) <= (fb.read_unaligned() as usize) {
+            (fa, fb)
+        } else {
+            (fb, fa)
+        };
+        (t.add(FLATS_OFF) as *mut u64).write_unaligned(new_entries as u64);
+        cap_ptr.write_unaligned(new_cap as u32);
+        size_ptr.write_unaligned((size0 + add) as u32);
+        mutex00_unlock(t);
+        crate::log(&format!(
+            "[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}, type='{class_name}'): GROW cap {cap}->{new_cap} + herdou {add} flats -> true"
+        ));
+        return true;
+    }
+    if !mutex00_lock(t) {
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): mutex00 ocupado — abortado sem mutar"));
+        return true;
+    }
+    let (entries, size, cap, size_ptr) = flats_header(t);
+    if size + add > cap {
+        mutex00_unlock(t);
+        crate::log(&format!("[tdbmanager] CloneRecord(id={id:#x}): slack sumiu sob o lock — abortado"));
+        return true;
+    }
+    merge_insert_from_end(entries, size, &news);
+    size_ptr.write_unaligned((size + add) as u32);
+    mutex00_unlock(t);
+    crate::log(&format!(
+        "[tdbmanager] CloneRecord(id={id:#x}, base={base:#x}, type='{class_name}'): herdou {add} flats -> true"
+    ));
+    true
+}
+
 /// Roda o registro UMA vez quando `~/.bwms-tdbcreate` existe (dev). Cria
 /// Items.BwmsCloneTest como gamedataWeaponItem_Record (type_key 0x7fdef930, confirmado
 /// válido). Chamado do cp77_tick em gameplay.
@@ -89,6 +277,18 @@ pub unsafe fn create_once_if_marked() {
     if !marked {
         return;
     }
+    // GATE (2026-08-01, achado no GOG): o marker+3s-fixos antigo dispara ANTES do que o
+    // comentário original assumia — `create_once_if_marked` é chamado desde o 1º tick
+    // (`lib.rs`, ANTES do gate de player), não só "em gameplay". No Steam isso nunca deu
+    // problema porque 3s após qualquer tick já bastam pra o cache de tipo RTTI do record
+    // (`gamedataWeaponItem_Record`) estar populado; no GOG, testado ao vivo, deu
+    // `KERN_INVALID_ADDRESS at 0x0` — null-deref FUNDO no construtor RTTI do tipo (RE offline
+    // confirmou a função-alvo/offset corretos, não é bug de endereço — ver DATABASE.md). Fix:
+    // exige GAMEPLAY REAL (mesmo sinal robusto de "mundo assentado" já usado por
+    // `tweakxl-updaterecord`/plugin `onUpdate`) antes de sequer agendar o disparo.
+    if !crate::selfboot::PHASE_REACHED_5.load(Ordering::Relaxed) {
+        return; // tenta de novo no próximo tick
+    }
     if CREATED.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -98,7 +298,7 @@ pub unsafe fn create_once_if_marked() {
     // CreateRecord de uma JOB THREAD, então é cross-thread-safe. Disparamos numa thread
     // separada (fora do hook) que pega o lock limpo.
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_secs(5)); // margem extra pós-phase5
         unsafe { create_record_rt("gamedataWeaponItem_Record", "Items.BwmsCloneTest") };
     });
 }
@@ -118,6 +318,17 @@ unsafe fn rd_u64(p: *const u8) -> u64 {
 /// Ponteiro do singleton TweakDB vivo. Lê o global (populado no load); se null,
 /// chama TweakDB::Get() (lazy-init). None se ainda não inicializado/ilegível.
 pub unsafe fn singleton() -> Option<*mut u8> {
+    // 🔴 GUARDA DE PROCESSO (2026-08-21) — fora do jogo, NADA aqui é válido: `rebase()` calcula o
+    // slide a partir do processo atual, então tanto o global quanto o endereço de `Get()` caem
+    // dentro do binário hospedeiro (um runner de teste, uma ferramenta que carregue o dylib) e
+    // `is_readable` responde TRUE pra eles — a guarda de legibilidade abaixo, sozinha, não
+    // protege. Medido: `cargo test` morria com SIGBUS ao chamar o "Get()" rebaseado pra lixo
+    // dentro do próprio binário de teste (`api::tests::v4_null_safe`, 15ª chamada). Isso também
+    // é robustez da API pública de plugin: `tweakdb_get_flat`/`set_flat` de um plugin carregado
+    // fora do jogo agora devolvem false em vez de derrubar o processo.
+    if !crate::selfboot::in_game() {
+        return None;
+    }
     // VALIDA que a instância está CARREGADA: o global às vezes aponta pra uma TweakDB
     // staging/vazia (flats size 0, flatDataBuffer null) — usar essa faz o getflat achar nada.
     // Critério de "carregada": flatDataBuffer@+0x148 != 0. Se o global for vazio, cai no Get().
@@ -250,8 +461,12 @@ const FLAT_DATA_END_OFF: usize = 0x158; //   uintptr_t flatDataBufferEnd
 /// VIA CANÔNICA de lookup de flat: acha a ENTRY (TweakDBID no SortedUniqueArray) por NOME —
 /// binary-search por hash(u32 primário) + length(u8 secundário) (TweakDBID::operator<). Devolve
 /// `*mut u64` (a entry, p/ ler OU reescrever o tdbOffset). getflat/setflat/repoint usam ESTA (Q5).
-pub unsafe fn find_flat_entry(t: *const u8, name: &str) -> Option<*mut u64> {
-    let id = tweak_db_id(name);
+/// Núcleo do binary-search por ID JÁ CALCULADO (sem derivar de string) — usado pela API
+/// redscript `TweakDBManager.*` (item TweakXL #44, `PENDENCIAS-UNIFICADAS.md`), cujo `TweakDBID`
+/// chega pronto do compilador (`t"..."`/`TDBID.Create` são resolvidos em compile-time pelo scc;
+/// só o `u64` atravessa a fronteira nativa). `find_flat_entry(name)` abaixo agora é só um atalho
+/// que deriva o id e delega aqui — mesmo algoritmo, sem duplicação.
+pub unsafe fn find_flat_entry_by_id(t: *const u8, id: u64) -> Option<*mut u64> {
     let q_hash = (id & 0xFFFF_FFFF) as u32;
     let q_len = ((id >> 32) & 0xFF) as u8;
     let entries = rd_u64(t.add(FLATS_OFF)) as *mut u64;
@@ -283,6 +498,11 @@ pub unsafe fn find_flat_entry(t: *const u8, name: &str) -> Option<*mut u64> {
     None
 }
 
+/// Variante por NOME (deriva `tweak_db_id(name)` e delega em `find_flat_entry_by_id`).
+pub unsafe fn find_flat_entry(t: *const u8, name: &str) -> Option<*mut u64> {
+    find_flat_entry_by_id(t, tweak_db_id(name))
+}
+
 /// tdbOffset de uma entry (bytes 5,6,7 em BIG-ENDIAN).
 #[inline]
 fn entry_tdb_offset(e: u64) -> u32 {
@@ -292,7 +512,12 @@ fn entry_tdb_offset(e: u64) -> u32 {
 /// FlatValue* de um flat por NOME (via `find_flat_entry` + flatDataBuffer + tdbOffset). None se
 /// não achar. READ-ONLY multi-thread-safe (ver nota do RED4ext).
 pub unsafe fn get_flat_value(t: *const u8, name: &str) -> Option<*mut u8> {
-    let ep = find_flat_entry(t, name)?;
+    get_flat_value_by_id(t, tweak_db_id(name))
+}
+
+/// Variante por ID já calculado — mesmo mecanismo de `get_flat_value`, sem string.
+pub unsafe fn get_flat_value_by_id(t: *const u8, id: u64) -> Option<*mut u8> {
+    let ep = find_flat_entry_by_id(t, id)?;
     let off = entry_tdb_offset(ep.read_unaligned());
     let fdb = rd_u64(t.add(FLAT_DATA_BUFFER_OFF)) as *mut u8;
     if fdb.is_null() {
@@ -302,11 +527,49 @@ pub unsafe fn get_flat_value(t: *const u8, name: &str) -> Option<*mut u8> {
     if crate::gum::is_readable(fv as *const c_void, 0x18) { Some(fv) } else { None }
 }
 
+/// ArchiveXL `#40` (2026-08-19, continuação — `OnAttachTPP`/`AttachmentExtension::OnAttachTPP`,
+/// Extension.cpp:140-185): lê um flat ESCALAR do tipo `TweakDBID` por ID já calculado, mesma
+/// técnica de `GetTypeName`@vtable+0xE8 + `GetDataPtr`@vtable+0xF0 já provada ao vivo em
+/// `tramp_get_flat_float` (TweakXL `#43`) — mas aceitando o tipo real como `TweakDBID` em vez de
+/// `Float`. Usada pra compor `Red::GetFlatValue<Red::TweakDBID>({slotID, ".parentSlot"})` (fonte
+/// real do C++, `s_extraSlots`/`s_baseSlots`) sem endereço nativo novo algum — só leitura dinâmica
+/// de flat já provada + `bwms_hashes::tweak_db_id_derive` (derivação de sufixo, já provada).
+pub unsafe fn get_flat_tdbid(t: *const u8, id: u64) -> Option<u64> {
+    let fv = get_flat_value_by_id(t, id)?;
+    let vt = (fv as *const u64).read_unaligned();
+    if !crate::gum::is_readable(vt as *const c_void, 0xF8) {
+        return None;
+    }
+    let get_type_name = ((vt as *const u8).add(0xE8) as *const u64).read_unaligned();
+    let get_data_ptr = ((vt as *const u8).add(0xF0) as *const u64).read_unaligned();
+    if !crate::rtti::sane(get_type_name as *mut c_void) || !crate::rtti::sane(get_data_ptr as *mut c_void) {
+        return None;
+    }
+    let mut name_out: u64 = 0;
+    let f_gtn: extern "C" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(get_type_name);
+    let ret = f_gtn(fv as *mut c_void, &mut name_out as *mut u64);
+    let type_name = crate::cname::resolve_cname(ret as u64);
+    if !type_name.eq_ignore_ascii_case("TweakDBID") {
+        return None;
+    }
+    let f_gdp: extern "C" fn(*mut c_void) -> *mut c_void = std::mem::transmute(get_data_ptr);
+    let data_ptr = f_gdp(fv as *mut c_void);
+    if !crate::gum::is_readable(data_ptr, 8) {
+        return None;
+    }
+    Some((data_ptr as *const u64).read_unaligned())
+}
+
 /// Repoint: aponta o flat de `name` pro FlatValue em flatDataBuffer+`new_off` (reescreve os bytes
 /// 5,6,7 BE da entry, preservando hash+len). O jogo passa a ler o valor novo. É o que permite
 /// SetFlat NÃO-escalar (array/string), onde o valor não cabe in-place e precisa de um FlatValue novo.
 pub unsafe fn set_flat_offset(t: *const u8, name: &str, new_off: u32) -> bool {
-    let ep = match find_flat_entry(t, name) {
+    set_flat_offset_by_id(t, tweak_db_id(name), new_off)
+}
+
+/// Variante por ID já calculado — mesmo mecanismo de `set_flat_offset`, sem derivar de string.
+pub unsafe fn set_flat_offset_by_id(t: *const u8, id: u64, new_off: u32) -> bool {
+    let ep = match find_flat_entry_by_id(t, id) {
         Some(e) => e,
         None => return false,
     };
@@ -323,8 +586,13 @@ pub unsafe fn set_flat_offset(t: *const u8, name: &str, new_off: u32) -> bool {
 /// set_flat_offset — a via canônica p/ mudar arrays (ex.: attacks/statModifiers da arma). Devolve
 /// o tdbOffset novo, ou None.
 pub unsafe fn set_flat_nonscalar(t: *mut u8, field: &str, donor: &str, data: &[u8], align: usize) -> Option<i32> {
-    let off = create_flat_value(t, donor, data, align)?;
-    if set_flat_offset(t as *const u8, field, off as u32) {
+    set_flat_nonscalar_by_id(t, tweak_db_id(field), tweak_db_id(donor), data, align)
+}
+
+/// Variante por ID já calculado — mesmo mecanismo de `set_flat_nonscalar`, sem derivar de string.
+pub unsafe fn set_flat_nonscalar_by_id(t: *mut u8, field_id: u64, donor_id: u64, data: &[u8], align: usize) -> Option<i32> {
+    let off = create_flat_value_by_id(t, donor_id, data, align)?;
+    if set_flat_offset_by_id(t as *const u8, field_id, off as u32) {
         Some(off)
     } else {
         None
@@ -355,13 +623,23 @@ fn dynarray_payload(entries: u64, n: u32) -> [u8; 16] {
 /// trailer de allocator do donor, cria o FlatValue e aponta `field`. Donor DEVE ser um flat
 /// array do MESMO tipo. Devolve o tdbOffset novo.
 pub unsafe fn set_flat_array_u64(t: *mut u8, field: &str, donor: &str, elems: &[u64]) -> Option<i32> {
-    let dv = get_flat_value(t as *const u8, donor)?;
+    set_flat_array_u64_by_id(t, tweak_db_id(field), tweak_db_id(donor), elems)
+}
+
+/// Variante por ID já calculado — mesmo mecanismo de `set_flat_array_u64`, sem derivar de string.
+/// `donor_id == field_id` é um uso válido e comum (SELF-DONOR): quando o campo já É um array
+/// (caso de `array_append_by_id`/etc., items TweakXL #32/#33), sua PRÓPRIA `FlatValue` atual serve
+/// de donor (tem a vtable/alloc certos, lida ANTES de repontar `field` — ordem importa, mas como
+/// `create_flat_value_by_id` lê o donor e só DEPOIS `set_flat_offset_by_id` repontam, a leitura do
+/// donor sempre vê o valor PRÉ-mutação, mesmo quando donor==field).
+pub unsafe fn set_flat_array_u64_by_id(t: *mut u8, field_id: u64, donor_id: u64, elems: &[u64]) -> Option<i32> {
+    let dv = get_flat_value_by_id(t as *const u8, donor_id)?;
     // probe de sanidade do donor (defesa 2): o payload em +0x8 parece um DynArray?
     let d_entries = rd_u64(dv.add(0x8));
     let d_cap = (dv.add(0x10) as *const u32).read_unaligned();
     let d_size = (dv.add(0x14) as *const u32).read_unaligned();
     if d_size > d_cap || d_cap > 1_000_000 {
-        crate::log(&format!("[flat] mkarr: donor '{donor}' não parece array (cap={d_cap} size={d_size})"));
+        crate::log(&format!("[flat] mkarr: donor {donor_id:#x} não parece array (cap={d_cap} size={d_size})"));
         return None;
     }
     if d_size > 0 && !crate::gum::is_readable(d_entries as *const c_void, 8) {
@@ -375,27 +653,213 @@ pub unsafe fn set_flat_array_u64(t: *mut u8, field: &str, donor: &str, elems: &[
         let tr = (d_entries + d_cap as u64 * 8 + 7) & !7;
         if crate::gum::is_readable(tr as *const c_void, 8) { rd_u64(tr as *const u8) } else { 0 }
     };
-    // buffer nosso: elems + trailer (leak intencional — flats nunca são destruídos; ver workflow)
-    let mut buf = Vec::with_capacity(elems.len() + 1);
-    buf.extend_from_slice(elems);
-    buf.push(alloc_vft);
-    let entries = Box::leak(buf.into_boxed_slice()).as_ptr() as u64;
+    // Array VAZIO (`!remove-all`, TweakXL #30): a convenção já usada no LADO LEITURA (acima,
+    // `d_cap==0 → alloc_vft = d_entries`) diz que uma DynArray com `cap==0` guarda o vft do
+    // allocator DIRETO nos bits do campo `entries` (não um ponteiro pra um buffer contendo o
+    // vft). Um buffer alocado por nós com só o trailer (`[alloc_vft]`, `entries=ptr_pro_buffer`)
+    // violaria essa convenção — a leitura interpretaria nosso PONTEIRO como se fossem os bits
+    // crus do vft (cap==0 no payload, mas entries≠vft). Fix: pra `elems.is_empty()`, escreve o
+    // vft DIRETO no campo `entries` — sem alocar buffer nenhum (mais simples que o caso não-vazio).
+    let entries = if elems.is_empty() {
+        alloc_vft
+    } else {
+        // buffer nosso: elems + trailer (leak intencional — flats nunca são destruídos; ver workflow)
+        let mut buf = Vec::with_capacity(elems.len() + 1);
+        buf.extend_from_slice(elems);
+        buf.push(alloc_vft);
+        Box::leak(buf.into_boxed_slice()).as_ptr() as u64
+    };
     let payload = dynarray_payload(entries, elems.len() as u32);
-    set_flat_nonscalar(t, field, donor, &payload, 8)
+    set_flat_nonscalar_by_id(t, field_id, donor_id, &payload, 8)
 }
 
-/// "Items.A,Items.B,0x1234" → [tweak_db_id, tweak_db_id, 0x1234]. Hex cru passa direto
-/// (serve p/ array:CName com hash conhecido); nome vira TweakDBID.
+/// Lê os elementos (8 bytes cada) de um flat array (`array:TweakDBID`/`array:CName`/etc.) pelo ID.
+/// `None` se o flat não existir/não parecer array; `Some(vec![])` se existir mas estiver vazio.
+pub unsafe fn get_flat_array_u64_by_id(t: *const u8, id: u64) -> Option<Vec<u64>> {
+    let fv = get_flat_value_by_id(t, id)?;
+    let entries = rd_u64(fv.add(0x8));
+    let cap = (fv.add(0x10) as *const u32).read_unaligned();
+    let size = (fv.add(0x14) as *const u32).read_unaligned();
+    if size > cap || cap > 1_000_000 {
+        return None;
+    }
+    if size == 0 {
+        return Some(Vec::new());
+    }
+    if !crate::gum::is_readable(entries as *const c_void, size as usize * 8) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(size as usize);
+    for i in 0..size {
+        out.push(rd_u64((entries + i as u64 * 8) as *const u8));
+    }
+    Some(out)
+}
+
+// ===== Mutação cirúrgica de array (TweakXL #32/#33: `!append`/`!prepend`/`!append-once`/
+// `!prepend-once`/`!remove`/`!append-from`/`!prepend-from`) — insere/remove elemento(s) SEM
+// reescrever o array inteiro na intenção do mod (mesmo efeito final observável: o array vivo no
+// jogo muda; a IMPLEMENTAÇÃO faz leitura + `set_flat_array_u64_by_id` self-donor por trás, não uma
+// via cirúrgica de baixo nível separada — não há necessidade de RE nova, é composição de 2
+// primitivas já provadas: `get_flat_array_u64_by_id`(leitura) + `set_flat_array_u64_by_id`
+// self-donor(escrita), a MESMA dupla já usada pelo comando `mkarr` provado ao vivo). Todas
+// devolvem `false` se o array resultante ficaria VAZIO (0 elementos) — caso nunca escrito/testado
+// (o `mkarr` original também rejeita lista vazia; ver nota em `set_flat_array_u64`), tratado como
+// limitação conhecida, não como erro silencioso.
+pub unsafe fn array_append_by_id(t: *mut u8, id: u64, value: u64, unique: bool) -> bool {
+    let mut elems = match get_flat_array_u64_by_id(t, id) {
+        Some(e) => e,
+        None => return false,
+    };
+    if unique && elems.contains(&value) {
+        crate::log(&format!("[xlarr] AppendOnce(id={id:#x}, value={value:#x}): já presente, skip"));
+        return true;
+    }
+    elems.push(value);
+    let n = elems.len();
+    match set_flat_array_u64_by_id(t, id, id, &elems) {
+        Some(off) => {
+            crate::log(&format!("[xlarr] Append(id={id:#x}, value={value:#x}) -> tdbOffset={off:#x} ({n} elementos)"));
+            true
+        }
+        None => {
+            crate::log(&format!("[xlarr] Append(id={id:#x}) FALHOU"));
+            false
+        }
+    }
+}
+
+pub unsafe fn array_prepend_by_id(t: *mut u8, id: u64, value: u64, unique: bool) -> bool {
+    let mut elems = match get_flat_array_u64_by_id(t, id) {
+        Some(e) => e,
+        None => return false,
+    };
+    if unique && elems.contains(&value) {
+        crate::log(&format!("[xlarr] PrependOnce(id={id:#x}, value={value:#x}): já presente, skip"));
+        return true;
+    }
+    elems.insert(0, value);
+    let n = elems.len();
+    match set_flat_array_u64_by_id(t, id, id, &elems) {
+        Some(off) => {
+            crate::log(&format!("[xlarr] Prepend(id={id:#x}, value={value:#x}) -> tdbOffset={off:#x} ({n} elementos)"));
+            true
+        }
+        None => {
+            crate::log(&format!("[xlarr] Prepend(id={id:#x}) FALHOU"));
+            false
+        }
+    }
+}
+
+pub unsafe fn array_remove_by_id(t: *mut u8, id: u64, value: u64) -> bool {
+    let mut elems = match get_flat_array_u64_by_id(t, id) {
+        Some(e) => e,
+        None => return false,
+    };
+    let before = elems.len();
+    elems.retain(|&v| v != value);
+    if elems.len() == before {
+        crate::log(&format!("[xlarr] Remove(id={id:#x}, value={value:#x}): elemento não estava no array"));
+        return false;
+    }
+    if elems.is_empty() {
+        crate::log(&format!(
+            "[xlarr] Remove(id={id:#x}, value={value:#x}): resultaria em array VAZIO — limitação conhecida (mesma guarda de `mkarr`), não aplicado"
+        ));
+        return false;
+    }
+    let n = elems.len();
+    match set_flat_array_u64_by_id(t, id, id, &elems) {
+        Some(off) => {
+            crate::log(&format!("[xlarr] Remove(id={id:#x}, value={value:#x}) -> tdbOffset={off:#x} ({n} elementos)"));
+            true
+        }
+        None => {
+            crate::log(&format!("[xlarr] Remove(id={id:#x}) FALHOU"));
+            false
+        }
+    }
+}
+
+/// `!remove-all` (TweakXL #30, `TweakChangeset::RemoveAllElements` real — `entry.deleteAll = true`
+/// na fonte C++, distinta de `!remove`: não recebe VALOR nenhum, limpa o array INTEIRO
+/// incondicionalmente). Reusa `set_flat_array_u64_by_id` com `elems=&[]` — agora seguro pra
+/// escrever array vazio de verdade (fix acima: `entries` guarda o vft do allocator DIRETO quando
+/// `cap==0`, mesma convenção já usada no lado leitura, sem precisar de buffer/trailer nenhum).
+pub unsafe fn array_remove_all_by_id(t: *mut u8, id: u64) -> bool {
+    let before = match get_flat_array_u64_by_id(t, id) {
+        Some(e) => e.len(),
+        None => return false,
+    };
+    match set_flat_array_u64_by_id(t, id, id, &[]) {
+        Some(off) => {
+            crate::log(&format!("[xlarr] RemoveAll(id={id:#x}) -> tdbOffset={off:#x} ({before} elementos removidos, array vazio)"));
+            true
+        }
+        None => {
+            crate::log(&format!("[xlarr] RemoveAll(id={id:#x}) FALHOU"));
+            false
+        }
+    }
+}
+
+/// `!append-from`/`!merge` (append=true) ou `!prepend-from` (append=false): mescla os elementos
+/// de OUTRO flat array (`src_id`) no array-alvo (`id`). Ordem do merge segue a semântica real
+/// (`writer.rs::compute_value`, `EditOp::AppendFrom|PrependFrom`): append cola a fonte no FIM;
+/// prepend cola a fonte na FRENTE, preservando a ordem interna da fonte.
+pub unsafe fn array_merge_from_by_id(t: *mut u8, id: u64, src_id: u64, append: bool) -> bool {
+    let mut elems = match get_flat_array_u64_by_id(t, id) {
+        Some(e) => e,
+        None => return false,
+    };
+    let src = match get_flat_array_u64_by_id(t, src_id) {
+        Some(e) => e,
+        None => {
+            crate::log(&format!("[xlarr] MergeFrom(id={id:#x}, src={src_id:#x}): fonte não achada/não é array"));
+            return false;
+        }
+    };
+    if append {
+        elems.extend(src);
+    } else {
+        let mut merged = src;
+        merged.append(&mut elems);
+        elems = merged;
+    }
+    if elems.is_empty() {
+        crate::log(&format!("[xlarr] MergeFrom(id={id:#x}, src={src_id:#x}): resultado vazio — não aplicado"));
+        return false;
+    }
+    let n = elems.len();
+    match set_flat_array_u64_by_id(t, id, id, &elems) {
+        Some(off) => {
+            crate::log(&format!(
+                "[xlarr] MergeFrom(id={id:#x}, src={src_id:#x}, append={append}) -> tdbOffset={off:#x} ({n} elementos)"
+            ));
+            true
+        }
+        None => {
+            crate::log(&format!("[xlarr] MergeFrom(id={id:#x}) FALHOU"));
+            false
+        }
+    }
+}
+
+/// Um elemento de array u64: hex cru (`0x1234`, serve p/ array:CName com hash conhecido) passa
+/// direto; qualquer outra string vira `TweakDBID` (o caso comum: nome de record referenciado,
+/// ex. `Attacks.A`). Extraído do `parse_u64_list` (item-a-item) pra reuso pelo `EditOp` do
+/// pipeline `.yaml` (TweakXL #32/#33), cujo valor de `!append`/`!remove`/etc. é 1 elemento só.
+pub fn parse_u64_elem(p: &str) -> u64 {
+    let p = p.trim();
+    p.strip_prefix("0x")
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .unwrap_or_else(|| tweak_db_id(p))
+}
+
+/// "Items.A,Items.B,0x1234" → [tweak_db_id, tweak_db_id, 0x1234].
 pub fn parse_u64_list(s: &str) -> Vec<u64> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            p.strip_prefix("0x")
-                .and_then(|h| u64::from_str_radix(h, 16).ok())
-                .unwrap_or_else(|| tweak_db_id(p))
-        })
-        .collect()
+    s.split(',').map(str::trim).filter(|p| !p.is_empty()).map(parse_u64_elem).collect()
 }
 
 /// `mkarr <field> <donor> <a,b,c>` (GATED ~/.bwms-flatwrite): SetFlat de array — cria um flat
@@ -469,8 +933,13 @@ fn flat_pool_record(vft: u64, data_hash: u64, off: i32) {
     }
 }
 
-pub unsafe fn create_flat_value(t: *mut u8, donor: &str, data: &[u8], align: usize) -> Option<i32> {
-    let dv = get_flat_value(t as *const u8, donor)?; // via canônica (a mesma do getflat)
+/// Variante por ID já calculado (sem derivar de string) — núcleo real; `create_flat_value(name)`
+/// abaixo só deriva o id do donor e delega aqui. Usada pela mutação de array por ID
+/// (`array_append_by_id`/etc., items TweakXL #32/#33) — o `flat`/`src` do pipeline `.yaml` já
+/// chegam como STRING do parser offline, mas o donor de um array é o PRÓPRIO campo (self-donor),
+/// então derivar o id 1x e reusar em toda a cadeia evita 3 `tweak_db_id()` redundantes.
+pub unsafe fn create_flat_value_by_id(t: *mut u8, donor_id: u64, data: &[u8], align: usize) -> Option<i32> {
+    let dv = get_flat_value_by_id(t as *const u8, donor_id)?; // via canônica (a mesma do getflat)
     let vft = rd_u64(dv); // FlatValue+0x00 = vtable nativa do tipo (identifica o TIPO)
     if vft == 0 {
         return None;
@@ -507,6 +976,11 @@ pub unsafe fn create_flat_value(t: *mut u8, donor: &str, data: &[u8], align: usi
     let off = (pos - fdb) as i32; // tdbOffset (relativo ao buffer)
     flat_pool_record(vft, data_hash, off);
     Some(off)
+}
+
+/// Variante por NOME (deriva `tweak_db_id(donor)` e delega em `create_flat_value_by_id`).
+pub unsafe fn create_flat_value(t: *mut u8, donor: &str, data: &[u8], align: usize) -> Option<i32> {
+    create_flat_value_by_id(t, tweak_db_id(donor), data, align)
 }
 
 /// `getflat <nome>` (READ-ONLY): acha o FlatValue e dumpa o cabeçalho (vtable + dados em
@@ -584,8 +1058,13 @@ pub unsafe fn probe_array_flat(name: &str) {
 /// já querem o efeito na hora, sem depender de um marcador de dev. ⚠️ `api_set_flat_scalar`
 /// afeta TODOS os records que compartilham o mesmo FlatValue (mesma ressalva do `setflat`).
 pub unsafe fn api_get_flat_scalar(name: &str) -> Option<u32> {
+    api_get_flat_scalar_by_id(tweak_db_id(name))
+}
+
+/// Variante por ID — núcleo por trás de `TweakDBManager`-like `GetFlat` escalar.
+pub unsafe fn api_get_flat_scalar_by_id(id: u64) -> Option<u32> {
     let t = singleton()?;
-    let fv = get_flat_value(t, name)?;
+    let fv = get_flat_value_by_id(t, id)?;
     Some((fv.add(0x08) as *const u32).read_unaligned())
 }
 
@@ -669,11 +1148,20 @@ pub unsafe fn batchset_cmd(pairs: &[String]) {
 }
 
 pub unsafe fn api_set_flat_scalar(name: &str, val: u32) -> bool {
+    api_set_flat_scalar_by_id(tweak_db_id(name), val)
+}
+
+/// Variante por ID — núcleo por trás de `TweakDBManager.SetFlat(id, value: Variant)` pro caso
+/// ESCALAR (Int32/Float/Bool/TweakDBID/CName — tudo que cabe nos 4 bytes in-place @+0x08).
+/// UNGATED (mesmo padrão do `api_set_flat_scalar`) — quem chama do redscript já passou pela
+/// própria checagem do mod, não pelo marcador de dev `~/.bwms-flatwrite` (esse é só pro comando
+/// de console `setflat`, uso manual/debug).
+pub unsafe fn api_set_flat_scalar_by_id(id: u64, val: u32) -> bool {
     let t = match singleton() {
         Some(s) => s,
         None => return false,
     };
-    match get_flat_value(t, name) {
+    match get_flat_value_by_id(t, id) {
         None => false,
         Some(fv) => {
             (fv.add(0x08) as *mut u32).write_unaligned(val);
@@ -978,6 +1466,61 @@ unsafe fn mutex00_unlock(t: *mut u8) {
     (*(t.add(0x20) as *const std::sync::atomic::AtomicU8)).store(0, Ordering::Release);
 }
 
+/// RED4ext.SDK `#429` (`SharedSpinLock::LockShared`/`UnlockShared`, 2026-08-10) — a metade
+/// LEITURA do mesmo lock já usado por `mutex00_lock`/`mutex00_unlock` (o lado ESCRITA, CAS
+/// 0->0xFF). Algoritmo EXATO do `SharedSpinLock-inl.hpp` real: `TryLockShared` faz CAS
+/// `currentState -> currentState+1` (NUNCA um `fetch_add` cru — isso colidiria com um lock
+/// exclusivo concorrente virando `-1` bem no meio do incremento); rejeita se `currentState==-1`
+/// (exclusivo já detido). `UnlockShared` = decremento simples (`InterlockedExchangeAdd8(-1)`),
+/// seguro sem CAS porque múltiplos leitores nunca colidem entre si e nenhum exclusivo pode estar
+/// ativo enquanto QUALQUER leitor detém o lock. Hoje as leituras de flat (`get_flat_value_by_id`/
+/// `find_flat_entry_by_id`) são 100% lock-free (divergência já documentada, item #339) — esta
+/// dupla fecha o PRIMITIVO em si (a via segura oficial passa a existir), sem retrofitar os
+/// call-sites de leitura já provados/em produção (mudança ampla de escopo maior, fora deste
+/// fechamento).
+unsafe fn mutex00_lock_shared(t: *mut u8) -> bool {
+    let st = &*(t.add(0x20) as *const std::sync::atomic::AtomicU8);
+    for i in 0..4_000_000u32 {
+        let cur = st.load(Ordering::Relaxed);
+        if cur != 0xFF {
+            let next = cur.wrapping_add(1);
+            if st.compare_exchange(cur, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+        }
+        if i & 511 == 511 {
+            std::thread::yield_now();
+        }
+    }
+    false
+}
+unsafe fn mutex00_unlock_shared(t: *mut u8) {
+    (*(t.add(0x20) as *const std::sync::atomic::AtomicU8)).fetch_sub(1, Ordering::Release);
+}
+
+/// Comando `mutexsharedtest` (read-only exceto pelo próprio byte do lock, restaurado ao fim):
+/// prova o par LockShared/UnlockShared contra o SharedSpinLock real do TweakDB vivo (`t+0x20`).
+pub unsafe fn mutex_shared_test_cmd(t: *mut u8) {
+    let st = &*(t.add(0x20) as *const std::sync::atomic::AtomicU8);
+    let before = st.load(Ordering::Relaxed);
+    let s1 = mutex00_lock_shared(t);
+    let after1 = st.load(Ordering::Relaxed);
+    let s2 = mutex00_lock_shared(t);
+    let after2 = st.load(Ordering::Relaxed);
+    mutex00_unlock_shared(t);
+    let after_rel1 = st.load(Ordering::Relaxed);
+    mutex00_unlock_shared(t);
+    let after_rel2 = st.load(Ordering::Relaxed);
+    let excl = mutex00_lock(t);
+    let after_excl = st.load(Ordering::Relaxed);
+    let shared_while_excl = mutex00_lock_shared(t); // deve FALHAR (spin limitado, timeout)
+    mutex00_unlock(t);
+    let after_final = st.load(Ordering::Relaxed);
+    crate::log(&format!(
+        "[mutexsharedtest] before={before} lock1={s1}(state={after1}) lock2={s2}(state={after2}) unlock1(state={after_rel1}) unlock2(state={after_rel2}) exclusive={excl}(state={after_excl}) shared_enquanto_exclusivo(deve_ser_false)={shared_while_excl} final(deve_ser_0)={after_final}"
+    ));
+}
+
 /// Merge-insert de um lote ORDENADO (`news`, por chave, já sem colisão com o existente) num
 /// SortedUniqueArray de `size` entries já ordenado — do FIM pro começo, IN-PLACE. `entries` DEVE ter
 /// capacidade p/ `size + news.len()`. Mantém a ordenação por (hash,len). Extraída de inherit_flats_rt
@@ -1204,10 +1747,13 @@ pub unsafe fn xlautoclone_cmd(base: &str, clone: &str) {
 // ===== `tweakxl-pipeline-runtime` (2026-07-15): PONTE com o parser .yaml REAL do TweakXL =====
 // Usa o parser puro do `tweakdb-tool` (reexposto como lib, ver Cargo.toml + tweakdb-tool/src/
 // lib.rs) — mesmo `interpret_from` que já produz `Vec<Op>` pro caminho OFFLINE, agora aplicado
-// direto no TweakDB VIVO. Escopo desta v1 (documentado, não escondido): `$base`/`$type` completos
-// (via `detect_record_class`/`KNOWN_RECORD_CLASSES`); `Op::Edit` só cobre `EditOp::Assign`
-// ESCALAR (o caso mais comum de mods reais — `damage: 500` etc.) — arrays/`!append`/`!remove`/
-// Assign-de-array ficam fora desta v1 (logados como "não suportado", não crasham).
+// direto no TweakDB VIVO. Escopo: `$base`/`$type` completos (via `detect_record_class`/
+// `KNOWN_RECORD_CLASSES`); `Op::Edit` cobre `EditOp::Assign` ESCALAR (`damage: 500` etc.) + TODAS
+// as 7 mutações de array de elemento-8B (`!append`/`!prepend`/`!append-once`/`!prepend-once`/
+// `!remove`/`!append-from`/`!prepend-from` — fechado 2026-08-08, itens TweakXL #32/#33, ver
+// `array_append_by_id`/`array_prepend_by_id`/`array_remove_by_id`/`array_merge_from_by_id`).
+// `EditOp::Assign` de um VALOR array (`tags: [A, B, C]`, substituição total) e arrays de elemento
+// <8B (`array:Int32`/`array:Float`/etc.) continuam fora do escopo (logados, não crasham).
 
 /// Aplica uma sequência de `Op` (do parser `tweakdb_tool::tweakxl`) no TweakDB VIVO. Roda numa
 /// thread PRÓPRIA (mesmo motivo do `clone_record_async`: tomar o lock do TweakDB dentro do hook
@@ -1287,9 +1833,47 @@ fn apply_ops_runtime(ops: Vec<tweakdb_tool::tweakxl::Op>) {
                                 fail += 1;
                             }
                         },
-                        _ => {
-                            crate::log(&format!("[xlyaml] {flat}: operação de array (!append/!remove/etc.) — fora do escopo desta v1, não aplicada"));
-                            fail += 1;
+                        // Mutação cirúrgica de array (TweakXL #32/#33: `!append`/`!prepend`/
+                        // `!append-once`/`!prepend-once`/`!remove`/`!append-from`/`!prepend-from`)
+                        // — fechado em 2026-08-08: compõe `get_flat_array_u64_by_id`(leitura) +
+                        // `set_flat_array_u64_by_id` self-donor(escrita), a MESMA dupla já provada
+                        // ao vivo pelo comando `mkarr`. Escopo: elemento de 8 bytes
+                        // (`array:TweakDBID`/`array:CName` — o caso esmagadoramente comum em mods
+                        // reais: tags/attacks/statModifiers); `array:Int32`/`array:Float`/etc.
+                        // (elemento <8B) ficam fora, documentado, não fingido.
+                        EditOp::Append(v) => {
+                            let id = tweak_db_id(&flat);
+                            if array_append_by_id(t, id, parse_u64_elem(&v), false) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::AppendOnce(v) => {
+                            let id = tweak_db_id(&flat);
+                            if array_append_by_id(t, id, parse_u64_elem(&v), true) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::Prepend(v) => {
+                            let id = tweak_db_id(&flat);
+                            if array_prepend_by_id(t, id, parse_u64_elem(&v), false) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::PrependOnce(v) => {
+                            let id = tweak_db_id(&flat);
+                            if array_prepend_by_id(t, id, parse_u64_elem(&v), true) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::Remove(v) => {
+                            let id = tweak_db_id(&flat);
+                            if array_remove_by_id(t, id, parse_u64_elem(&v)) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::RemoveAll => {
+                            let id = tweak_db_id(&flat);
+                            if array_remove_all_by_id(t, id) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::AppendFrom(src) => {
+                            let id = tweak_db_id(&flat);
+                            let src_id = tweak_db_id(&src);
+                            if array_merge_from_by_id(t, id, src_id, true) { ok += 1 } else { fail += 1 }
+                        }
+                        EditOp::PrependFrom(src) => {
+                            let id = tweak_db_id(&flat);
+                            let src_id = tweak_db_id(&src);
+                            if array_merge_from_by_id(t, id, src_id, false) { ok += 1 } else { fail += 1 }
                         }
                     },
                 }
@@ -1297,6 +1881,51 @@ fn apply_ops_runtime(ops: Vec<tweakdb_tool::tweakxl::Op>) {
             crate::log(&format!("[xlyaml] pipeline concluído: {ok} ok / {fail} não-aplicadas"));
         }
     });
+}
+
+/// `$dlc: EP1` real (2026-08-05, achado de auditoria — ver comentário em `tweakxl.rs::Ctx`):
+/// chama a native global REAL do jogo (`IsEP1() -> Bool`, `orphans.script:39008`, mesma função
+/// que o `TweakContext.hpp` original do TweakXL usa) via `register::get_function`/`call_func`
+/// (mesmo padrão do comando `callg`). `None`/falha = `false` (mais seguro: um mod gateado por
+/// engano fica DESLIGADO em vez de aplicar sem checar — nunca pior que o bug antigo).
+unsafe fn check_is_ep1() -> bool {
+    let Some(reg) = crate::registry() else { return false };
+    let f = crate::register::get_function(reg, "IsEP1");
+    if !crate::rtti::sane(f) {
+        return false;
+    }
+    let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+    match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[]) {
+        Some(r) => r[0] != 0,
+        None => false,
+    }
+}
+
+/// Núcleo do pipeline TweakXL sem gate de marcador — usado pelo `mod_pipeline::session_phase`
+/// para auto-aplicar .yaml dos mods ativos em BWMS/mods/<tema>/<mod>/r6/tweaks/.
+pub(crate) fn apply_xl_file_auto(path: &str) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => return crate::log(&format!("[xlauto] lendo '{path}': {e}")),
+    };
+    let root = match tweakdb_tool::yaml::parse(&text) {
+        Ok(r) => r,
+        Err(e) => return crate::log(&format!("[xlauto] parse YAML '{path}': {e}")),
+    };
+    let root = match tweakdb_tool::template::expand(&root) {
+        Ok(r) => r,
+        Err(e) => return crate::log(&format!("[xlauto] expand '{path}': {e}")),
+    };
+    let is_ep1 = unsafe { check_is_ep1() };
+    let ops = match tweakdb_tool::tweakxl::interpret_from_ctx(&root, path, is_ep1) {
+        Ok(o) => o,
+        Err(e) => return crate::log(&format!("[xlauto] interpret '{path}': {e}")),
+    };
+    if ops.is_empty() {
+        return crate::log(&format!("[xlauto] '{path}': sem operações"));
+    }
+    crate::log(&format!("[xlauto] '{path}': {} ops, aplicando…", ops.len()));
+    apply_ops_runtime(ops);
 }
 
 /// `applyxlfile <caminho.yaml>` (GATED ~/.bwms-flatwrite): lê+parseia um `.yaml` REAL do
@@ -1324,7 +1953,8 @@ pub unsafe fn applyxlfile_cmd(path: &str) {
         Ok(r) => r,
         Err(e) => return crate::log(&format!("[xlyaml] expand $instances: {e}")),
     };
-    let ops = match tweakdb_tool::tweakxl::interpret_from(&root, path) {
+    let is_ep1 = check_is_ep1();
+    let ops = match tweakdb_tool::tweakxl::interpret_from_ctx(&root, path, is_ep1) {
         Ok(o) => o,
         Err(e) => return crate::log(&format!("[xlyaml] interpret: {e}")),
     };
@@ -1855,6 +2485,105 @@ pub unsafe fn update_record_rt(class_name: &str, name: &str) -> bool {
     true
 }
 
+/// `UpdateRecord(id: TweakDBID) -> Bool` — variante SEM `class_name` (a API redscript real do
+/// TweakXL, `TweakDBManager.UpdateRecord`, só recebe o ID). Deriva o `class_name` que
+/// `update_record_rt` precisa (pra `CreateTDBRecord` no scratch) a partir do PRÓPRIO record já
+/// vivo: `get_record_instance(id)` -> `class_of` -> `type_name_hash` (CName do nome do tipo,
+/// campo `+0x18` da CClass) -> `crate::cname::resolve_cname` (nomes de tipo RTTI reais são sempre
+/// pool-registrados, então isso resolve de forma confiável — mesma técnica já usada em
+/// `tramp_setfield`/`tramp_callplayer` pro NOME do método/campo, aqui aplicada ao nome da CLASSE).
+pub unsafe fn update_record_by_id(id: u64) -> bool {
+    let t = match singleton() {
+        Some(s) => s,
+        None => return false,
+    };
+    let existing = get_record_instance(t, id);
+    if existing.is_null() || !crate::gum::is_readable(existing as *const c_void, 0x40) {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): record vivo não achado"));
+        return false;
+    }
+    let native_type = crate::rtti::class_of(existing as *mut c_void);
+    let name_hash = crate::rtti::type_name_hash(native_type);
+    let class_name = crate::cname::resolve_cname(name_hash);
+    if class_name.is_empty() {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): não resolveu o nome do tipo (hash={name_hash:#x})"));
+        return false;
+    }
+    // update_record_rt deriva o MESMO `id` de volta via `tweak_db_id(name)` — não temos o nome
+    // original do record aqui, só o id. Passamos uma string sintética SÓ pro log (o algoritmo em
+    // si usa `existing`/`id` diretos a partir daqui, então isso é seguro): reimplementamos o corpo
+    // por id em vez de reusar `update_record_rt(class_name, name)` (que exigiria o nome do record).
+    update_record_core(t, id, existing, native_type, &class_name)
+}
+
+/// Núcleo compartilhado entre `update_record_rt` (nome+nome) e `update_record_by_id` (só id):
+/// CreateTDBRecord num TweakDB *scratch* (mesmo type) + Assign(existing, fresh). Ver
+/// `update_record_rt` pro algoritmo comentado passo-a-passo (idêntico, só sem os `crate::log`
+/// de cada etapa intermediária — aquele é a versão de prova/diagnóstico, esta é a de produção).
+unsafe fn update_record_core(_t: *mut u8, id: u64, existing: *mut u8, native_type: *mut c_void, class_name: &str) -> bool {
+    let mut fake: [u8; 0x168] = [0u8; 0x168];
+    let vtable_ptr = fake_allocator_vtable_ptr();
+    fake[0x80..0x88].copy_from_slice(&vtable_ptr.to_le_bytes());
+    fake[0xB0..0xB8].copy_from_slice(&vtable_ptr.to_le_bytes());
+    let fake_ptr = fake.as_mut_ptr();
+
+    let type_hash = record_type_key(class_name);
+    let create: extern "C" fn(*mut c_void, u32, u64) = std::mem::transmute(crate::rebase(ADDR_CREATE_RECORD));
+    create(fake_ptr as *mut c_void, type_hash, id);
+
+    let rid_size = (fake_ptr.add(0x60) as *const u32).read_unaligned();
+    if rid_size == 0 {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): CreateTDBRecord não inseriu no scratch"));
+        return false;
+    }
+
+    let rt_base = fake_ptr.add(0x88);
+    let rt_index = (rt_base as *const u64).read_unaligned() as *const u32;
+    let rt_cap = (rt_base.add(0x0C) as *const u32).read_unaligned();
+    let rt_nodes = (rt_base.add(0x10) as *const u64).read_unaligned() as *const u8;
+    if rt_index.is_null() || rt_nodes.is_null() || rt_cap == 0 {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): recordsByType vazio após CreateTDBRecord"));
+        return false;
+    }
+    const NODE_STRIDE: usize = 0x20;
+    let mut fresh_record: *mut c_void = std::ptr::null_mut();
+    'buckets: for b in 0..rt_cap {
+        let mut idx = (rt_index.add(b as usize)).read_unaligned();
+        let mut guard = 0;
+        while idx != u32::MAX && guard < 64 {
+            guard += 1;
+            let node = rt_nodes.add(idx as usize * NODE_STRIDE);
+            let dyn_entries = (node.add(0x10) as *const u64).read_unaligned() as *const u8;
+            let dyn_size = (node.add(0x10 + 0x0C) as *const u32).read_unaligned();
+            if !dyn_entries.is_null() && dyn_size > 0 {
+                fresh_record = (dyn_entries as *const u64).read_unaligned() as *mut c_void;
+                break 'buckets;
+            }
+            idx = (node.add(0) as *const u32).read_unaligned();
+        }
+    }
+    if fresh_record.is_null() || !crate::gum::is_readable(fresh_record as *const c_void, 0x40) {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): record fresco não achado em recordsByType"));
+        return false;
+    }
+
+    let type_vtable = (native_type as *const u64).read_unaligned();
+    if type_vtable == 0 || !crate::gum::is_readable(type_vtable as *const c_void, ADDR_ASSIGN_TYPE_VTBL_SLOT_OFF + 8) {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): vtable do nativeType ilegível"));
+        return false;
+    }
+    let assign_slot = (type_vtable as *const u8).add(ADDR_ASSIGN_TYPE_VTBL_SLOT_OFF) as *const u64;
+    let assign_fn = assign_slot.read_unaligned();
+    if !crate::gum::is_readable(assign_fn as *const c_void, 4) {
+        crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}): Assign@vtbl+0x58 ilegível"));
+        return false;
+    }
+    let assign: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(assign_fn);
+    assign(native_type, existing as *mut c_void, fresh_record);
+    crate::log(&format!("[tdbmanager] UpdateRecord(id={id:#x}, type='{class_name}') -> OK"));
+    true
+}
+
 /// Round-trip COMPLETO (canal `updaterecroundtrip`): repointa o índice do flat pra um FlatValue
 /// NOVO (mesma técnica de `prove_updaterecord`), varre a memória do record por TODAS as
 /// FlatConnections cujo prefixo (hash+len) bate com o flat (sem exigir offset — acha o que
@@ -2019,6 +2748,415 @@ pub unsafe fn prove_updaterecord_v2(class_name: &str, record_name: &str, prop_na
             "NÃO bateu — ver as listas de FlatConnections acima (antes/sem/com update)"
         }
     ));
+}
+
+// ===== ArchiveXL #59 (`PENDENCIAS-UNIFICADAS.md`, `TweakDB.hpp`): `GetRecords<R>() -> DynArray
+// <Handle<R>>` — lista TODOS os records de um TIPO. Layout `recordsByID: HashMap<TweakDBID,
+// Handle<IScriptable>>` @TweakDB+0x58, CONFIRMADO byte-a-byte contra o header REAL vendorizado
+// (`RED4ext.SDK/include/RED4ext/HashMap.hpp` + `Memory/SharedPtr.hpp`, lidos nesta sessão, não
+// suposição): `indexTable*@+0x00, size@+0x08, capacity@+0x0C, nodeList{nodes*@+0x10,
+// cap@+0x18, stride@+0x1C, nextIdx@+0x20, size@+0x24}, allocator@+0x28`; `Node{next(u32)@0,
+// hashedKey(u32)@4, key:TweakDBID(8B)@8, value:Handle<IScriptable>{instance*@0x10,
+// refCount*@0x18}}` — stride TOTAL = 0x20 (32B). Read-only puro (nunca escreve).
+
+/// Enumera `recordsByID` inteiro, filtrando por CLASSE EXATA (via `rtti::class_of` no ponteiro
+/// `instance` de cada Handle, comparado ao `CClass*` resolvido de `class_name`). Devolve pares
+/// (TweakDBID, instance ptr). `limit` corta o total de nós visitados (proteção contra loop
+/// gigante em capacity absurda); `None` se o singleton/recordsByID não estiver populado.
+pub unsafe fn get_records_of_class(t: *mut u8, reg: &crate::rtti::Registry, class_name: &str, limit: usize) -> Option<Vec<(u64, *mut c_void)>> {
+    let target_cls = reg.class_by_name(class_name);
+    if !crate::rtti::sane(target_cls) {
+        crate::log(&format!("[getrecords] classe '{class_name}' não resolveu"));
+        return None;
+    }
+    let base = t.add(0x58);
+    if !crate::gum::is_readable(base as *const c_void, 0x30) {
+        return None;
+    }
+    let index_table = rd_u64(base) as *const u32;
+    let size = (base.add(0x08) as *const u32).read_unaligned();
+    let capacity = (base.add(0x0C) as *const u32).read_unaligned();
+    let nodes = rd_u64(base.add(0x10)) as *const u8;
+    crate::log(&format!(
+        "[getrecords] recordsByID: size={size} capacity={capacity} indexTable={index_table:p} nodes={nodes:p}"
+    ));
+    if index_table.is_null() || nodes.is_null() || capacity == 0 || capacity > 5_000_000 {
+        crate::log("[getrecords] recordsByID vazio/ilegível — abortado");
+        return None;
+    }
+    if !crate::gum::is_readable(index_table as *const c_void, capacity as usize * 4) {
+        crate::log("[getrecords] indexTable ilegível");
+        return None;
+    }
+    const NODE_STRIDE: usize = 0x20;
+    let mut out = Vec::new();
+    let mut visited = 0usize;
+    'buckets: for b in 0..capacity {
+        let mut idx = index_table.add(b as usize).read_unaligned();
+        let mut guard = 0;
+        while idx != u32::MAX && guard < 10_000 {
+            guard += 1;
+            visited += 1;
+            if visited > limit {
+                crate::log(&format!("[getrecords] limite de {limit} nós visitados atingido — parando cedo"));
+                break 'buckets;
+            }
+            let node = nodes.add(idx as usize * NODE_STRIDE);
+            if !crate::gum::is_readable(node as *const c_void, NODE_STRIDE) {
+                break;
+            }
+            let key = rd_u64(node.add(0x08)); // TweakDBID
+            let instance = rd_u64(node.add(0x10)) as *mut c_void; // Handle.instance
+            if !instance.is_null() && crate::gum::is_readable(instance as *const c_void, 8) {
+                let cls = crate::rtti::class_of(instance);
+                if cls == target_cls {
+                    out.push((key, instance));
+                }
+            }
+            idx = (node as *const u32).read_unaligned(); // next
+        }
+    }
+    crate::log(&format!(
+        "[getrecords] '{class_name}': {} record(s) encontrados de {visited} nó(s) visitado(s) (size real={size})",
+        out.len()
+    ));
+    Some(out)
+}
+
+// RED4ext.SDK item #341 (`TweakDB::GetRecordsByType`/`TryGetRecordsByType`). Diferente de
+// `get_records_of_class` (varre TODO `recordsByID`@+0x58, O(n) sobre 193354 nós, filtra por
+// classe), este usa o índice DEDICADO `recordsByType: HashMap<IType*, DynArray<Handle<
+// IScriptable>>>@+0x88` (layout já confirmado ao vivo em `create_record_v2`, contra um scratch
+// — aqui aplicado pela 1ª vez contra o SINGLETON REAL) — lookup por bucket único (O(1)
+// amortizado), sem varrer o HashMap inteiro. Mesmo NODE_STRIDE=0x20 (chave=`IType*` 8B@+0x08,
+// valor=`DynArray<Handle>` 16B@+0x10: entries*@+0x10, cap(u32)@+0x18, size(u32)@+0x1C — cada
+// entry do array é um `Handle<IScriptable>` de 16B, instance*@+0). Hash da chave = FNV1a32 dos
+// 8 bytes do ponteiro (`HashMapHash<T*>`, item #367, mesma fórmula já usada em `create_record_v2`).
+pub unsafe fn get_records_by_type(t: *mut u8, native_type: *mut c_void, limit: usize) -> Option<Vec<*mut c_void>> {
+    if native_type.is_null() {
+        return None;
+    }
+    let base = t.add(0x88);
+    if !crate::gum::is_readable(base as *const c_void, 0x30) {
+        return None;
+    }
+    let index_table = rd_u64(base) as *const u32;
+    let size = (base.add(0x08) as *const u32).read_unaligned();
+    let capacity = (base.add(0x0C) as *const u32).read_unaligned();
+    let nodes = rd_u64(base.add(0x10)) as *const u8;
+    crate::log(&format!(
+        "[getrecbytype] recordsByType: size={size} capacity={capacity} indexTable={index_table:p} nodes={nodes:p}"
+    ));
+    if index_table.is_null() || nodes.is_null() || capacity == 0 || capacity > 1_000_000 {
+        crate::log("[getrecbytype] recordsByType vazio/ilegível — abortado");
+        return None;
+    }
+    if !crate::gum::is_readable(index_table as *const c_void, capacity as usize * 4) {
+        crate::log("[getrecbytype] indexTable ilegível");
+        return None;
+    }
+    const NODE_STRIDE: usize = 0x20;
+    let key_bytes = (native_type as u64).to_le_bytes();
+    let hashed_key = bwms_hashes::fnv1a32(&key_bytes);
+    let bucket = (hashed_key % capacity) as usize;
+    let mut idx = index_table.add(bucket).read_unaligned();
+    let mut guard = 0;
+    while idx != u32::MAX && guard < 10_000 {
+        guard += 1;
+        let node = nodes.add(idx as usize * NODE_STRIDE);
+        if !crate::gum::is_readable(node as *const c_void, NODE_STRIDE) {
+            break;
+        }
+        let node_key = rd_u64(node.add(0x08));
+        if node_key == native_type as u64 {
+            let entries = rd_u64(node.add(0x10)) as *const u8;
+            let dyn_size = (node.add(0x10 + 0x0C) as *const u32).read_unaligned();
+            crate::log(&format!(
+                "[getrecbytype] bucket={bucket} idx={idx} MATCH: entries={entries:p} size={dyn_size}"
+            ));
+            if entries.is_null() || dyn_size == 0 {
+                return Some(Vec::new());
+            }
+            if !crate::gum::is_readable(entries as *const c_void, dyn_size as usize * 16) {
+                crate::log("[getrecbytype] entries[] ilegível");
+                return None;
+            }
+            let n = (dyn_size as usize).min(limit);
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let inst = rd_u64(entries.add(i * 16)) as *mut c_void;
+                if !inst.is_null() {
+                    out.push(inst);
+                }
+            }
+            return Some(out);
+        }
+        idx = (node as *const u32).read_unaligned();
+    }
+    crate::log(&format!("[getrecbytype] bucket={bucket}: nenhum node com key={native_type:p} — 0 records"));
+    Some(Vec::new())
+}
+
+/// Comando `getrecbytype <classe> [limite]` — teste read-only de `get_records_by_type`, cross-
+/// validado contra `get_records_of_class` (mesma classe deve dar a MESMA contagem por 2 vias
+/// independentes: scan completo filtrado vs. lookup direto no índice por-tipo).
+pub unsafe fn getrecbytype_cmd(reg: &crate::rtti::Registry, class_name: &str, limit: usize) {
+    let Some(t) = singleton() else {
+        return crate::log("[getrecbytype] singleton indisponível");
+    };
+    let native_type = reg.class_by_name(class_name);
+    if !crate::rtti::sane(native_type) {
+        return crate::log(&format!("[getrecbytype] classe '{class_name}' não resolveu"));
+    }
+    match get_records_by_type(t, native_type as *mut c_void, limit) {
+        None => {}
+        Some(records) => {
+            crate::log(&format!(
+                "[getrecbytype] '{class_name}' (via recordsByType): {} record(s)",
+                records.len()
+            ));
+            for (i, ptr) in records.iter().take(5).enumerate() {
+                crate::log(&format!("[getrecbytype]   [{i:02}] instance={ptr:p}"));
+            }
+        }
+    }
+}
+
+/// Busca o NODE (não só o Handle.instance) de `recordsByID` cuja chave bate `id` — mesmo full-scan
+/// já provado de `get_records_of_class`, só com predicado por CHAVE em vez de filtro por classe.
+/// Devolve o ponteiro do node inteiro (não só o instance) pra permitir sobrescrever o campo
+/// Handle.instance@node+0x10 depois (usado por `create_record_alias_by_id`).
+unsafe fn find_record_node_by_id(t: *mut u8, id: u64, limit: usize) -> Option<*mut u8> {
+    let base = t.add(0x58);
+    if !crate::gum::is_readable(base as *const c_void, 0x30) {
+        return None;
+    }
+    let index_table = rd_u64(base) as *const u32;
+    let capacity = (base.add(0x0C) as *const u32).read_unaligned();
+    let nodes = rd_u64(base.add(0x10)) as *const u8;
+    if index_table.is_null() || nodes.is_null() || capacity == 0 || capacity > 5_000_000 {
+        return None;
+    }
+    const NODE_STRIDE: usize = 0x20;
+    let mut visited = 0usize;
+    for b in 0..capacity {
+        let mut idx = index_table.add(b as usize).read_unaligned();
+        let mut guard = 0;
+        while idx != u32::MAX && guard < 10_000 {
+            guard += 1;
+            visited += 1;
+            if visited > limit {
+                return None;
+            }
+            let node = nodes.add(idx as usize * NODE_STRIDE) as *mut u8;
+            if !crate::gum::is_readable(node as *const c_void, NODE_STRIDE) {
+                break;
+            }
+            let key = rd_u64(node.add(0x08));
+            if key == id {
+                return Some(node);
+            }
+            idx = (node as *const u32).read_unaligned();
+        }
+    }
+    None
+}
+
+// ArchiveXL `#59` (`TweakDB.hpp::CreateRecordAlias(recordID, aliasID)`) — item deprioritizado
+// desde 2026-08-10 (cont.161) por causa de `recordsByID` observado em `size==capacity` (zero
+// slack, growth manual pareceria arriscado). Achado (2026-08-10, cont.171): NÃO é preciso
+// implementar growth/rehash à mão — `create_record_by_id` já usa a native `CreateTDBRecord`
+// (`ADDR_CREATE_RECORD`, já PROVADA por `TweakDBManager.CreateRecord`/`CloneRecord`), que faz o
+// INSERT com growth-safety do PRÓPRIO motor (o mesmo mecanismo que qualquer record novo do jogo
+// usa). Estratégia: cria uma entrada NOVA pro `aliasID` (mesmo tipo do `recordID` fonte, via
+// `CreateTDBRecord` — deixa o motor cuidar do growth), depois REPONTA o `Handle.instance` do node
+// recém-inserido pro MESMO instance do record fonte (alias de verdade — dado compartilhado, não
+// cópia) via 1 escrita de 8 bytes (não mexe em capacity/allocator/growth nenhum). A instância
+// alocada pelo `CreateTDBRecord` pro alias fica órfã (vazada) — mesmo padrão já aceito em ~10
+// itens do catálogo RED4ext.SDK ("nunca desaloca").
+pub unsafe fn create_record_alias_by_id(t: *mut u8, reg: &crate::rtti::Registry, record_id: u64, alias_id: u64) -> bool {
+    let on = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join(".bwms-flatwrite").exists())
+        .unwrap_or(false);
+    if !on {
+        crate::log("[createalias] BLOQUEADO: crie ~/.bwms-flatwrite p/ habilitar escrita");
+        return false;
+    }
+    let Some(source_node) = find_record_node_by_id(t, record_id, 5_000_000) else {
+        crate::log(&format!("[createalias] record fonte {record_id:#x} não achado em recordsByID"));
+        return false;
+    };
+    let source_instance = rd_u64(source_node.add(0x10)) as *mut c_void;
+    if source_instance.is_null() || !crate::gum::is_readable(source_instance as *const c_void, 8) {
+        crate::log("[createalias] instance fonte nula/ilegível");
+        return false;
+    }
+    let cls = crate::rtti::class_of(source_instance);
+    let name_hash = crate::rtti::type_name_getname(cls);
+    let class_name = crate::cname::resolve_cname(name_hash);
+    if class_name.is_empty() {
+        crate::log("[createalias] classe fonte não resolveu nome");
+        return false;
+    }
+    let type_hash = record_type_key(&class_name);
+    if !create_record_by_id(type_hash, alias_id) {
+        crate::log(&format!("[createalias] CreateTDBRecord(aliasID={alias_id:#x}, type='{class_name}') falhou"));
+        return false;
+    }
+    let Some(alias_node) = find_record_node_by_id(t, alias_id, 5_000_000) else {
+        crate::log("[createalias] node do alias recém-criado não achado — abortado (sem repoint)");
+        return false;
+    };
+    // Repoint: alias.Handle.instance = source.Handle.instance (dado COMPARTILHADO, não copiado).
+    (alias_node.add(0x10) as *mut u64).write_unaligned(source_instance as u64);
+    let readback = rd_u64(alias_node.add(0x10)) as *mut c_void;
+    let ok = readback == source_instance;
+    crate::log(&format!(
+        "[createalias] aliasID={alias_id:#x} -> recordID={record_id:#x} (type='{class_name}') repoint={ok} (source={source_instance:p} readback={readback:p})"
+    ));
+    let _ = reg;
+    ok
+}
+
+// TweakXL `#34` (`TweakChangeset::ReinheritFlat`, 2026-08-10) — no C++ real é só uma QUEUE
+// (`m_reinheritedProps[aFlatId] = {sourceId, appendix}`, aplicado depois no Commit do changeset,
+// `TweakChangeset.cpp:21-31`). Mesma simplificação já documentada+aceita pro resto do
+// `TweakDBBatch` (BWMS não faz staging, aplica na hora — ver `tweakdbbatch.reds`). Repoint em vez
+// de insert: `aFlatId` (o flat do CLONE) já tem sua PRÓPRIA entry (herdada via CloneRecord/
+// InheritProps) — reponta só os 24 bits de offset (bytes 5-7, mesma máscara já usada em
+// `inherit_flats_rt`) pro offset do flat FONTE (`sourceId + "." + appendix`, derivado via
+// `tweak_db_id_derive` — mesma telescopagem de CRC já provada), mantendo os 40 bits de chave
+// (identidade) do próprio `aFlatId` intactos. 1 escrita de 8 bytes, sem grow/insert. UNGATED
+// (mesmo padrão de `api_set_flat_scalar_by_id`/`create_record_by_id`/`clone_record_by_id` — a
+// API redscript-facing `TweakDBManager`/`TweakDBBatch` não usa o marcador `.bwms-flatwrite`,
+// que é só pros comandos de console cru `setflat`/`mkflat`/`clone`, uso manual/debug).
+pub unsafe fn reinherit_flat_by_id(t: *mut u8, flat_id: u64, source_id: u64, appendix: &str) -> bool {
+    let Some(dst_entry) = find_flat_entry_by_id(t as *const u8, flat_id) else {
+        crate::log(&format!("[reinheritflat] flat alvo {flat_id:#x} não achado (precisa já existir — herdado via CloneRecord)"));
+        return false;
+    };
+    let source_flat_id = bwms_hashes::tweak_db_id_derive(source_id, &format!(".{appendix}"));
+    let Some(src_entry) = find_flat_entry_by_id(t as *const u8, source_flat_id) else {
+        crate::log(&format!(
+            "[reinheritflat] flat fonte {source_flat_id:#x} (sourceId={source_id:#x} + '.{appendix}') não achado"
+        ));
+        return false;
+    };
+    let src_val = src_entry.read_unaligned();
+    let dst_val_before = dst_entry.read_unaligned();
+    let new_val = (dst_val_before & 0xFFFF_FFFF_FF) | (src_val & 0xFFFF_FF00_0000_0000);
+    dst_entry.write_unaligned(new_val);
+    let readback = dst_entry.read_unaligned();
+    let ok = readback == new_val && (readback & 0xFFFF_FF00_0000_0000) == (src_val & 0xFFFF_FF00_0000_0000);
+    crate::log(&format!(
+        "[reinheritflat] flatId={flat_id:#x} <- sourceId={source_id:#x}+'.{appendix}' (source_flat={source_flat_id:#x}): offset {:#08x} -> {:#08x} ok={ok}",
+        (dst_val_before >> 40) & 0xFF_FFFF,
+        (readback >> 40) & 0xFF_FFFF
+    ));
+    ok
+}
+
+// TweakXL `#23` (`RegisterExtraFlat`, 2026-08-10) — adiciona um flat GENUINAMENTE NOVO (chave
+// nunca vista) com storage PRÓPRIO (diferente de CloneRecord/ReinheritFlat, que sempre repontam
+// pra storage já EXISTENTE — aqui aloca um `FlatValue` dedicado via `create_flat_value_by_id`,
+// vtable clonada de um `donor` do MESMO tipo). Fonte real: só chamado de `MetadataImporter.cpp`
+// (import de metadata `extraFlats.json`), sem tag YAML própria nem API redscript exposta —
+// mesma filosofia de `#34`: capacidade PRÓPRIA do BWMS. Insert com grow — MESMO padrão já
+// provado em `inherit_flats_rt` (cont.127-171)/`#34`, generalizado pra 1 entry nova (não N
+// heranças de classe).
+pub unsafe fn add_extra_flat_scalar_by_id(t: *mut u8, flat_id: u64, donor_type_flat_id: u64, val: u32) -> bool {
+    if find_flat_entry_by_id(t as *const u8, flat_id).is_some() {
+        crate::log(&format!("[addflat] flat {flat_id:#x} já existe — use SetFlat pra sobrescrever, não AddFlat"));
+        return false;
+    }
+    let Some(off) = create_flat_value_by_id(t, donor_type_flat_id, &val.to_le_bytes(), 8) else {
+        crate::log(&format!("[addflat] create_flat_value_by_id falhou (donorTypeFlat={donor_type_flat_id:#x} inválido? buffer cheio?)"));
+        return false;
+    };
+    let off_u = off as u32;
+    let new_entry = id_key40(flat_id)
+        | (((off_u >> 16) & 0xFF) as u64) << 40
+        | (((off_u >> 8) & 0xFF) as u64) << 48
+        | ((off_u & 0xFF) as u64) << 56;
+    let (entries, size, cap, _sp) = flats_header(t);
+    if entries.is_null() || size > 10_000_000 {
+        crate::log("[addflat] array de flats inválido");
+        return false;
+    }
+    if size + 1 > cap {
+        // GROW (mesmo padrão de inherit_flats_rt): realoca com margem, copia trailer de allocator.
+        let cur_trailer = ((entries as u64) + cap as u64 * 8 + 7) & !7;
+        if !crate::gum::is_readable(cur_trailer as *const c_void, 8) {
+            crate::log("[addflat] grow abortado: trailer de allocator ilegível");
+            return false;
+        }
+        let alloc_vft = rd_u64(cur_trailer as *const u8);
+        let new_cap = size + 257;
+        let mut buf: Vec<u64> = vec![0u64; new_cap + 1];
+        std::ptr::copy_nonoverlapping(entries as *const u64, buf.as_mut_ptr(), size);
+        buf[new_cap] = alloc_vft;
+        let new_entries = Box::leak(buf.into_boxed_slice()).as_mut_ptr();
+        merge_insert_from_end(new_entries, size, &[new_entry]);
+        if !mutex00_lock(t) {
+            crate::log("[addflat] mutex00 ocupado no grow — abortado (buffer novo vazado, inócuo)");
+            return false;
+        }
+        let (entries2, size2, cap2, _sp2) = flats_header(t);
+        if entries2 != entries || size2 != size || cap2 != cap {
+            mutex00_unlock(t);
+            crate::log("[addflat] flats mudou sob o lock — abortado SEM publicar");
+            return false;
+        }
+        let fa = t.add(FLATS_OFF + 0x08) as *mut u32;
+        let fb = t.add(FLATS_OFF + 0x0C) as *mut u32;
+        let (size_ptr, cap_ptr) = if (fa.read_unaligned() as usize) <= (fb.read_unaligned() as usize) { (fa, fb) } else { (fb, fa) };
+        (t.add(FLATS_OFF) as *mut u64).write_unaligned(new_entries as u64);
+        cap_ptr.write_unaligned(new_cap as u32);
+        size_ptr.write_unaligned((size + 1) as u32);
+        mutex00_unlock(t);
+        crate::log(&format!(
+            "[addflat] GROW: flat NOVO {flat_id:#x} inserido (cap {cap}->{new_cap}, size {size}->{}) tdbOffset={off} ✓",
+            size + 1
+        ));
+        return true;
+    }
+    if !mutex00_lock(t) {
+        crate::log("[addflat] mutex00 ocupado — abortado SEM mutar");
+        return false;
+    }
+    let (entries2, size2, cap2, size_ptr) = flats_header(t);
+    if size2 + 1 > cap2 {
+        mutex00_unlock(t);
+        crate::log("[addflat] slack sumiu sob o lock — abortado");
+        return false;
+    }
+    merge_insert_from_end(entries2, size2, &[new_entry]);
+    size_ptr.write_unaligned((size2 + 1) as u32);
+    mutex00_unlock(t);
+    crate::log(&format!(
+        "[addflat] flat NOVO {flat_id:#x} inserido (size {size2}->{}, cap {cap2}) tdbOffset={off} ✓",
+        size2 + 1
+    ));
+    true
+}
+
+/// Comando `getrecords <classe> [limite]` — teste read-only de `get_records_of_class`.
+pub unsafe fn getrecords_cmd(reg: &crate::rtti::Registry, class_name: &str, limit: usize) {
+    let Some(t) = singleton() else {
+        return crate::log("[getrecords] singleton indisponível");
+    };
+    match get_records_of_class(t, reg, class_name, limit) {
+        None => {}
+        Some(records) => {
+            for (i, (id, ptr)) in records.iter().take(10).enumerate() {
+                crate::log(&format!("[getrecords]   [{i:02}] id={id:#018x} instance={ptr:p}"));
+            }
+            if records.len() > 10 {
+                crate::log(&format!("[getrecords]   ... +{} mais (mostrando só os 10 primeiros)", records.len() - 10));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

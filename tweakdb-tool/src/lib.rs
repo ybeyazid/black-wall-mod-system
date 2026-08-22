@@ -8,5 +8,6 @@
 
 pub mod hashes;
 pub mod template;
+pub mod tweak_source;
 pub mod tweakxl;
 pub mod yaml;

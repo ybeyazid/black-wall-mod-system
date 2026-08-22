@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn basename_pega_so_o_nome() {
-        assert_eq!(basename("/Users/x/Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077"), "Cyberpunk2077");
+        assert_eq!(basename("/opt/games/Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077"), "Cyberpunk2077");
         assert_eq!(basename("libcp77_console.dylib"), "libcp77_console.dylib");
     }
 

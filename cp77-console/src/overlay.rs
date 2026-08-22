@@ -145,52 +145,59 @@ pub unsafe fn disable_app_nap() {
     }
 }
 
-/// Ponte do clipboard do sistema (NSPasteboard) pro editor de texto do imgui.
-/// Faz Cmd+C/Cmd+X/Cmd+V/Cmd+A funcionarem no console (colar comandos longos).
+/// Ponte do clipboard do sistema (NSPasteboard), extraída em funções standalone (`clipboard_get`/
+/// `clipboard_set`) — reusadas por 2 consumidores: (1) `MacClipboard` (abaixo, editor de texto do
+/// imgui — Cmd+C/Cmd+X/Cmd+V/Cmd+A no console, colar comandos longos); (2) `register.rs::tramp_ink_*`
+/// (Codeware `#100`/`inkSystem.GetClipboardText`/`SetClipboardText` — a fonte real usa a lib de 3o
+/// `clip::get_text`/`clip::set_text`, C++-only; aqui é a MESMA capacidade via a ponte NSPasteboard
+/// que este projeto já tinha, provada em produção pelo console há sessões — zero código novo de
+/// baixo nível, só reuso). `pub(crate)` pra ser visível de `register.rs` sem duplicar a ponte ObjC.
+pub(crate) unsafe fn clipboard_get() -> Option<String> {
+    let cls = class("NSPasteboard");
+    if cls.is_null() {
+        return None;
+    }
+    let pb = msg0(cls as Id, sel("generalPasteboard"));
+    if pb.is_null() {
+        return None;
+    }
+    let ty = nsstring("public.utf8-plain-text");
+    let s = msg1(pb, sel("stringForType:"), ty);
+    if s.is_null() {
+        return None;
+    }
+    let p = msg_cstr(s, sel("UTF8String"));
+    if p.is_null() {
+        return None;
+    }
+    CStr::from_ptr(p).to_str().ok().map(|x| x.to_string())
+}
+pub(crate) unsafe fn clipboard_set(value: &str) {
+    let cls = class("NSPasteboard");
+    if cls.is_null() {
+        return;
+    }
+    let pb = msg0(cls as Id, sel("generalPasteboard"));
+    if pb.is_null() {
+        return;
+    }
+    let _ = msg_usize(pb, sel("clearContents")); // NSInteger; ignora
+    let ns = nsstring(value);
+    let ty = nsstring("public.utf8-plain-text");
+    if ns.is_null() || ty.is_null() {
+        return;
+    }
+    let f: extern "C" fn(Id, Sel, Id, Id) -> bool = std::mem::transmute(objc_msgSend as *const c_void);
+    f(pb, sel("setString:forType:"), ns, ty);
+}
+
 struct MacClipboard;
 impl imgui::ClipboardBackend for MacClipboard {
     fn get(&mut self) -> Option<String> {
-        unsafe {
-            let cls = class("NSPasteboard");
-            if cls.is_null() {
-                return None;
-            }
-            let pb = msg0(cls as Id, sel("generalPasteboard"));
-            if pb.is_null() {
-                return None;
-            }
-            let ty = nsstring("public.utf8-plain-text");
-            let s = msg1(pb, sel("stringForType:"), ty);
-            if s.is_null() {
-                return None;
-            }
-            let p = msg_cstr(s, sel("UTF8String"));
-            if p.is_null() {
-                return None;
-            }
-            CStr::from_ptr(p).to_str().ok().map(|x| x.to_string())
-        }
+        unsafe { clipboard_get() }
     }
     fn set(&mut self, value: &str) {
-        unsafe {
-            let cls = class("NSPasteboard");
-            if cls.is_null() {
-                return;
-            }
-            let pb = msg0(cls as Id, sel("generalPasteboard"));
-            if pb.is_null() {
-                return;
-            }
-            let _ = msg_usize(pb, sel("clearContents")); // NSInteger; ignora
-            let ns = nsstring(value);
-            let ty = nsstring("public.utf8-plain-text");
-            if ns.is_null() || ty.is_null() {
-                return;
-            }
-            let f: extern "C" fn(Id, Sel, Id, Id) -> bool =
-                std::mem::transmute(objc_msgSend as *const c_void);
-            f(pb, sel("setString:forType:"), ns, ty);
-        }
+        unsafe { clipboard_set(value) }
     }
 }
 
@@ -309,8 +316,31 @@ pub unsafe fn force_game_frontmost() {
     if shared.is_null() {
         return;
     }
+    // DIAGNÓSTICO 2026-08-20 (madrugada, investigação "jogo nunca ganha foco de janela" — ver
+    // memória bwms-t82s-crash-vs-887pct-hang Atualização 8): `activateIgnoringOtherApps:` sozinho
+    // parou de funcionar nesta sessão (Finder sempre fica frontmost, confirmado por 3 métodos
+    // independentes). Hipótese testada aqui: a política de ativação do app pode não estar
+    // Regular (0) — setando explicitamente ANTES de ativar, e também tentando a via
+    // NSRunningApplication (API mais nova, pode ter semântica diferente de ativação forçada).
+    let policy_sel = sel("setActivationPolicy:");
+    let fp: extern "C" fn(Id, Sel, i64) -> bool = std::mem::transmute(objc_msgSend as *const c_void);
+    let ok = fp(shared, policy_sel, 0); // NSApplicationActivationPolicyRegular
+    crate::log(&format!("[focusgame] setActivationPolicy(Regular) -> {ok}"));
+
     let f: extern "C" fn(Id, Sel, bool) = std::mem::transmute(objc_msgSend as *const c_void);
     f(shared, sel("activateIgnoringOtherApps:"), true);
+
+    // Via alternativa: NSRunningApplication.currentApplication.activateWithOptions: com as 2
+    // flags mais fortes (ActivateAllWindows=1<<0 | ActivateIgnoringOtherApps=1<<1 = 3).
+    let ra_cls = class("NSRunningApplication");
+    if !ra_cls.is_null() {
+        let cur = msg0(ra_cls as Id, sel("currentApplication"));
+        if !cur.is_null() {
+            let fa: extern "C" fn(Id, Sel, u64) -> bool = std::mem::transmute(objc_msgSend as *const c_void);
+            let ok2 = fa(cur, sel("activateWithOptions:"), 3);
+            crate::log(&format!("[focusgame] NSRunningApplication.activateWithOptions(3) -> {ok2}"));
+        }
+    }
 }
 
 /// Injeta keyDown+keyUp da tecla via CGEvent (HID). O `CGEventPostToPid(getpid())` é inócuo (o jogo
@@ -319,24 +349,27 @@ pub unsafe fn force_game_frontmost() {
 /// do usuário (bug reportado: teclado dando espaço aleatório ao digitar fora do jogo). Thread-safe.
 #[cfg(feature = "autoproceed")]
 pub unsafe fn cg_press(keycode: u16) {
+    cg_key_event(keycode, true);
+    cg_key_event(keycode, false);
+}
+
+/// keyDown OU keyUp isolado (não os dois em sequência) — permite ao CALLER (ex. o bridge de
+/// visão por IA, processo EXTERNO no Mac) controlar a duração do "hold" via 2 comandos de canal
+/// separados + sleep DELE MESMO, sem nunca bloquear a thread do jogo com um sleep interno.
+/// `automacao-mundo` (2026-08-17): ponte IA-LAN precisa de movimento sustentado (WASD), não só
+/// tap — mesma receita/permissão de `cg_press` (CGEventPost de dentro do processo do jogo).
+#[cfg(feature = "autoproceed")]
+pub unsafe fn cg_key_event(keycode: u16, down: bool) {
     let pid = getpid();
     let frontmost = game_is_frontmost();
     let src = CGEventSourceCreate(1); // kCGEventSourceStateHIDSystemState
-    let down = CGEventCreateKeyboardEvent(src, keycode, true);
-    let up = CGEventCreateKeyboardEvent(src, keycode, false);
-    if !down.is_null() {
-        CGEventPostToPid(pid, down);
+    let ev = CGEventCreateKeyboardEvent(src, keycode, down);
+    if !ev.is_null() {
+        CGEventPostToPid(pid, ev);
         if frontmost {
-            CGEventPost(0, down); // global SÓ com o jogo em foco (senão vaza pros outros apps)
+            CGEventPost(0, ev); // global SÓ com o jogo em foco (senão vaza pros outros apps)
         }
-        CFRelease(down);
-    }
-    if !up.is_null() {
-        CGEventPostToPid(pid, up);
-        if frontmost {
-            CGEventPost(0, up);
-        }
-        CFRelease(up);
+        CFRelease(ev);
     }
     if !src.is_null() {
         CFRelease(src);
@@ -715,10 +748,12 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                     } else {
                         // overlay fechado: key-up de registerInput (cb recebe isDown=false).
                         let s0 = msg0(event, sel("charactersIgnoringModifiers"));
+                        let mut ch_up = String::new();
                         if !s0.is_null() {
                             let p = msg_cstr(s0, sel("UTF8String"));
                             if !p.is_null() {
                                 if let Ok(st) = CStr::from_ptr(p).to_str() {
+                                    ch_up = st.to_string();
                                     if let Some(c) = st.chars().next() {
                                         if crate::input_is(c) {
                                             crate::input_event(c, false);
@@ -727,6 +762,18 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                                 }
                             }
                         }
+                        // CET `VKBindings` (2026-08-11): metade que faltava do CallbackSystem
+                        // RawInput — captura da tecla SOLTA, mesma técnica de mapeamento/
+                        // enfileiramento do keydown (linha ~647 acima), só o destino é a fila
+                        // IRMÃ (`push_raw_key_up`, drenada como "Input/KeyUp" no `cp77_tick`).
+                        let kc_up = msg_u16(event, sel("keyCode"));
+                        let flags_up = msg_usize(event, sel("modifierFlags"));
+                        let up_shift = (flags_up & 0x0002_0000) != 0;
+                        let up_control = (flags_up & 0x0004_0000) != 0;
+                        let up_alt = (flags_up & 0x0008_0000) != 0;
+                        let mapped_key_up =
+                            crate::register::map_macos_keycode_to_einputkey(kc_up as i32, ch_up.chars().next());
+                        crate::push_raw_key_up(mapped_key_up, up_shift, up_control, up_alt);
                     }
                 }
                 1 => MOUSE_DOWN.store(true, Ordering::Relaxed), // LeftMouseDown
@@ -1079,6 +1126,8 @@ fragment float4 lut_f(float4 cur [[color(0)]], float4 pos [[position]],
     return float4(x, cur.a);
 }
 "#;
+
+static BADGE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// ReShade-Metal: preset de LUT/grading ativo (0 = off, jogo intocado). Cicla com F2.
 static LUT_PRESET: AtomicU32 = AtomicU32::new(0);
@@ -1482,6 +1531,30 @@ fn build_boot_splash(ui: &imgui::Ui, splash: Option<(f32, f32)>, w: f32, h: f32)
                     .build();
             }
 
+            // ---- promo NEONSYNC (embaixo da marca BWMS, acima da barra de progresso) ----
+            {
+                let promo_y = h * 0.60;
+                ui.set_window_font_scale(1.35);
+                let l1 = "Enjoy being a netrunner?";
+                let s1 = ui.calc_text_size(l1);
+                ui.set_cursor_pos([(w - s1[0]) * 0.5, promo_y]);
+                ui.text_colored(DIM, l1);
+
+                ui.set_window_font_scale(2.6);
+                let l2 = "NEONSYNC";
+                let s2b = ui.calc_text_size(l2);
+                let y2 = promo_y + s1[1] + 14.0;
+                ui.set_cursor_pos([(w - s2b[0]) * 0.5, y2]);
+                ui.text_colored(RED, l2);
+                ui.set_window_font_scale(1.35);
+
+                let l3 = "Search on Steam";
+                let s3 = ui.calc_text_size(l3);
+                ui.set_cursor_pos([(w - s3[0]) * 0.5, y2 + s2b[1] + 14.0]);
+                ui.text_colored(DIM, l3);
+                ui.set_window_font_scale(1.0);
+            }
+
             // ---- barra de progresso (vermelha) + texto, na base ----
             let prog = crate::selfboot::boot_progress();
             let secs = crate::selfboot::boot_elapsed_secs();
@@ -1513,7 +1586,7 @@ fn build_boot_splash(ui: &imgui::Ui, splash: Option<(f32, f32)>, w: f32, h: f32)
         });
 }
 
-fn build_badge(ui: &imgui::Ui, ticks: u64, mods: usize) {
+fn build_badge(ui: &imgui::Ui, ticks: u64) {
     let [dw, _] = ui.io().display_size;
     let flags = imgui::WindowFlags::NO_TITLE_BAR
         | imgui::WindowFlags::NO_RESIZE
@@ -1527,19 +1600,37 @@ fn build_badge(ui: &imgui::Ui, ticks: u64, mods: usize) {
     ui.window("##badge")
         .flags(flags)
         .position([dw - 14.0, 14.0], imgui::Condition::Always)
-        .position_pivot([1.0, 0.0]) // ancora pelo canto superior direito
-        .bg_alpha(0.30)
+        .position_pivot([1.0, 0.0])
+        .bg_alpha(0.22)
         .build(|| {
-            // heartbeat: alterna a cada ~6 ticks; se o runtime travar, para de piscar.
+            // pulso de heartbeat — confirma runtime vivo
             let on = (ticks / 6) % 2 == 0;
-            ui.text(if on { "[*] BWMS" } else { "[ ] BWMS" });
-            ui.same_line();
-            let tag = if mods == 0 {
-                "console".to_string()
+            let pulse = if on { [0.25, 1.0, 0.35, 1.0] } else { [0.12, 0.55, 0.18, 0.75] };
+            ui.text_colored(pulse, "■");
+
+            let (ok, warn, err, inactive) = crate::mod_counts();
+            let total = ok + warn + err + inactive;
+            if total == 0 {
+                ui.same_line();
+                ui.text_colored([0.5, 0.5, 0.5, 0.7], "0");
             } else {
-                format!("{mods} mod{}", if mods == 1 { "" } else { "s" })
-            };
-            ui.text_disabled(format!("- {tag}"));
+                if ok > 0 {
+                    ui.same_line();
+                    ui.text_colored([0.2, 1.0, 0.4, 1.0], format!("●{ok}"));
+                }
+                if warn > 0 {
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.85, 0.0, 1.0], format!("●{warn}"));
+                }
+                if err > 0 {
+                    ui.same_line();
+                    ui.text_colored([1.0, 0.2, 0.2, 1.0], format!("●{err}"));
+                }
+                if inactive > 0 {
+                    ui.same_line();
+                    ui.text_colored([0.5, 0.5, 0.5, 0.8], format!("●{inactive}"));
+                }
+            }
         });
 }
 
@@ -1696,6 +1787,67 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                     }
                     ui.separator();
                     ui.text_disabled("Cheats (Godmode/Money/Perks/Level...) ficam em Settings > Cheats, sem duplicar.");
+                }
+                // ---- MODS: lista de mods BWMS instalados com toggle ativo/inativo ----
+                if let Some(_t) = ui.tab_item("Mods") {
+                    let mut badge_on = BADGE_ENABLED.load(Ordering::Relaxed);
+                    if ui.checkbox("Exibir badge (canto superior direito)", &mut badge_on) {
+                        BADGE_ENABLED.store(badge_on, Ordering::Relaxed);
+                    }
+                    ui.separator();
+                    let (n_active, n_inactive, n_problems) = crate::mod_scan::summary();
+                    let total = n_active + n_inactive;
+                    if total == 0 {
+                        if ui.button("Escanear") {
+                            crate::mod_scan::refresh_async();
+                        }
+                        ui.same_line();
+                        ui.text_disabled("Nenhum mod em BWMS/mods/ (ainda)");
+                    } else {
+                        // Linha de resumo
+                        ui.text(format!("{n_active} ativo{} · {n_inactive} inativo{} · {n_problems} problema{}",
+                            if n_active == 1 { "" } else { "s" },
+                            if n_inactive == 1 { "" } else { "s" },
+                            if n_problems == 1 { "" } else { "s" },
+                        ));
+                        ui.same_line();
+                        if ui.button("Atualizar") {
+                            crate::mod_scan::refresh_async();
+                        }
+                        if crate::mod_scan::NEEDS_RESTART.load(std::sync::atomic::Ordering::Relaxed) {
+                            ui.same_line();
+                            ui.text_colored([1.0, 0.65, 0.0, 1.0], "⚠ Reiniciar para aplicar");
+                        }
+                        ui.separator();
+                        ui.child_window("##modlist").size([0.0, 0.0]).build(|| {
+                            let mods = crate::mod_scan::get();
+                            let mut cur_theme = String::new();
+                            for m in &mods {
+                                if m.theme != cur_theme {
+                                    if !cur_theme.is_empty() { ui.spacing(); }
+                                    ui.text_disabled(format!("[{}]", m.theme.to_uppercase()));
+                                    cur_theme = m.theme.clone();
+                                }
+                                let mut active = m.active;
+                                let label = if m.pending {
+                                    format!("{}  (aplicando…)##mod_{}", m.name, m.name)
+                                } else {
+                                    format!("{}##mod_{}", m.name, m.name)
+                                };
+                                if m.pending {
+                                    ui.text_disabled(&format!("  • {}", m.name));
+                                } else if ui.checkbox(&label, &mut active) && !m.pending {
+                                    let name = m.name.clone();
+                                    let was_active = m.active;
+                                    crate::mod_scan::toggle(name, was_active);
+                                }
+                                if let Some(prob) = &m.problem {
+                                    ui.same_line();
+                                    ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("  ✕ {prob}"));
+                                }
+                            }
+                        });
+                    }
                 }
                 // ---- K-LOG: captura de teclas (input/atalhos), fora do console ----
                 if let Some(_t) = ui.tab_item("K-LOG") {
@@ -1900,8 +2052,8 @@ unsafe fn render_imgui(cb_raw: Id, drawable: Id) {
             let splash = if rd.splash_tex.is_some() { Some(rd.splash_dim) } else { None };
             build_boot_splash(ui, splash, w, h);
         }
-        if badge && !boot {
-            build_badge(ui, crate::ticks(), crate::mods_loaded());
+        if badge && !boot && !show && BADGE_ENABLED.load(Ordering::Relaxed) {
+            build_badge(ui, crate::ticks());
         }
         if show {
             build_ui(ui, &mut rd.ui);

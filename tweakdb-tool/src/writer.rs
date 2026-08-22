@@ -308,6 +308,14 @@ impl Model {
                 }
                 Ok(tweakdb::encode_array(&blobs))
             }
+            EditOp::RemoveAll => {
+                if !is_array {
+                    return Err("'!remove-all' só vale para array".into());
+                }
+                // Sem `current_value_bytes`/split — limpa incondicionalmente, formato de
+                // serialização offline (VLQ count + elementos) suporta array vazio nativamente.
+                Ok(tweakdb::encode_array(&[]))
+            }
             EditOp::AppendFrom(src) | EditOp::PrependFrom(src) => {
                 if !is_array {
                     return Err("'!append-from'/'!merge'/'!prepend-from' só valem para array".into());

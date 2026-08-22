@@ -15,8 +15,21 @@ mod capture;
 mod camscan;
 mod cet_json;
 mod console;
+mod district;
 mod crashreport;
+// RASCUNHO (2026-08-11, prep CET `FunctionOverride`/`PENDENCIAS-UNIFICADAS.md`): hook nativo
+// (não-Lua) de função redscript por classe+método, reusando o executor `exec_replacement` já
+// hookado — ver doc-comment no topo de `fnoverride.rs`. Compilado offline, NUNCA integrado nos
+// pontos de chamada (`exec_replacement`/`api.rs`) nem testado ao vivo — módulo isolado, zero
+// efeito em runtime até alguém ligar os 3 pontos de integração documentados no arquivo.
+mod fnoverride;
 mod gum;
+// RASCUNHO (2026-08-11, prep CET `DumpVTablesTask`/`PENDENCIAS-UNIFICADAS.md` item `#44`): dump
+// de vtable→nome-de-classe por construção real de instância, versão BOUNDED/filtrada (não o
+// "tudo de uma vez" do CET original) — ver doc-comment no topo de `vtabledump.rs`. Compilado
+// offline, comando `vtabledump` wired no match de comandos (gated `dev_mode()`), NUNCA testado
+// ao vivo.
+mod vtabledump;
 // hooks (roteador de method-hook CET) e lua = só com a feature `lua`. Sem ela, stubs no-op
 // mantêm os call sites do executor/overlay intactos e o core fica 0% Lua (sem luajit).
 #[cfg(feature = "lua")]
@@ -29,6 +42,8 @@ mod lua;
 #[cfg(not(feature = "lua"))]
 #[path = "lua_stub.rs"]
 mod lua;
+mod mod_pipeline;
+mod mod_scan;
 mod overlay;
 mod plugins;
 mod register;
@@ -61,7 +76,7 @@ const LINK_BASE: u64 = 0x1_0000_0000;
 /// Endereço de carga do binário PRINCIPAL do jogo, achado por NOME (robusto —
 /// `_dyld_get_image_vmaddr_slide(0)` devolveu o slide da NOSSA dylib, não o do
 /// jogo, quando carregada via Module.load/dlopen).
-fn game_base() -> usize {
+pub(crate) fn game_base() -> usize {
     unsafe {
         let n = _dyld_image_count();
         for i in 0..n {
@@ -86,13 +101,24 @@ fn game_base() -> usize {
 /// slide. Steam/Unknown = identidade (comportamento histórico, byte-idêntico).
 pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
     let v = match game_build() {
-        GameBuild::Gog => steam_to_gog(vmaddr).unwrap_or_else(|| {
-            // Não mapeado no GOG: só addr DINÂMICO de probe/sweep dev chega aqui (todos
-            // dev-gated + checam prólogo/readable antes de tocar). Loga e passa — nunca
-            // crasha por isto; produção GOG só usa consts mapeadas.
-            log(&format!("[rebase] vmaddr {vmaddr:#x} sem mapa GOG (dev/probe?) -> passthrough"));
-            vmaddr
-        }),
+        GameBuild::Gog => match steam_to_gog(vmaddr) {
+            Some(v) => v,
+            None => {
+                // CORRIGIDO 2026-07-31 (crash real confirmado): a suposição antiga era que
+                // "passthrough" (devolver o vmaddr Steam cru) era seguro porque os call-sites
+                // checam prólogo/readable antes de tocar. FALSO — um vmaddr Steam interpretado
+                // como offset de arquivo no binário GOG (layout DIFERENTE) pode calhar numa
+                // sequência de bytes que PARECE um prólogo ARM64 válido (padrão comum,
+                // `stp`/`sub sp`) sem SER o alvo certo; um `Interceptor::replace/attach` ali
+                // corrompe código real do executável (confirmado: crash em
+                // `dyld4::Loader::runInitializersBottomUp`, dentro do binário principal —
+                // assinatura de patch aplicado em local errado, não de null-deref comum).
+                // Fix: nunca mais devolver o vmaddr cru — retorna null, que todo call-site já
+                // trata como "não instala" via `gum::is_readable` (retorna false pra null).
+                log(&format!("[rebase] vmaddr {vmaddr:#x} sem mapa GOG -> SKIP (null; nunca mais passthrough)"));
+                return core::ptr::null_mut();
+            }
+        },
         _ => vmaddr, // Steam + Unknown = identidade
     };
     (game_base() + (v - LINK_BASE) as usize) as *mut c_void
@@ -194,6 +220,66 @@ fn steam_to_gog(s: u64) -> Option<u64> {
     })
 }
 
+/// `~/.bwms-log-full` presente = AUMENTA o orçamento verbatim do `log()` de 800 pra 20000 linhas
+/// (não desliga o throttle — ver a nota dentro de `log()`).
+///
+/// **Por que existe (achado 2026-08-21):** o rate-limit global (1 em 8 depois das ~800 primeiras
+/// chamadas) foi criado em 2026-08-20 pra reduzir I/O na janela de boot, e resolve isso — mas
+/// torna TODA leitura de veredito de smoke test não-confiável: num boot com 1375 linhas, ~87% das
+/// linhas depois das 800 primeiras são descartadas em SILÊNCIO, então "0 linhas" pra um smoke não
+/// distingue "não rodou" de "a linha foi jogada fora". Isso levou a conclusões erradas — cheguei a
+/// registrar que 3 itens "precisavam de estado de jogo" quando o que faltava era a linha no log.
+///
+/// Gate próprio (não `dev_mode()`): boots de DIAGNÓSTICO ligam o marcador e recebem log COMPLETO;
+/// boots normais de dev seguem com o throttle e sua proteção. Resolvido 1x (`OnceLock`) — o
+/// caminho quente não paga syscall por chamada.
+fn log_full_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join(".bwms-log-full").exists())
+            .unwrap_or(false)
+    })
+}
+
+/// Uma anomalia é DIGNA DE LOG quando o objeto é POLIMÓRFICO e mesmo assim saiu do `Construct`
+/// com ponteiro de vtable NULO.
+///
+/// A distinção importa e é a razão de isto ser função pura testável em vez de um `if` solto:
+/// para quem deriva de `IScriptable` o offset 0 é o ponteiro de vtable (obrigatoriamente
+/// não-nulo — é objeto C++ com métodos virtuais), mas para um struct PURO (`Vector4` etc.) o
+/// offset 0 é DADO comum, e `x = 0.0` é um valor perfeitamente legítimo. Uma checagem cega em
+/// `*obj == 0` acusaria todo `Vector4` zerado como defeito.
+pub(crate) fn null_vtable_is_anomalous(derives_iscriptable: bool, vtable_word: usize) -> bool {
+    derives_iscriptable && vtable_word == 0
+}
+
+/// Log de ANOMALIA — não passa pelo rate-limit de [`log`].
+///
+/// [`log`] mantém as primeiras ~800 chamadas e depois grava só 1 em cada 8 (corte deliberado de
+/// I/O, 2026-08-20). Isso é correto para diagnóstico de sequência, e errado para um evento raro:
+/// a linha que decide uma hipótese teria 1/8 de chance de sobreviver. Como anomalia é rara por
+/// definição, gravar todas custa I/O desprezível — nada a ver com o firehose que o rate-limit
+/// existe para conter. Arquivo próprio para não se perder no meio das milhares de linhas normais.
+pub(crate) fn log_anomaly(msg: &str) {
+    #[cfg(not(feature = "devlog"))]
+    {
+        let _ = msg;
+    }
+    #[cfg(feature = "devlog")]
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/bwms-anomalias.log")
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+        log(msg); // também na trilha normal, para aparecer na sequência do boot
+    }
+}
+
 pub(crate) fn log(msg: &str) {
     // Build PÚBLICO (sem feature `devlog`): silencioso — não escreve /tmp/cp77-console.log nem
     // trace.log (o usuário final não precisa dos diagnósticos; um mod escrevendo em /tmp a cada
@@ -208,23 +294,71 @@ pub(crate) fn log(msg: &str) {
     #[cfg(feature = "devlog")]
     {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/cp77-console.log")
-    {
-        let _ = writeln!(f, "{msg}");
+    // PERF (2026-08-17, achado do dia — mesma classe de bug já corrigida em `route_native`/
+    // `capture()`): `log()` é chamado de ~324 call-sites, incl. o HOT-PATH de `exec_replacement`
+    // e seus vizinhos (`AnimationSystem_FrameBeginReset`, ticks de GameState de plugin) — sob
+    // carga pesada (streaming de boot, rajada de eventos) isso dispara MILHARES de vezes/segundo.
+    // A versão antiga reabria o arquivo (`open+append+close`, syscalls de verdade) TODA CHAMADA —
+    // custo que composto nessa escala pode facilmente virar minutos de I/O bloqueante, mesmo
+    // padrão que já explicou o travamento do `route_native` O(n) e o `capture()` sem rate-limit.
+    // Fix: handle cacheado (aberto 1x, `O_APPEND` garante posicionamento correto mesmo se algo
+    // externo truncar o arquivo entre boots — cada processo novo abre um handle novo de qualquer
+    // forma). `try_lock`: se contendido (log reentrante/concorrente), pula silenciosamente em vez
+    // de bloquear — perder uma linha de log é aceitável, travar o hot-path não é.
+    //
+    // RATE-LIMIT GLOBAL (2026-08-20, madrugada, achado desta sessão): build de teste inteira desta
+    // madrugada rodou com `devtools`(=`devlog` ligado) e reproduziu SIGSEGV+travamento de memória
+    // consistentemente (≥8 tentativas); um boot idêntico com `devlog` OFF sobreviveu 570s+ sem
+    // crash nem travamento severo, mesma memória crítica do sistema — forte indício de que o
+    // VOLUME de I/O deste log (2 escritas por chamada em dev_mode: console.log+trace.log, cada
+    // `writeln!` é 1 syscall real mesmo com handle cacheado) contribui pra fragilidade sob pressão,
+    // mesmo sem ser a causa raiz da pressão em si. Fix cirúrgico: mantém verbatim as primeiras
+    // ~800 chamadas do processo (cobre o boot inicial, onde o diagnóstico de sequência importa
+    // mais), depois passa a escrever só 1 em cada 8 — corta ~87% do volume em regime de alta
+    // atividade (exatamente a janela onde o crash/travamento historicamente acontece) sem perder
+    // a capacidade de diagnóstico (amostragem ainda mostra a sequência, só mais esparsa).
+    static LOG_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = LOG_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Orçamento de linhas VERBATIM antes do 1-em-8 começar: 800 no boot normal, 20000 quando o
+    // marcador de diagnóstico está armado. **É um TETO, não "sem limite"** — desligar o throttle
+    // por completo devolve o firehose de I/O que correlacionou com fragilidade de boot em
+    // 2026-08-20 (e um boot de 2026-08-21 com log irrestrito ficou visivelmente mais lento pra
+    // chegar na engagement). 20000 cobre com folga a janela de um veredito de smoke (um boot
+    // inteiro com throttle deu ~1375 linhas) sem virar firehose.
+    let budget: u64 = if log_full_enabled() { 20_000 } else { 800 };
+    if n >= budget && n % 8 != 0 {
+        return;
+    }
+    static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    if let Ok(mut guard) = LOG_FILE.try_lock() {
+        if guard.is_none() {
+            *guard = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/cp77-console.log")
+                .ok();
+        }
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "{msg}");
+        }
     }
     // Em dev, ESPELHA no trace.log — sink confiável p/ diagnóstico de 1 ciclo: o console.log é
     // zerado ao abrir o console in-game (perde prints), o trace.log só zera no boot. Junta num
     // lugar só: loads de mod, prints de Lua (cheats/Cron), erros — pra ler tudo de uma vez.
+    // Mesmo fix de handle cacheado (era `open+append+close` por chamada).
     if dev_mode() {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/cp77-trace.log")
-        {
-            let _ = writeln!(f, "{msg}");
+        static TRACE_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+        if let Ok(mut guard) = TRACE_FILE.try_lock() {
+            if guard.is_none() {
+                *guard = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/cp77-trace.log")
+                    .ok();
+            }
+            if let Some(f) = guard.as_mut() {
+                let _ = writeln!(f, "{msg}");
+            }
         }
     }
     } // fim do bloco #[cfg(feature = "devlog")]
@@ -261,7 +395,26 @@ pub(crate) fn trace(msg: &str) {
     }
 }
 
+/// Atraso fixo no topo do `on_load()` — fix real (não workaround de dev) do crash determinístico
+/// `brk #1`/`baseEngineInit.cpp:1094` ("Failed to initialize scripts data!") que acontecia em TODO
+/// boot com o dylib presente, independente de conteúdo/registro/comportamento (isolado por
+/// eliminação em 2026-08-19: mesmo crash com `BWMS_INERT=1`, com `register_all()` desligado, com
+/// dylib antigo pré-sessão — é corrida de timing no boot, não bug de conteúdo). Achado: rodar sob
+/// `lldb -- <exe>` (stop-at-entry) evita o crash por completo — a pausa do lldb entre dyld carregar
+/// o dylib (roda este `on_load` como parte da carga) e o processo seguir pra `main()` desloca o
+/// timing o suficiente pra sair da corrida. Um atraso artificial aqui reproduz o MESMO efeito sem
+/// precisar de debugger: confirmado em boot normal (sem lldb), GAMEPLAY real alcançada, zero crash,
+/// input funcional. `BWMS_BOOT_DELAY_MS` sobrescreve o valor (ms) pra tuning/teste.
+const BOOT_RACE_DELAY_MS: u64 = 800;
+
 extern "C" fn on_load() {
+    let delay_ms = std::env::var("BWMS_BOOT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(BOOT_RACE_DELAY_MS);
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     // Dead-man's switch do lever BwmsFireStart — TEM que rodar antes de qualquer coisa que possa
     // levar o lever a disparar nesta sessão (ver selfboot::check_stale_boot_attempt).
     selfboot::check_stale_boot_attempt();
@@ -304,6 +457,17 @@ extern "C" fn on_load() {
     // TRAVA na tela preta antes do menu. O cp77_tick recria o marcador só quando há player (gameplay).
     #[cfg(feature = "cpvr")]
     cpvr_clear_stale_ingame();
+    // Registro condicional (2026-08-07): `register_all()` lê o conteúdo dos `.reds` deployados
+    // pra só registrar no RTTI o que algum mod de fato usa (reduz a injeção no motor). Achado #1
+    // (corrigido): a 1ª tentativa lia da pasta ERRADA (`mods_dir()`=`red4ext/blackwall-mods/`,
+    // vazia/vestigial — ver `game_scripts_dir()`), causando gate-off de natives realmente usadas
+    // → crash de bind no Steam. Com o path certo (`r6/scripts`), o crash de bind AINDA
+    // reapareceu 1x — hipótese em aberto: I/O síncrono na janela crítica do hook, não mais falta
+    // de dado. Pré-popula aqui, em `on_load()` (FS comprovadamente confiável — crashreport/
+    // check_stale_boot_attempt acima leem/escrevem com sucesso), ANTES do hook nem existir — log
+    // do tamanho lido confirma se o preload aqui realmente evita I/O na hot-path mais tarde.
+    let preload_bytes = unsafe { crate::register::preload_reds_scan() };
+    log(&format!("[cp77-console] preload_reds_scan (on_load, pré-hook): {preload_bytes} bytes"));
     // F-B: instala a ponte do bind orchestrator JÁ AQUI (topo do on_load), o mais cedo possível —
     // o bind do script (RedScriptsHost::Load → orchestrator @0x1021e897c) roda muito cedo, antes
     // do overlay/selfboot. É só patch de código (sem RTTI). Gated em ~/.bwms-bind-bridge.
@@ -353,14 +517,24 @@ extern "C" fn on_load() {
     // `--features lua` ele não roda confiável (luajit muda a ordem do __mod_init_func) →
     // disparamos AQUI também, do `on_load` que SEMPRE roda. É idempotente (guard ACTIVE).
     unsafe { selfboot::selfboot_if_needed() };
-    // `axl-pathb-injection-arbitrary`: instala o hook no append de archive AQUI, no `on_load`
-    // SÍNCRONO (thread do jogo, mais cedo possível — ANTES do InitializeArchives/LoadGlobs do boot).
-    // Instalar hook de CÓDIGO da nossa thread de heartbeat NÃO efetivou a escrita (v2 não capturou
-    // nada); o copy-test que funciona instala do cp77_tick = thread do jogo. Ver `install_pathb_capture`.
-    if let Ok(hh) = std::env::var("HOME") {
-        if std::path::Path::new(&hh).join(".bwms-pathbtest").exists() {
-            unsafe { install_pathb_capture() };
-        }
+    // `axl-pathb-injection-arbitrary` + `ArchiveXL.RegisterArchive`/`RegisterDir`: instala o hook no
+    // InitializeArchives AQUI, no `on_load` SÍNCRONO (thread do jogo, mais cedo possível — ANTES do
+    // InitializeArchives/LoadGlobs do boot). Instalar hook de CÓDIGO da nossa thread de heartbeat NÃO
+    // efetivou a escrita (v2 não capturou nada); o copy-test que funciona instala do cp77_tick = thread
+    // do jogo. **Sempre instalado** (antes só sob `~/.bwms-pathbtest`) — base da API Facade shipada,
+    // não mais só probe de dev. Ver `install_pathb_capture`.
+    unsafe { install_pathb_capture() };
+    // RED4ext.SDK `#461` (`CallbackSystem.RegisterCallback(n"Pipeline/FrameBegin",...)`, ✅ FECHADO
+    // 2026-08-11): **Sempre instalado** (antes só sob `dev_mode()`+`~/.bwms-updateregistrar-probe`
+    // dentro de `install_postload_hooks()`) — mesma promoção de "probe de dev" pra "base shipada"
+    // já dada ao `install_pathb_capture()` acima. Passthrough observe-only puro, zero mudança de
+    // comportamento do jogo. Ver `install_pipeline_framebegin_probe` (selftest.rs).
+    unsafe { crate::selftest::install_pipeline_framebegin_probe() };
+    // `axl-streaming-apply` + `axl-resource-patch-apply`: instala hooks PostLoad CEDO (on_load,
+    // ANTES do carregamento de recursos). worldStreamingSector::PostLoad dispara ANTES do player
+    // spawnar — hook via postload-hook manual chega tarde demais. Gated por dev_mode().
+    if crate::dev_mode() {
+        unsafe { crate::selftest::install_postload_hooks() };
     }
     // `axl-factories-apply` E2E: instala o HookAfter em LoadFactoryAsync CEDO (antes do factory-load) +
     // enfileira o NOSSO factory CUSTOM (base\zz_bwms\bwms_factory.csv, num archive injetado via pathb).
@@ -369,6 +543,7 @@ extern "C" fn on_load() {
     if let Ok(hh) = std::env::var("HOME") {
         if std::path::Path::new(&hh).join(".bwms-facttest").exists() {
             unsafe { crate::selftest::install_factory_hook() };
+            unsafe { crate::selftest::install_resolveresource_probe() };
             crate::selftest::factory_add("base\\zz_bwms\\bwms_factory.csv");
         }
     }
@@ -404,6 +579,11 @@ extern "C" fn on_load() {
             // captura um objeto ESPÚRIO na fase-3 (asset-load) e dava falso-positivo de "gameplay" num boot travado.
             if seen_eng && player {
                 log(&format!("[hb] t={}s GAMEPLAY (engagement+player) — boot ok", t0.elapsed().as_secs()));
+                // Fallback: o getter viu real==5 na maioria dos boots, mas às vezes a transição
+                // 1→5 não passa pelo getter hookado (multi-SM, race). O heartbeat é o gate final.
+                if !selfboot::PHASE_REACHED_5.swap(true, Ordering::Relaxed) {
+                    log("[hb] PHASE_REACHED_5 setado via heartbeat (getter não viu phase=5)");
+                }
                 break;
             }
             // fase da sessão (GAME_SESSION_DESC+0x84, capturado pelo getter): 3=asset-load do boot, 1=engagement,
@@ -422,9 +602,263 @@ extern "C" fn on_load() {
                 log(&format!("[hb] t={t}s eng={eng} seen_eng={seen_eng} phase={phase}{spur} (esperando gameplay)"));
             }
             last = (eng, seen_eng, phase);
+            // 2026-08-14 (ângulo novo desta rodada, `#198`/`#199`/checkres): captura BEM CEDO no
+            // boot, ANTES de `seen_eng && player` (gameplay) — ideia nunca tentada antes nesta
+            // investigação. Toda tentativa anterior só mandava `checkreshook` depois de confirmar
+            // GAMEPLAY (o canal completo do executor/heartbeat só existe no loop PÓS-gameplay,
+            // abaixo). Mas o comentário do próprio `install_checkres_probe` já dizia que
+            // `CheckResource` "dispara continuamente durante loading real, mesmo antes de
+            // GAMEPLAY" — e o BOOT em si (fase 1-3, streaming de textura/shader/mundo) é onde essa
+            // atividade deveria ser mais densa, não depois. Whitelist mínima (só os 3 comandos
+            // desta investigação + `ping` de diagnóstico) reaproveitando as MESMAS funções
+            // thread-safe já usadas no loop pós-gameplay — `checkresbaseline`/`checkrespost` são
+            // puro drain de ring/Mutex, zero risco novo. `checkreshook` (instala
+            // `Interceptor::replace`, escreve código) AQUI roda da THREAD DO HEARTBEAT (não da
+            // game thread/executor) — categoria de risco já documentada como "nunca testada" pro
+            // `checkreshook` especificamente; testando agora de propósito, opt-in via gate próprio
+            // do probe, prefixo `[hb-early]` pra nunca confundir com o canal pós-gameplay.
+            if let Ok(cmd) = std::fs::read_to_string("/tmp/cp77-cmd.txt") {
+                let cmd = cmd.trim().to_string();
+                let consumed = match cmd.as_str() {
+                    "ping" => { log(&format!("[hb-early] pong (t={t}s, pré-gameplay)")); true }
+                    "checkreshook" => {
+                        unsafe { crate::selftest::install_checkres_probe() };
+                        log(&format!("[hb-early] checkreshook (t={t}s, pré-gameplay)"));
+                        true
+                    }
+                    "checkresbaseline" => {
+                        crate::selftest::checkres_baseline();
+                        log(&format!("[hb-early] checkresbaseline (t={t}s, pré-gameplay)"));
+                        true
+                    }
+                    "checkrespost" => {
+                        crate::selftest::checkres_post();
+                        log(&format!("[hb-early] checkrespost (t={t}s, pré-gameplay)"));
+                        true
+                    }
+                    // `findresloader` PRÉ-GAMEPLAY (2026-08-21): metade dos boots desta sessão
+                    // morreu ANTES da gameplay, e como o scan só rodava pelo canal pós-gameplay,
+                    // esses boots eram DESPERDIÇADOS por completo. Aqui ele roda mesmo num boot que
+                    // nunca chega ao jogo. É a adição mais SEGURA possível a esta whitelist: só
+                    // `mach_vm_read_overwrite` (leitura pura, thread-safe, nunca falha em página
+                    // inválida) — bem menos arriscado que o `checkreshook` que já está aqui, que
+                    // ESCREVE código via `Interceptor::replace`.
+                    c if c.starts_with("findresloader") => {
+                        let a: Vec<&str> = c.split_whitespace().collect();
+                        let start = a.get(1)
+                            .and_then(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0x1_06e0_0000);
+                        let mb = a.get(2).and_then(|x| x.parse::<u64>().ok()).unwrap_or(16);
+                        let min_size = a.get(3).and_then(|x| x.parse::<u32>().ok()).unwrap_or(64);
+                        log(&format!("[hb-early] findresloader (t={t}s, pré-gameplay)"));
+                        unsafe { crate::register::find_res_loader(start, mb, min_size) };
+                        true
+                    }
+                    _ => false,
+                };
+                if consumed {
+                    let _ = std::fs::write("/tmp/cp77-cmd.txt", "");
+                }
+            }
+            // RED4ext.SDK `#37` (`GameStates.OnUpdate`, Initialization) — MOVIDO pra ESTE loop
+            // (2026-08-11, fix desta sessão): antes vivia só no loop PÓS-gameplay (abaixo), que só
+            // começa a rodar DEPOIS que `seen_eng && player` já é true — mas com o fix de `#38`
+            // (Init.OnExit agora disparando de forma confiável na MESMA transição de presença que
+            // termina este loop, via `GS1_EXITED` em cp77_tick), `GS1_EXITED` já está `true` no
+            // instante em que o loop pós-gameplay começa — a janela de `OnUpdate(1)` tinha
+            // colapsado pra ZERO disparos (regressão que o fix de `#38` teria introduzido em `#37`
+            // se não corrigida junto). Este loop (ANTES de `seen_eng && player`) é a janela REAL de
+            // `Initialization` — dispara aqui, a cada ~2s, enquanto ainda não transicionou.
+            if !GS1_EXITED.load(Ordering::Relaxed) {
+                crate::api::call_game_state_update(1);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        // Pós-boot: game state management + canal drain, independente do executor.
+        // O executor para quando o jogo fica idle após save-load; esta thread continua.
+        loop {
+            // Canal para comandos thread-safe (sem callf/nativo que exige a game thread).
+            if let Ok(cmd) = std::fs::read_to_string("/tmp/cp77-cmd.txt") {
+                let cmd = cmd.trim().to_string();
+                if !cmd.is_empty() {
+                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                    let consumed = match parts.as_slice() {
+                        ["ping"] => { log("[hb-canal] pong"); true }
+                        ["gsenter", n] => {
+                            if let Ok(state) = n.parse::<u32>() {
+                                crate::api::call_game_state_enter(state);
+                                log(&format!("[hb-canal] call_game_state_enter({state}) ok"));
+                            }
+                            true
+                        }
+                        ["gsexit", n] => {
+                            if let Ok(state) = n.parse::<u32>() {
+                                crate::api::call_game_state_exit(state);
+                                log(&format!("[hb-canal] call_game_state_exit({state}) ok"));
+                            }
+                            true
+                        }
+                        // 2026-08-14 (achado desta rodada, `#198`/`#199`/checkres): `checkresbaseline`/
+                        // `checkrespost` são 100% thread-safe (só drenam um ring de AtomicU64 + logam —
+                        // ZERO chamada de VM/callf, ZERO instalação de hook) mas ficavam presos no canal
+                        // gated-por-executor (`cp77_tick`, lib.rs ~1466) — que SÓ roda quando
+                        // `exec_replacement` dispara. Achado ao vivo: o executor para de disparar assim
+                        // que a rajada inicial de smoke-tests do `OnGameAttached` termina e o jogo fica
+                        // "quieto" (nesta sessão, save preso numa cutscene de diálogo) — o canal fica
+                        // MORTO pro resto do boot, mesmo com `PHASE_REACHED_5=true`. Adicionadas aqui
+                        // (thread do heartbeat, sempre viva) pra nunca dependerem do executor estar
+                        // ativo. `checkreshook` (instala o `Interceptor::replace`, escreve código
+                        // executável) FICA DE FORA de propósito — patchear a partir de uma thread
+                        // diferente da que pode estar executando o alvo concorrentemente é uma categoria
+                        // de risco nova, nunca testada (e `install_pathb_capture` já documentou 1 caso
+                        // real de hook-da-thread-de-heartbeat "não efetivar a escrita" pra um alvo
+                        // diferente) — precisa ser instalado cedo, DURANTE a rajada (executor ainda
+                        // ativo), não corrigido movendo pra esta thread.
+                        ["checkresbaseline"] => {
+                            crate::selftest::checkres_baseline();
+                            log("[hb-canal] checkresbaseline (via heartbeat, sem depender do executor)");
+                            true
+                        }
+                        ["checkrespost"] => {
+                            crate::selftest::checkres_post();
+                            log("[hb-canal] checkrespost (via heartbeat, sem depender do executor)");
+                            true
+                        }
+                        // 2026-08-14 (mesma sessão, mesmo fix aplicado a `inkgetbaseline`/`inkgetpost`
+                        // — item Codeware `#120`): MESMO mecanismo/MESMA causa do `checkresbaseline`/
+                        // `checkrespost` acima — a 5ª tentativa (mesmo dia) confirmou que o canal
+                        // gated-por-executor morre ~15-20s pós-GAMEPLAY (a rajada de smoke-tests do
+                        // `OnGameAttached` termina e `exec_replacement` para de disparar), deixando
+                        // `presskey`+`inkgetpost` presos em `/tmp/cp77-cmd.txt` intocados pelo resto do
+                        // boot. `inkget_baseline`/`inkget_post` são 100% thread-safe (só drenam o ring
+                        // `INKGET_RING` de `AtomicU64` + um `Mutex<BTreeSet>` de baseline + logam — ZERO
+                        // chamada de VM/RTTI/callf, ZERO instalação de hook) — movidas aqui pelo mesmo
+                        // motivo. `inkgethook` (instala o `Interceptor::replace_adrp_br8`, escreve
+                        // código executável) fica DE FORA deste braço de propósito (não precisa: desde
+                        // `cw-inkget-autoretry`, 2026-08-16, a thread dedicada spawnada em `on_load`
+                        // já tenta instalar sozinha, repetidamente, independente deste canal — ver o
+                        // spawn logo após a thread de heartbeat, e o braço `["inkgethook"]` manual do
+                        // executor mais abaixo pra reinstalar sob demanda).
+                        ["inkgetbaseline"] => {
+                            crate::selftest::inkget_baseline();
+                            log("[hb-canal] inkgetbaseline (via heartbeat, sem depender do executor)");
+                            true
+                        }
+                        ["inkgetpost"] => {
+                            crate::selftest::inkget_post();
+                            log("[hb-canal] inkgetpost (via heartbeat, sem depender do executor)");
+                            true
+                        }
+                        // 2026-08-16/17 (rodada 41, infra pendente desde a rodada 39/40):
+                        // `archivegroupdump` é 100% read-only (zero mutação, só lê `PATHB_DEPOT`,
+                        // já capturado pelo hook `InitializeArchives` bem mais cedo no boot,
+                        // ~t=15s — MUITO antes de `PHASE_REACHED_5`/GAMEPLAY) — mesma categoria
+                        // segura de `checkresbaseline`/`inkgetbaseline` acima. Migrado pro canal
+                        // do heartbeat (sempre vivo, independente do executor) pra que diagnósticos
+                        // futuros do depot não precisem competir com a janela de risco do lock
+                        // nativo do motor (`SharedSpinLock::Lock()`, confirmado nas rodadas
+                        // 26/32/35/36, perto/depois de gameplay real). `archivegroupcreate` (muta
+                        // memória real do engine) fica DE FORA de propósito — mesma cautela que já
+                        // manteve `checkreshook`/`presskey` fora desta migração (categoria "escreve
+                        // em memória/código vivo" precisa do executor, nunca da thread do
+                        // heartbeat). Núcleo em `run_archivegroupdump()` (lib.rs, junto de
+                        // `archive_scope_name`), reusado pelo fallback do canal do executor acima.
+                        ["archivegroupdump"] => {
+                            unsafe { run_archivegroupdump() };
+                            log("[hb-canal] archivegroupdump (via heartbeat, sem depender do executor)");
+                            true
+                        }
+                        _ => false // callf/spawnsub/outros precisam da game thread — NÃO apaga
+                    };
+                    if consumed {
+                        let _ = std::fs::write("/tmp/cp77-cmd.txt", "");
+                    }
+                }
+            }
+            // (nota: `OnUpdate(1)`/Initialization foi movido pro loop DE CIMA — este loop só
+            // começa a rodar DEPOIS que `seen_eng && player` já é true, ponto em que `GS1_EXITED`
+            // já sempre disparou via `cp77_tick`; a janela real de Initialization é ANTES disso.)
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
+    // `cw-inkget-autoretry` (2026-08-16, engenharia de robustez pro item Codeware `#120`): 9
+    // tentativas MANUAIS seguidas (ver HISTORICO.md) confirmaram que a janela em que o canal do
+    // EXECUTOR fica vivo pós-gameplay é curta e IMPREVISÍVEL (às vezes fecha em 1-2s, às vezes
+    // nem isso, dependendo de quando a 2ª rajada de `OnGameAttached` do autocontinue domina o
+    // executor) — mandar `inkgethook` "na hora certa" por fora (agente/humano cronometrando)
+    // nunca convergiu de forma confiável. Em vez de continuar apostando no timing manual, o
+    // PRÓPRIO dylib agora tenta instalar o probe sozinho, repetidamente, numa THREAD DEDICADA
+    // (sempre viva desde o `on_load`, independente do executor/foco — mesma categoria da thread
+    // de heartbeat acima, só que com cadência mais apertada, 750ms, só pra esta tarefa).
+    //
+    // Por que é seguro chamar `install_inkget_probe()` em loop, de uma thread que não é a do
+    // executor: (1) `install_inkget_probe()` JÁ é idempotente por design — o primeiro `swap`
+    // em `INKGET_INSTALLED` funciona como uma trava: só 1 chamada por vez chega a de fato tentar
+    // o patch; se falhar (alvo ilegível/prólogo mudou), a flag volta pra `false` e a PRÓXIMA
+    // tentativa (deste mesmo loop) tenta de novo do zero — nunca instala 2x, nunca deixa o hook
+    // pela metade. (2) O mecanismo de escrita (`Interceptor::replace_adrp_br8`, ver `gum.rs`) é
+    // `mach_vm_protect`(COW)+`memcpy`+`sys_icache_invalidate` sobre memória do MESMO processo —
+    // opera no espaço de endereço da TASK inteira, não é uma operação por-thread; e
+    // `pthread_jit_write_protect_np` (usado só pro trampolim JIT, não pro patch em si) já é
+    // corretamente per-thread e setado/resetado dentro da própria chamada, então funciona igual
+    // não importa qual thread chama. (3) Já existe precedente direto no próprio projeto: o
+    // `checkreshook` (mesmíssima categoria — instala hook de código, ver bloco `[hb-early]`
+    // acima) foi testado ao vivo rodando desta MESMA thread de heartbeat e o hook instalou e
+    // capturou dado real (`HISTORICO.md`, 2026-08-14). O único precedente NEGATIVO conhecido
+    // (`install_pathb_capture`, comentário ~linha 393) foi pra um alvo que dispara 1 VEZ SÓ, bem
+    // cedo no boot (`InitializeArchives`) — plausivelmente um problema de JANELA (o heartbeat só
+    // chegou a instalar DEPOIS que a única chamada já tinha acontecido), não de escrita
+    // cross-thread não-visível; `Red::InkSystem::Get()` é chamado continuamente (562+ sites, o
+    // boot inteiro) — não tem essa janela de "1 chance só", então esse risco específico não se
+    // aplica aqui. Risco residual, PRÉ-EXISTENTE (não introduzido por esta mudança): qualquer
+    // inline hook nesta base de código pode colidir com outra thread lendo o mesmo prólogo no
+    // instante exato do patch (nenhum stop-the-world) — já era verdade quando `inkgethook` só
+    // rodava via comando manual do executor; mover PRA ONDE roda não muda ESSE risco específico.
+    //
+    // Gate `~/.bwms-hook-inkget-lr` (o mesmo marcador manual de sempre) checado 1x aqui, na
+    // decisão de nascer a thread — ausente = zero overhead (thread nem chega a existir) pra
+    // qualquer boot/usuário sem o marcador. `install_inkget_probe()` internamente RE-checa o
+    // mesmo gate a cada chamada (barato, mesmo padrão de outros probes do projeto) — redundante
+    // de propósito, não uma otimização perdida.
+    if let Ok(hh) = std::env::var("HOME") {
+        if std::path::Path::new(&hh).join(".bwms-hook-inkget-lr").exists() {
+            std::thread::spawn(|| {
+                // ~7,5min a 750ms — generoso (feature dev-only, gate fechado por padrão pra
+                // qualquer usuário final; não precisa ser econômico), mas não infinito: se o
+                // alvo nunca ficar legível (módulo nunca mapeado, boot travado antes disso),
+                // a thread desiste e para de gastar ciclos sozinha.
+                const MAX_ATTEMPTS: u32 = 600;
+                let mut n = 0u32;
+                loop {
+                    n += 1;
+                    log(&format!("[inkget-retry] tentativa {n}"));
+                    unsafe { crate::selftest::install_inkget_probe() };
+                    if crate::selftest::inkget_is_installed() {
+                        log(&format!(
+                            "[inkget-retry] SUCESSO na tentativa {n} — hook instalado, parando de tentar"
+                        ));
+                        // Captura de baseline AUTOMÁTICA (sem precisar do comando manual
+                        // `inkgetbaseline`): espera a instalação assentar (~10s de idle real)
+                        // e drena o ring sozinho, sempre pela mesma thread — `inkget_baseline()`
+                        // é 100% thread-safe (só drena `INKGET_RING`/`AtomicU64` + grava
+                        // `INKGET_BASELINE`/`Mutex<BTreeSet>`, zero VM/RTTI/callf).
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                        crate::selftest::inkget_baseline();
+                        log("[inkget-retry] baseline automático capturado (10s pós-instalação) — presskey/inkgetpost seguem manuais via canal (precisam de ação externa)");
+                        break;
+                    }
+                    if n >= MAX_ATTEMPTS {
+                        log(&format!(
+                            "[inkget-retry] desistindo após {n} tentativas (~{}min) — alvo nunca ficou instalável nesta sessão",
+                            (n as u64 * 750) / 60_000
+                        ));
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                }
+            });
+        }
+    }
     // Execução de comandos: NÃO numa thread nossa (instanciar item da thread
     // errada crasha) — a sonda chama `cp77_tick` de dentro do hook do executor,
     // que é a THREAD DO JOGO. (Esse mesmo mecanismo serve pro Observe/Override.)
@@ -459,18 +893,73 @@ pub(crate) fn current_tx() -> *mut c_void {
 /// Heartbeat do runtime: o cp77_tick incrementa todo tick (na thread do jogo) só
 /// quando há player/tx vivos. O badge do overlay lê isso → mostra "ativo" sem spam.
 static TICKS: AtomicU64 = AtomicU64::new(0);
-/// Quantos mods já foram carregados (loadmod) — exibido no badge.
+/// Quantos mods já foram carregados (loadmod) — mantido por compat interna.
 static MODS_LOADED: AtomicUsize = AtomicUsize::new(0);
+/// Cache do ponteiro `Red::InkSystem*` já cross-validado nesta sessão de boot (2026-08-14,
+/// Codeware `#100`/`#120`) — `get_inksystem_singleton()` grava aqui na 1ª descoberta bem
+/// sucedida pra nunca re-varrer a BSS a cada chamada de `GetLayers`/`GetLayer`/etc. 0 = ainda
+/// não resolvido nesta sessão.
+static INKSYSTEM_CACHED: AtomicU64 = AtomicU64::new(0);
+
+// ---- registry de status por mod (badge colorido) --------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) enum ModStatus {
+    Ok,
+    Warning(String),
+    Error(String),
+    Inactive,
+}
+
+pub(crate) struct ModRecord {
+    pub name: String,
+    pub status: ModStatus,
+}
+
+use std::sync::OnceLock;
+static MOD_REGISTRY: OnceLock<std::sync::Mutex<Vec<ModRecord>>> = OnceLock::new();
+
+fn mod_registry() -> &'static std::sync::Mutex<Vec<ModRecord>> {
+    MOD_REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn register_mod(name: String, status: ModStatus) {
+    if let Ok(mut r) = mod_registry().lock() {
+        r.push(ModRecord { name, status });
+    }
+}
+
+/// Retorna (ok, warn, err, inactive) — lido pelo badge do overlay.
+pub(crate) fn mod_counts() -> (usize, usize, usize, usize) {
+    let Ok(r) = mod_registry().lock() else { return (0, 0, 0, 0); };
+    r.iter().fold((0, 0, 0, 0), |acc, m| match &m.status {
+        ModStatus::Ok => (acc.0 + 1, acc.1, acc.2, acc.3),
+        ModStatus::Warning(_) => (acc.0, acc.1 + 1, acc.2, acc.3),
+        ModStatus::Error(_) => (acc.0, acc.1, acc.2 + 1, acc.3),
+        ModStatus::Inactive => (acc.0, acc.1, acc.2, acc.3 + 1),
+    })
+}
 /// Auto-load dos mods (BWMS = Black Wall Mod System): dispara UMA vez quando o RTTI
 /// fica pronto, pra a aba Mods/cheats vir ativa sem o usuário rodar `loadmods`.
 static AUTO_LOADED: AtomicBool = AtomicBool::new(false);
-static PLUGINS_LOADED: AtomicBool = AtomicBool::new(false);
-static RESLINK_LOADED: AtomicBool = AtomicBool::new(false);
-static FACTORIES_LOADED: AtomicBool = AtomicBool::new(false);
+static GS01_FIRED: AtomicBool = AtomicBool::new(false);
+/// RED4ext.SDK `#32`/`#36`/`#37`/`#38` (2026-08-11, fix desta sessão — GameStates cluster):
+/// latch de `Initialization.OnExit` (type=1), ESCOPO DE ARQUIVO (antes era uma `static` LOCAL
+/// dentro da closure da thread de heartbeat, disparada por leitura do byte de fase — achado de
+/// cont.192 (`proofs/2026-08-11-red4ext-37-gamestates-onupdate-PARCIAL.log`): essa leitura é
+/// FLAKY, às vezes o byte nunca chega a `5` de forma confiável naquela thread, mesmo quando a
+/// transição real pra Running já aconteceu). Movido pra disparar no MESMO ponto/mecanismo já
+/// PROVADO confiável pra `Running.OnEnter`/`OnExit` — a transição de presença do player dentro
+/// de `cp77_tick` (ver bloco `[cbs]` abaixo). Latch único: `Initialization` só transiciona pra
+/// `Running` 1x por processo (mesmo racional já usado pra `GS01_FIRED`).
+static GS1_EXITED: AtomicBool = AtomicBool::new(false);
 static RELOCREAL_DONE: AtomicBool = AtomicBool::new(false);
 static ATTACHDETACH_DONE: AtomicBool = AtomicBool::new(false);
 static DERIVETEST_DONE: AtomicBool = AtomicBool::new(false);
 static LOCTEST_DONE: AtomicBool = AtomicBool::new(false);
+/// `red4ext-461` Opção A: latch local barato pra parar de rechecar o marcador/estado a cada tick
+/// depois que `install_anim_framebegin_hook_if_ready()` (selftest.rs) já confirmou instalado.
+static ANIM_FRAMEBEGIN_HOOK_INSTALLED_TICK: AtomicBool = AtomicBool::new(false);
 // `axl-pathb-injection-arbitrary`: injeta um .archive fora do glob no content-group via um `replace`
 // no InitializeArchives (0x103ed96b0). A replacement chama a original (constrói TODOS os archives do
 // boot) e DEPOIS injeta — na THREAD DO JOGO, com o depot REAL (x0 do InitializeArchives, ≠ o singleton
@@ -480,9 +969,16 @@ static LOCTEST_DONE: AtomicBool = AtomicBool::new(false);
 static INIT_ARCH_ORIG: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static PATHB_HOOK_ON: AtomicBool = AtomicBool::new(false);
 static PATHB_INJECTED: AtomicBool = AtomicBool::new(false);
+/// `ArchiveXL.RegisterArchive`/`RegisterDir` (`PENDENCIAS-UNIFICADAS.md`, Facade.hpp — achado já
+/// desde 2026-07-13 nunca implementado): o `depot` REAL capturado 1x por `init_archives_replacement`
+/// (sempre instalado agora, não mais só sob `~/.bwms-pathbtest`) fica cacheado aqui pra qualquer
+/// chamada FUTURA de `RegisterArchive` (redscript, tempo de execução do mod) reusar sem precisar
+/// re-hookar nada — `InitializeArchives` só roda 1x no boot inteiro.
+static PATHB_DEPOT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static COPYTEST_DONE: AtomicBool = AtomicBool::new(false);
 static COPYTEST_ARMED: AtomicBool = AtomicBool::new(false);
 static UPDATEREC_DONE: AtomicBool = AtomicBool::new(false);
+static EQUIP_DEFERRED_DONE: AtomicBool = AtomicBool::new(false);
 /// Pasta padrão de mods. Sobreponível em runtime via `/tmp/cp77-mods-dir.txt`
 /// (a sonda pode escrever o caminho certo no boot, p/ portabilidade).
 pub(crate) fn mods_dir() -> String {
@@ -502,6 +998,14 @@ pub(crate) fn mods_dir() -> String {
     }
     // 3) dladdr falhou (não deveria acontecer): caminho relativo ao cwd, sem embutir path do jogo.
     "red4ext/blackwall-mods".to_string()
+}
+
+/// `<jogo>/r6/scripts` — onde o `scc` compila TODO `.reds` de verdade (BWMS +
+/// mods de 3os), a partir de `dylib_dir()` (`<jogo>/red4ext`). Achado 2026-08-07:
+/// `mods_dir()` (acima) NÃO é isso — aponta pra `red4ext/blackwall-mods/`, uma
+/// pasta vestigial/vazia desde 2026-07-11, sem relação com o bundle redscript real.
+pub(crate) fn game_scripts_dir() -> Option<String> {
+    dylib_dir().map(|d| format!("{d}/../r6/scripts"))
 }
 
 /// Pasta onde a NOSSA dylib está carregada (via dladdr no próprio código). Base
@@ -583,6 +1087,23 @@ pub(crate) fn push_raw_key(key: i32, shift: bool, control: bool, alt: bool) {
 fn drain_raw_keys() -> Vec<(i32, bool, bool, bool)> {
     RAW_KEYS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
+/// CET item `VKBindings` (`PENDENCIAS-UNIFICADAS.md`, 2026-08-11) — fila IRMÃ de `RAW_KEYS`,
+/// mesmo formato, mas pro evento SOLTA-tecla (KeyUp). Antes só existia captura de key-DOWN via
+/// CallbackSystem — mods conseguiam detectar "tecla pressionada" mas nunca "tecla solta"/"tecla
+/// mantida", bloqueando detecção de combo/input-contínuo (o núcleo prático de `VKBindings`, que
+/// mods redscript podem construir em cima disto). Mesmo mecanismo já provado (`cw-rawinput-
+/// realname`), só o evento nome/timing divergem — zero RE nova.
+static RAW_KEYS_UP: std::sync::Mutex<Vec<(i32, bool, bool, bool)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn push_raw_key_up(key: i32, shift: bool, control: bool, alt: bool) {
+    if let Ok(mut q) = RAW_KEYS_UP.lock() {
+        if q.len() < 64 {
+            q.push((key, shift, control, alt));
+        }
+    }
+}
+fn drain_raw_keys_up() -> Vec<(i32, bool, bool, bool)> {
+    RAW_KEYS_UP.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+}
 pub(crate) fn input_register_char(c: char) {
     let mut g = INPUT_CHARS.lock().unwrap_or_else(|e| e.into_inner());
     g.get_or_insert_with(Default::default).insert(c);
@@ -620,7 +1141,7 @@ impl Drop for TickGuard {
 }
 
 /// Versão do BWMS — escrita no splash de boot. Bumpar a cada release pro Nexus.
-pub const BWMS_VERSION: &str = "0.1.3";
+pub const BWMS_VERSION: &str = "0.1.4";
 
 /// CPVR (dev): remove o marcador `.cpvr-ingame` stale no boot (1x, no on_load), pra o cpvr.js
 /// começar com `gameplayActive=false` — sem capturar no menu/boot. O tick recria só com player vivo.
@@ -668,10 +1189,20 @@ pub extern "C" fn cp77_tick() {
         return;
     }
     let _tg = TickGuard;
+    // [execpace] rodada 31 (2026-08-17): mede o ritmo de exec_replacement, throttled a 1
+    // log/segundo, investigando o achado da rodada 30 (cadeia de ~108 `@wrapMethod(PlayerPuppet)
+    // OnGameAttached` empilhados pode nunca devolver controle dentro da janela testada). Roda
+    // ANTES de qualquer gate (registry/RTTI) de propósito — queremos ver o ritmo mesmo se o
+    // resto do tick ainda não puder agir. Puramente observacional. Ver selfboot::log_exec_pace.
+    selfboot::log_exec_pace();
     // WATCHDOG anti-hang de boot (backstop): roda ANTES do gate de registry, todo tick, pra o
     // caso do getter parar de ser chamado mas o tick seguir vivo. Idempotente/barato (ver
     // selfboot::boot_hang_watchdog — só age se skip ligado + phase<=1 após 75s).
     selfboot::boot_hang_watchdog();
+    // Proteção contra o watchdog PRÓPRIO do motor (CDPR) matando o processo sob macOS Low Power
+    // Mode (CPU/GPU throttled -> acumulado do watchdog estoura o budget default de 120s). Roda
+    // SEMPRE, todo tick, incondicional (não é diagnóstico) — ver selfboot::neutralize_engine_watchdog.
+    selfboot::neutralize_engine_watchdog();
     // SKIP-INTRO: força da phase byte DESLIGADA — escrever phase=3 dispara assert do jogo e não
     // fecha o attract screen (camada paralela). Mantido só p/ referência. Ver notes/boot-flow.
     let _ = overlay::engagement_active;
@@ -730,39 +1261,23 @@ pub extern "C" fn cp77_tick() {
             log(&format!("[bwms] pasta de mods não achada p/ auto-load: {dir}"));
         }
     }
-    // Carregador de plugin Rust (frida-free, OPT-IN): só age se houver .dylib em
-    // red4ext/plugins/. Sem plugin = zero impacto (Lua/jogo do usuário intactos).
-    if !PLUGINS_LOADED.swap(true, Ordering::Relaxed) {
-        if let Some(red4) = std::path::Path::new(&mods_dir()).parent() {
-            plugins::load_plugins(&red4.join("plugins"));
-        }
-    }
-    // resource.link/copy: se um mod instalou pares (red4ext/bwms-reslink.txt, gerado pelo
-    // mod-manager a partir do .xl), instala o hook (idempotente) + carrega a tabela. Produção:
-    // só age se o arquivo existir (mod de link presente) — sem mod = zero impacto.
-    if !RESLINK_LOADED.swap(true, Ordering::Relaxed) {
-        if let Some(red4) = std::path::Path::new(&mods_dir()).parent() {
-            let f = red4.join("bwms-reslink.txt");
-            if f.is_file() {
-                unsafe { crate::selftest::install_reslink() };
-                crate::selftest::reslink_file(&f.to_string_lossy());
-            }
-        }
-    }
-    // `axl-e2e-wire-modmanager`: espelha o auto-load do reslink acima, mas pro `axl-factories-apply`
-    // — `bwms-core::apply::apply_report` (chamado pelo `install` do mod-manager) já GERA
-    // `red4ext/bwms-factories.txt` automaticamente a partir da seção `factories:` dos `.xl` ativos
-    // (`write_factory_table`). Faltava só o RUNTIME carregar esse arquivo sozinho no boot — antes só
-    // existia via o marcador de dev `~/.bwms-facttest` (`factory_add` manual). Produção: só age se o
-    // arquivo existir (mod com factory presente) — sem mod = zero impacto.
-    if !FACTORIES_LOADED.swap(true, Ordering::Relaxed) {
-        if let Some(red4) = std::path::Path::new(&mods_dir()).parent() {
-            let f = red4.join("bwms-factories.txt");
-            if f.is_file() {
-                unsafe { crate::selftest::install_factory_hook() };
-                crate::selftest::factory_file(&f.to_string_lossy());
-            }
-        }
+    // Pipeline unificado de carga de mods (6 serem 1): ArchiveXL resource.link + factory,
+    // RED4ext plugins e scan inicial da aba Mods. Idempotente — roda só na 1ª iteração.
+    mod_pipeline::boot_phase();
+    // RED4ext.SDK #32/#36/#37/#38 (2026-08-11): cobertura completa de `EGameStateType` —
+    // `BaseInitialization`(0)/`Initialization`(1) NUNCA disparavam antes (só `Running`(2, via
+    // heartbeat phase-tracking) e `Shutdown`(3, via exit hook)). `boot_phase()` (acima) é o
+    // 1º ponto idempotente ONDE plugins já tiveram chance de `add_game_state` (carregados
+    // dentro dele, via `mod_pipeline::load_plugins`) — dispara enter(0)→exit(0)→enter(1) aqui,
+    // 1x. `exit(1)` dispara mais abaixo, na thread de heartbeat, na 1ª transição real pra
+    // Running (mesmo sinal já usado pro `enter(2)`). Mapeamento é uma decisão pragmática (não
+    // verificada contra o binário real) — residual: callback pode disparar num momento
+    // ligeiramente diferente do original Windows, não um risco de crash.
+    if !GS01_FIRED.swap(true, Ordering::Relaxed) {
+        crate::api::call_game_state_enter(0);
+        crate::api::call_game_state_exit(0);
+        crate::api::call_game_state_enter(1);
+        log("[gs] call_game_state_enter(0)+exit(0)+enter(1) — cobertura BaseInitialization/Initialization");
     }
     // `red4ext-reloc-universal` one-shot NO MENU: gated por `~/.bwms-relocreal`. Roda AQUI (antes do
     // gate de player) porque o alvo é um dtor de IA de NPC — dormente no menu (mundo não carregado),
@@ -790,6 +1305,16 @@ pub extern "C" fn cp77_tick() {
             let _ = std::fs::remove_file(&m);
             unsafe { prove_derive() };
         }
+    }
+    // `red4ext-461` (✅ FECHADO 2026-08-11, promovido pra sempre-ativo 2026-08-17): hookar o
+    // `invoke` REAL do callback já registrado pelo `AnimationSystem_FrameBeginReset` vanilla,
+    // capturado pelo probe observe-only de `UpdateRegistrar::RegisterUpdate`
+    // (`install_pipeline_framebegin_probe`, sempre instalado no `on_load` agora — nenhum marcador
+    // necessário). Rechecado todo tick até o ponteiro ter sido capturado — idempotente, barato.
+    if !ANIM_FRAMEBEGIN_HOOK_INSTALLED_TICK.load(Ordering::Relaxed)
+        && unsafe { crate::selftest::install_anim_framebegin_hook_if_ready() }
+    {
+        ANIM_FRAMEBEGIN_HOOK_INSTALLED_TICK.store(true, Ordering::Relaxed);
     }
     // (loctest movido pra a thread do heartbeat — o cp77_tick/executor é intermitente por foco.)
     // `axl-copy-makeexist`: redirect de path inexistente (roda no MENU). Máquina de estados dirigida
@@ -834,7 +1359,21 @@ pub extern "C" fn cp77_tick() {
         // o mundo assentar" — ver BwmsTppPoller/tweakxl-updaterecord acima). `Player/Spawned` (sem
         // handle) continua disparando na hora — não usa `Handle_ctor`, não é suspeito.
         static PENDING_HANDLE_EVENTS_AT: AtomicU64 = AtomicU64::new(0); // tick-alvo; 0 = nada pendente
+        // ptr do player salvo antes da transição null — Entity/Detach precisa dele quando player já é null
+        static LAST_ENTITY_PTR: AtomicUsize = AtomicUsize::new(0);
         const HANDLE_EVENTS_DELAY_TICKS: u64 = 180; // ~3-6s no ritmo já usado por TICKS neste arquivo
+        // 2026-08-20 (madrugada, sessão 2, retomada pós-compactação): 4/4 crashes SIGSEGV reproduzidos
+        // nesta sessão (mesma assinatura de sempre, `EXC_BAD_ACCESS`/zero frame nosso na pilha) sempre
+        // IMEDIATAMENTE APÓS `mod_pipeline::session_phase` (scan RTTI de ~27800 tipos procurando
+        // `ScriptableTweak`, `[tweakxl] GetAllTypes`) terminar de rodar no MESMO tick dos 4
+        // `fire_event_args` acima — nunca durante os 4 eventos em si, sempre logo depois do scan+
+        // dispatch do TweakXL completar. Candidato de fix já listado em sessões anteriores, testado
+        // agora pela 1ª vez: dar ao scan TweakXL um tick-alvo PRÓPRIO, mais tarde que os 4 eventos
+        // (não junto no mesmo tick) — reduz a chance de o scan pesado colidir com a mesma janela de
+        // fila-de-eventos do motor que os 4 `fire_event_args` já ocupam. Ver memória
+        // `bwms-t82s-crash-vs-887pct-hang` (Atualização 10).
+        static PENDING_SESSION_PHASE_AT: AtomicU64 = AtomicU64::new(0); // tick-alvo p/ o scan TweakXL; 0 = nada pendente
+        const SESSION_PHASE_EXTRA_DELAY_TICKS: u64 = 120; // ~2-4s DEPOIS dos 4 eventos (soma a HANDLE_EVENTS_DELAY_TICKS)
         let present = !player.is_null() && !tx.is_null();
         if present != PLAYER_PRESENT.swap(present, Ordering::Relaxed) {
             let ev = if present { "Player/Spawned" } else { "Player/Despawned" };
@@ -845,6 +1384,17 @@ pub extern "C" fn cp77_tick() {
                 // anti-crash do redDispatcher também no modo 0 (onde o getter de skip — a única fonte
                 // de PHASE_REACHED_5 — não instala). Latcha.
                 selfboot::POST_SAVELOAD.store(true, Ordering::Relaxed);
+                LAST_ENTITY_PTR.store(player as usize, Ordering::Relaxed);
+                // RED4ext.SDK `#32`/`#36`/`#37`/`#38` (2026-08-11, fix desta sessão): `Initialization.
+                // OnExit` (type=1) TEM que disparar ANTES de `Running.OnEnter` — mesma transição, mesmo
+                // instante, mesmo mecanismo (presença do player, já provado confiável pro Running) em
+                // vez do byte de fase lido pela thread de heartbeat (flaky, ver `GS1_EXITED` acima).
+                if !GS1_EXITED.swap(true, Ordering::Relaxed) {
+                    crate::api::call_game_state_exit(1);
+                    crate::log("[gs] call_game_state_exit(1) — saiu de Initialization, entrando em Running (via presença do player)");
+                }
+                // red4ext-gamestates-add: Running.OnEnter (type=2) — player spawnando = estado Running
+                crate::api::call_game_state_enter(2);
                 // NÃO dispara Session/Start/Entity/Attach aqui — agenda pra N ticks depois (bloco
                 // fora do `if`, abaixo), fora da janela de flood do save-load real.
                 let target = TICKS.load(Ordering::Relaxed) + HANDLE_EVENTS_DELAY_TICKS;
@@ -853,13 +1403,32 @@ pub extern "C" fn cp77_tick() {
                     "[cbs] Session/Start+Entity/Attach AGENDADOS pra tick>={target} (delay anti-crash, atual={})",
                     TICKS.load(Ordering::Relaxed)
                 ));
+                // session_phase (scan TweakXL) agendado num tick DEPOIS dos 4 eventos acima —
+                // ver comentário de `SESSION_PHASE_EXTRA_DELAY_TICKS` acima.
+                let sp_target = target + SESSION_PHASE_EXTRA_DELAY_TICKS;
+                PENDING_SESSION_PHASE_AT.store(sp_target, Ordering::Relaxed);
+                crate::log(&format!(
+                    "[cbs] session_phase (scan TweakXL) AGENDADO pra tick>={sp_target} (separado dos 4 eventos, +{SESSION_PHASE_EXTRA_DELAY_TICKS} ticks)"
+                ));
             } else {
                 // Despawn/End: sem o padrão de flood conhecido (mundo saindo, não entrando) — mantém
                 // imediato, e também cancela qualquer disparo pendente de uma sessão anterior.
                 PENDING_HANDLE_EVENTS_AT.store(0, Ordering::Relaxed);
+                PENDING_SESSION_PHASE_AT.store(0, Ordering::Relaxed);
+                // red4ext-gamestates-add: Running.OnExit (type=2) — player despawnando = saindo do Running
+                crate::api::call_game_state_exit(2);
                 if let Some(arg) = unsafe { register::make_gamesessionevent_arg(false, true) } {
                     let n2 = unsafe { register::fire_event_args("Session/End", &[arg]) };
                     crate::log(&format!("[cbs] Session/End (GameSessionEvent real) → {n2} callback(s)"));
+                }
+                // `cw-controller-entity` sub-evento: "Entity/Detach" (EntityDetachHook.hpp) —
+                // usa LAST_ENTITY_PTR pq player já é null aqui na transição de despawn.
+                let last = LAST_ENTITY_PTR.load(Ordering::Relaxed) as *mut c_void;
+                if !last.is_null() {
+                    if let Some(arg) = unsafe { register::make_entitylifecycleevent_arg(last) } {
+                        let nd = unsafe { register::fire_event_args("Entity/Detach", &[arg]) };
+                        crate::log(&format!("[cbs] Entity/Detach (EntityLifecycleEvent real) → {nd} callback(s)"));
+                    }
                 }
             }
         }
@@ -869,7 +1438,20 @@ pub extern "C" fn cp77_tick() {
         let pending = PENDING_HANDLE_EVENTS_AT.load(Ordering::Relaxed);
         if pending != 0 && TICKS.load(Ordering::Relaxed) >= pending {
             PENDING_HANDLE_EVENTS_AT.store(0, Ordering::Relaxed);
-            if PLAYER_PRESENT.load(Ordering::Relaxed) && present {
+            // DIAGNÓSTICO TEMPORÁRIO (2026-08-20, investigação do crash SIGSEGV redDispatcher da
+            // madrugada, ver memória `bwms-t82s-crash-vs-887pct-hang` Atualização 3b/4): teste de
+            // eliminação — se `~/.bwms-diag-skip-delayed-dispatch` existir, pula TODO este bloco
+            // (Session/Start+Entity/Assemble+Entity/Attach+Component/Toggle; `session_phase`/scan
+            // TweakXL agora tem tick-alvo PRÓPRIO, separado, ver bloco abaixo)
+            // pra ver se o crash intermitente na fila de eventos do motor (`redDispatcher*`) some.
+            // Remover este gate depois que a causa for isolada (não é fix permanente).
+            let skip_diag = std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::Path::new(&h).join(".bwms-diag-skip-delayed-dispatch").exists())
+                .unwrap_or(false);
+            if skip_diag {
+                crate::log("[diag] ~/.bwms-diag-skip-delayed-dispatch presente — PULANDO Session/Start+Entity/Assemble+Entity/Attach+Component/Toggle (teste de eliminação)");
+            } else if PLAYER_PRESENT.load(Ordering::Relaxed) && present {
                 // `cw-controller-session`: "Session/Start" (nome REAL do Codeware,
                 // `CallbackSystem::SessionStartEventName`). `restored=true` (auto-continue SEMPRE
                 // carrega save) / `pregame=false` (player só presente pós-char-creation).
@@ -877,11 +1459,52 @@ pub extern "C" fn cp77_tick() {
                     let n2 = unsafe { register::fire_event_args("Session/Start", &[arg]) };
                     crate::log(&format!("[cbs] Session/Start (GameSessionEvent real, atrasado {HANDLE_EVENTS_DELAY_TICKS} ticks) → {n2} callback(s)"));
                 }
+                // `cw-entity-builder` (2026-07-24): "Entity/Assemble" (nome REAL,
+                // `EntityAssembleHook.hpp`) — achado da investigação paralela: carrega o MESMO
+                // `EntityLifecycleEvent` que "Entity/Attach" (não `EntityBuilderEvent`, esse é
+                // específico de "Entity/Extract"), então dispara pelo MESMO mecanismo já provado,
+                // zero RE nova. Ordem real do motor: Assemble roda ANTES de Attach — disparado
+                // primeiro aqui pelo mesmo motivo (um `Entity.AddComponent` feito no handler de
+                // Assemble deveria já estar no array quando o Attach nativo roda de verdade).
+                if let Some(arg) = unsafe { register::make_entitylifecycleevent_arg(player) } {
+                    let n0 = unsafe { register::fire_event_args("Entity/Assemble", &[arg]) };
+                    crate::log(&format!("[cbs] Entity/Assemble (EntityLifecycleEvent real, atrasado {HANDLE_EVENTS_DELAY_TICKS} ticks) → {n0} callback(s)"));
+                }
                 // `cw-controller-entity`: "Entity/Attach" (nome REAL, `EntityAttachHook.hpp`) com
                 // `EntityLifecycleEvent` real (`GetEntity()->ref<Entity>`, "raw"/sem dono).
                 if let Some(arg) = unsafe { register::make_entitylifecycleevent_arg(player) } {
                     let n3 = unsafe { register::fire_event_args("Entity/Attach", &[arg]) };
                     crate::log(&format!("[cbs] Entity/Attach (EntityLifecycleEvent real, atrasado {HANDLE_EVENTS_DELAY_TICKS} ticks) → {n3} callback(s)"));
+                }
+                // Codeware `#9` (2026-08-11): "Component/Toggle" (nome REAL, `ComponentTarget.hpp`
+                // wiki) com `EntityComponentEvent` real e um COMPONENTE GENUÍNO do player (1º slot
+                // vivo de `entity+0xA0`, não fixture) — testa `GetComponent()->wref<IComponent>`
+                // com dado real, mesmo padrão de disparo diagnóstico atrasado já usado acima.
+                let comp = unsafe { register::first_component(player) };
+                if !comp.is_null() {
+                    if let Some(arg) = unsafe { register::make_entitycomponentevent_arg(comp) } {
+                        let n4 = unsafe { register::fire_event_args("Component/Toggle", &[arg]) };
+                        crate::log(&format!("[cbs] Component/Toggle (EntityComponentEvent real, componente={comp:p}, atrasado {HANDLE_EVENTS_DELAY_TICKS} ticks) → {n4} callback(s)"));
+                    }
+                }
+            }
+        }
+        // session_phase (scan TweakXL/GetAllTypes) — tick-alvo PRÓPRIO, separado dos 4 eventos
+        // acima (ver `SESSION_PHASE_EXTRA_DELAY_TICKS`). Mesmo gate de diagnóstico (consistência:
+        // se o usuário pediu pra pular tudo, pula os dois blocos).
+        let sp_pending = PENDING_SESSION_PHASE_AT.load(Ordering::Relaxed);
+        if sp_pending != 0 && TICKS.load(Ordering::Relaxed) >= sp_pending {
+            PENDING_SESSION_PHASE_AT.store(0, Ordering::Relaxed);
+            let skip_diag = std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::Path::new(&h).join(".bwms-diag-skip-delayed-dispatch").exists())
+                .unwrap_or(false);
+            if skip_diag {
+                crate::log("[diag] ~/.bwms-diag-skip-delayed-dispatch presente — PULANDO session_phase (teste de eliminação)");
+            } else if PLAYER_PRESENT.load(Ordering::Relaxed) && present {
+                // Pipeline TweakXL Session/Start: ScriptableTweak dispatch + YAML auto-apply dos mods.
+                if let Some(reg) = unsafe { rtti::Registry::obtain() } {
+                    unsafe { mod_pipeline::session_phase(&reg) };
                 }
             }
         }
@@ -909,6 +1532,11 @@ pub extern "C" fn cp77_tick() {
             crate::log(&format!("[cbs] Resource/Load (ResourceEvent real, path_hash={h:#018x}) → {n} callback(s)"));
         }
     }
+    // ArchiveXL `#47` (`CustomizationExtension`, 2026-08-14): drena os 3 edge flags marcados por
+    // `BwmsCustomizationEdge` (chamado sincronamente pelos wraps em `characterCreationBodyMorphMenu`)
+    // — MESMO padrão seguro de "Resource/Load" acima (edge setado por native chamado por bytecode
+    // → dispatch de verdade só aqui, fora de qualquer nesting de call_func).
+    unsafe { register::drain_customization_edges() };
     if player.is_null() || tx.is_null() {
         return;
     }
@@ -1004,6 +1632,59 @@ pub extern "C" fn cp77_tick() {
                 unsafe { crate::tweakdb_rt::prove_updaterecord() };
             }
         }
+    }
+    // `axl-puppet-state-apply` (2026-08-02, iteração 2): dispara a recuperação ATRASADA do
+    // soft-lock do espelho, se `BwmsPuppetStateArmRecovery` armou uma (ver register.rs). Roda
+    // todo tick, é um no-op de load quando nada está pendente (checa 1 AtomicU64).
+    unsafe { register::puppetstate_recovery_tick(reg) };
+    // `axl-garment-apply` (2026-08-02): teste da hipótese do agente de RE do crash de `equiponce`
+    // (`EquipmentSystem::QueueRequest` crasha porque `CClassFunction::GetInvokable()` retorna null —
+    // possível dependência de contexto/thread, não de cache-warmup). Em vez de disparar na hora que o
+    // comando chega (thread arbitrária, pode ser reentrante numa chamada nativa qualquer do motor),
+    // dispara UMA VEZ desta MESMA posição periódica onde `BwmsPluginOnUpdate` já fez centenas de
+    // chamadas sem incidente — mesmo TICKS>N de "deixar a sessão assentar", SEM o gate de
+    // `in_crash_window` (esse gate é sobre proximidade de save-load, não é a preocupação aqui).
+    // Gated marcador ~/.bwms-equipdeferred + ~/.bwms-equip=1/2/3 (mesmo seletor de item de sempre).
+    if !EQUIP_DEFERRED_DONE.load(Ordering::Relaxed) && TICKS.load(Ordering::Relaxed) > 120 {
+        if let Ok(h) = std::env::var("HOME") {
+            let m = std::path::Path::new(&h).join(".bwms-equipdeferred");
+            if m.exists() && !EQUIP_DEFERRED_DONE.swap(true, Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&m);
+                unsafe {
+                    if !player.is_null() {
+                        let gi: Option<[u8; 16]> = rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                            rtti::call_func(&gg, player, &[]).map(|b| {
+                                let mut o = [0u8; 16];
+                                o.copy_from_slice(&b[..16]);
+                                o
+                            })
+                        });
+                        match gi {
+                            Some(gi) => {
+                                let f = register::get_function(reg, "BwmsForceEquipOnce");
+                                if rtti::sane(f) {
+                                    let rf = rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                                    if rtti::call_func(&rf, std::ptr::null_mut(), &[rtti::Arg::Raw(gi)]).is_some() {
+                                        log("[equipdeferred] BwmsForceEquipOnce(game) chamado do tick periódico (rota alternativa, teste de contexto/thread)");
+                                    } else {
+                                        log("[equipdeferred] call_func não completou");
+                                    }
+                                } else {
+                                    log("[equipdeferred] BwmsForceEquipOnce não resolveu");
+                                }
+                            }
+                            None => log("[equipdeferred] PlayerPuppet.GetGame falhou"),
+                        }
+                    } else {
+                        log("[equipdeferred] player null");
+                    }
+                }
+            }
+        }
+    }
+    // `tweakxl-hot-reload`: poll de mtime a cada ~10s; re-aplica yamls se algum mudou.
+    if !in_crash_window {
+        unsafe { mod_pipeline::hot_reload_tick(reg) };
     }
     // breadth Reflection: probe de CProperty num objeto VIVO (gated ~/.bwms-reflection-test), 1x.
     unsafe { register::reflection_live_once(player) };
@@ -1146,6 +1827,8 @@ pub extern "C" fn cp77_tick() {
         // "Session/Update" = evento PERIÓDICO (onUpdate, callback contínuo de mod). 2º tipo de evento.
         if t % 180 == 0 {
             unsafe { register::fire_event("Session/Update") };
+            // red4ext-gamestates-add: Running.OnUpdate (type=2)
+            crate::api::call_game_state_update(2);
         }
         // "Session/Tick" = evento periódico que PASSA DADO (o nº do tick) pro callback — prova que o
         // evento carrega args (= o que input/entity events precisam). callback = OnBwmsTick(n: Int32).
@@ -1158,12 +1841,30 @@ pub extern "C" fn cp77_tick() {
     if hooks::has_pending() {
         unsafe { hooks::drain_pending(reg) };
     }
-    // comando pendente (do overlay ou de fora, via /tmp)
-    let cmd = std::fs::read_to_string("/tmp/cp77-cmd.txt").unwrap_or_default();
-    let cmd = cmd.trim().to_string();
-    if !cmd.is_empty() {
-        let _ = std::fs::remove_file("/tmp/cp77-cmd.txt");
-        run_cmd(reg, player, tx, &cmd);
+    // comando(s) pendente(s) (do overlay ou de fora, via /tmp) — suporta múltiplas linhas.
+    // Gate: só processa em gameplay (phase==5). Durante boot/menu, comandos como `postloadprobe`
+    // constroem objetos complexos antes do engine estar pronto → crash (2026-07-27).
+    // O arquivo fica intacto até phase5 chegar — sem perda de comandos.
+    // CORREÇÃO 2026-07-27: gate original usava GAME_SESSION_DESC+0x84 que trava no objeto TRANSIENTE
+    // da engagement e NUNCA re-captura o objeto real pós-save-load (bug documentado em selfboot.rs:1039-1048).
+    // Substituído por PHASE_REACHED_5 (event-based, set na 1ª vez que QUALQUER getter vê phase=5).
+    // Player é garantido não-nulo aqui (gate player/tx em cima já retornou).
+    // CORREÇÃO 2026-07-31 (RE do crash do `equiponce`): + `!exec_nested()` — não roda a fila se a
+    // chamada ATUAL do executor está aninhada dentro de uma chamada do motor ainda em voo nesta
+    // thread (mesmo mecanismo do crash: `call_func` síncrono disparado no meio de uma execução já
+    // em andamento). Arquivo fica intacto (não é consumido) — tenta de novo no próximo tick não-aninhado.
+    {
+        let canal_phase5 = selfboot::PHASE_REACHED_5.load(Ordering::Relaxed);
+        if canal_phase5 && !selfboot::exec_nested() {
+            let content = std::fs::read_to_string("/tmp/cp77-cmd.txt").unwrap_or_default();
+            let cmds: Vec<&str> = content.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            if !cmds.is_empty() {
+                let _ = std::fs::remove_file("/tmp/cp77-cmd.txt");
+                for cmd in cmds {
+                    run_cmd(reg, player, tx, cmd);
+                }
+            }
+        }
     }
     // hotkeys pressionados (registerHotkey) → dispara callbacks na thread do jogo.
     for c in hotkey_drain() {
@@ -1178,8 +1879,24 @@ pub extern "C" fn cp77_tick() {
     // — antes era o keycode cru como Int32; agora constrói+despacha o objeto real via
     // `Arg::Handle`, mesmo nome de evento REAL do Codeware, `Input/Key`).
     for (key, shift, control, alt) in drain_raw_keys() {
-        if let Some(arg) = unsafe { register::make_keyinputevent_arg(key, shift, control, alt) } {
+        // `IACT_PRESS`: tecla DESCENDO (2026-08-21 — antes ia `2`/`IACT_Release` fixo aqui e no
+        // KeyUp abaixo, ver `make_keyinputevent_arg`).
+        let arg = unsafe { register::make_keyinputevent_arg(register::IACT_PRESS, key, shift, control, alt) };
+        if let Some(arg) = arg {
             unsafe { register::fire_event_args("Input/Key", &[arg]) };
+        }
+    }
+    // CET `VKBindings` (2026-08-11): metade que faltava — emite "Input/KeyUp" com o MESMO
+    // `ref<KeyInputEvent>` real (reuso puro do construtor já provado), pra CADA tecla solta
+    // capturada no sendEvent durante gameplay. Nome de evento distinto (não reaproveita
+    // "Input/Key") segue o padrão já estabelecido no projeto de sinalizar fases por NOME
+    // (`Session/Start`/`Session/End`, `Overlay/Open`/`Overlay/Close`) em vez de um campo
+    // extra no evento.
+    for (key, shift, control, alt) in drain_raw_keys_up() {
+        // `IACT_RELEASE`: tecla SUBINDO — o único caso em que o `2` antigo estava certo por acaso.
+        let arg = unsafe { register::make_keyinputevent_arg(register::IACT_RELEASE, key, shift, control, alt) };
+        if let Some(arg) = arg {
+            unsafe { register::fire_event_args("Input/KeyUp", &[arg]) };
         }
     }
     // lifecycle: onOverlayOpen/onOverlayClose quando o console abre/fecha (lua) + equivalente
@@ -1269,6 +1986,7 @@ fn load_mods_dir(dir: &str, prod_only: bool) -> usize {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         if prod_only && (name.contains("Test") || name.starts_with("CPVR")) {
+            register_mod(name.clone(), ModStatus::Inactive);
             continue; // fora do default; carregável no `loadmods` manual
         }
         let init = path.join("init.lua");
@@ -1277,9 +1995,13 @@ fn load_mods_dir(dir: &str, prod_only: bool) -> usize {
                 Ok(src) => {
                     unsafe { lua::run_mod(&name, &src, path) };
                     count += 1;
+                    register_mod(name.clone(), ModStatus::Ok);
                     log(&format!("[mods] carregado: {}", init.display()));
                 }
-                Err(er) => log(&format!("[mods] erro lendo {}: {er}", init.display())),
+                Err(er) => {
+                    register_mod(name.clone(), ModStatus::Error(er.to_string()));
+                    log(&format!("[mods] erro lendo {}: {er}", init.display()));
+                }
             }
         }
     }
@@ -1739,17 +2461,24 @@ unsafe extern "C" fn init_archives_replacement(depot: *mut c_void) -> u64 {
     let orig = INIT_ARCH_ORIG.load(Ordering::Relaxed);
     let f: unsafe extern "C" fn(*mut c_void) -> u64 = core::mem::transmute(orig);
     let ret = f(depot); // constrói os ~N archives do boot no depot
-    if !PATHB_INJECTED.swap(true, Ordering::Relaxed)
-        && !depot.is_null()
-        && crate::gum::is_readable(depot as *const c_void, 0x80)
-    {
-        pathb_inject(depot as *mut u8);
+    if !depot.is_null() && crate::gum::is_readable(depot as *const c_void, 0x80) {
+        // Cacheia SEMPRE — base de `facade_register_archive`/`facade_register_dir`, chamáveis a
+        // qualquer momento depois (InitializeArchives só roda esta 1x por boot).
+        PATHB_DEPOT.store(depot, Ordering::Relaxed);
+        // Regressão do achado original (`axl-pathb-injection-arbitrary`), só sob marker de dev —
+        // injeta um .archive de teste fixo, comportamento preservado 1:1.
+        if !PATHB_INJECTED.swap(true, Ordering::Relaxed) {
+            pathb_inject(depot as *mut u8);
+        }
     }
     ret
 }
 
-/// Instala o `replace` no InitializeArchives (uma vez, cedo — do on_load/thread do jogo). Gated pelo
-/// chamador (marker). Ver `init_archives_replacement`.
+/// Instala o `replace` no InitializeArchives (uma vez, cedo — do on_load/thread do jogo). Ver
+/// `init_archives_replacement`. **Sempre instalado agora** (não mais só sob `~/.bwms-pathbtest`) —
+/// vira base de uma capacidade shipada (`ArchiveXL.RegisterArchive`), não mais só probe de dev.
+/// Risco: baixo — a replacement SEMPRE chama a original primeiro (constrói os archives do boot
+/// normalmente); o único efeito extra incondicional é guardar 1 ponteiro num `AtomicPtr`.
 unsafe fn install_pathb_capture() {
     if PATHB_HOOK_ON.swap(true, Ordering::Relaxed) {
         return;
@@ -1769,25 +2498,17 @@ unsafe fn install_pathb_capture() {
     }
 }
 
-/// `axl-pathb-injection-arbitrary`: injeta um .archive REAL cujo nome NÃO casa o glob nativo
-/// (basegame_*/audio_*/lang_*) no content-group do ResourceDepot via `LoadArchives` @0x103eda488
-/// (abre+parseia+APENDA, BYPASSA o filtro do glob). Chamada de dentro de `init_archives_replacement`
-/// (thread do jogo, depot REAL x0 já construído, pré-streaming). `depot` é o `this` autêntico — os
-/// offsets da RE são corretos aqui (grupos@depot+0x10 inline {ptr@+0x10,cap@+0x18,count@+0x1c,stride
-/// 0x38}; key@g+0x30==3; count@g+0xc; lock@depot+0x78). Segura o lock exclusivo durante a injeção.
-unsafe fn pathb_inject(depot: *mut u8) {
-    use core::arch::asm;
-    // grupos: DynArray inline @depot+0x10
+/// Acha o grupo REAL de content do depot: o de MAIOR count, HEAP (não sentinela estático de
+/// imagem). Extraído de `axl-pathb-injection-arbitrary` (achado 2026-07-17: key==3 fica vazio,
+/// arr sentinela; os archives do boot vão pra key=1/2, arr HEAP — injetar no de maior count).
+/// `groups@depot+0x10` inline {ptr@+0x10,cap@+0x18,count@+0x1c}, stride 0x38; count@g+0x0c.
+unsafe fn find_pathb_content_group(depot: *mut u8) -> Option<*mut u8> {
     let groups = (depot.add(0x10) as *const *mut u8).read();
     let gcount = (depot.add(0x1c) as *const u32).read();
     if groups.is_null() || gcount == 0 || gcount > 64 {
         log(&format!("[pathb] grupos inválidos (ptr={groups:p} n={gcount}) — abortado"));
-        return;
+        return None;
     }
-    // Achar o grupo REAL de content: o de MAIOR count. DUMP 2026-07-17 (v5): no Mac o grupo key==3
-    // fica VAZIO (count=0, arr=sentinela ESTÁTICO na faixa de imagem 0x109... → LoadArchives nele
-    // CRASHA); os archives do boot vão pra key=1 (33) e key=2 (26), arr HEAP, já carregados (síncronos
-    // no retorno do InitArchives). Injetar no de maior count = grupo válido/cheio.
     let mut g: *mut u8 = core::ptr::null_mut();
     let mut best = 0u32;
     for i in 0..gcount as usize {
@@ -1804,48 +2525,294 @@ unsafe fn pathb_inject(depot: *mut u8) {
             g = gi;
         }
     }
-    // DUMP read-only de TODOS os grupos (key@+0x30, count@+0xc) — safe, sem crash. Revela o layout
-    // real do depot pra fechar a injeção numa sessão futura. Achado 2026-07-17 (v5): no retorno do
-    // InitializeArchives o content group está VAZIO (count=0) → os archives carregam ASSÍNCRONOS DEPOIS
-    // (o append-hook do v4 viu o count crescer até 33 mais tarde). Logo o ponto de injeção certo NÃO é
-    // aqui — é após a conclusão do load async (achar o callback), ou de dentro do append-hook (game
-    // thread) MAS com o depot capturado à parte pro lock.
-    {
-        let mut s = format!("[pathb] DUMP {gcount} grupos (depot real={depot:p}):");
-        for i in 0..gcount as usize {
-            let gi = groups.add(i * 0x38);
-            if !crate::gum::is_readable(gi as *const c_void, 0x38) {
-                s.push_str(&format!(" [{i}]=ilegível"));
-                continue;
-            }
-            let key = (gi.add(0x30) as *const u32).read();
-            let cnt = (gi.add(0x0c) as *const u32).read();
-            let arrp = (gi as *const *const u8).read();
-            s.push_str(&format!(" [{i}]{{key={key} count={cnt} arr={arrp:p}}}"));
-        }
-        log(&s);
-    }
     if g.is_null() || best == 0 {
         log(&format!("[pathb] nenhum grupo heap com archives entre {gcount} — abortado"));
+        return None;
+    }
+    Some(g)
+}
+
+/// ArchiveXL `#37`/`ResolveArchiveGroup(depot, basePath) -> ArchiveGroup&` (achado 2026-08-17,
+/// auditoria de consistência de documentação — item catalogado como "ACHADO ACIONÁVEL"). Função
+/// 100% PRÓPRIA do ArchiveXL (`App/Archives/ArchiveService.cpp`) — `std::find_if` puro sobre
+/// `aDepot->groups`, ZERO `RawFunc`/`AddressLib`, ZERO endereço nativo a resolver. Layout do
+/// grupo confirmado pelo header OFICIAL vendorizado (`RED4ext.SDK/include/RED4ext/ResourceDepot.hpp`,
+/// `RED4EXT_ASSERT_SIZE`/`RED4EXT_ASSERT_OFFSET`, não é palpite):
+/// `ArchiveGroup{archives:DynArray<Archive>@0x00, basePath:CString@0x10, scope:ArchiveScope(u32)@0x30}`
+/// (stride 0x38). `ArchiveGroup`/`Archive` NÃO são polimórficos (zero vtable) — os offsets batem
+/// Windows=Mac SEM o shift Itanium de +0x08 que outras structs deste projeto precisam; confirmado
+/// pela porção `archives` (offsets 0x00/0x0c) já EMPIRICAMENTE validada ao vivo há semanas por
+/// `find_pathb_content_group`/`load_archive_into_group` (contagem sobe corretamente ao injetar).
+///
+/// Implementa só a METADE de LEITURA do algoritmo real (passo 1 de `ResolveArchiveGroup`: acha
+/// grupo JÁ EXISTENTE cujo `basePath` bate exato) — substituiria o heurístico frágil de
+/// `find_pathb_content_group` ("grupo de maior contagem heap", documentado no próprio código como
+/// não sendo a resolução real) por resolução por BASE PATH de verdade, quando o grupo já existe.
+///
+/// A METADE de ESCRITA do algoritmo oficial (criar grupo NOVO via `DynArray<ArchiveGroup>::Emplace`
+/// quando nenhum bate, inserindo antes do 1º grupo `scope != Mod`) fica DE FORA de propósito —
+/// mutar/crescer o array `depot->groups` ao vivo é categoria de risco alta (mesma classe de bug
+/// que já causou heap-corruption em outros arrays deste projeto ao crescer sem o cuidado certo,
+/// ex. saga do TweakXL flat-array/`CreateFlatValue`) e precisa de RE do padrão de grow (allocator-vft
+/// trailer, mesma técnica já usada em `mkarr`/`inherit_flats_rt`) + teste ao vivo dedicado antes de
+/// entrar em qualquer caminho de boot padrão. **Nunca chamada de nenhum hook/caminho de produção** —
+/// só o comando de canal `archivegroupdump`/`archivegroupresolve` abaixo, 100% observe-only.
+unsafe fn resolve_archive_group_by_path(depot: *mut u8, base_path: &str) -> Option<*mut u8> {
+    let groups = (depot.add(0x10) as *const *mut u8).read();
+    let gcount = (depot.add(0x1c) as *const u32).read();
+    if groups.is_null() || gcount == 0 || gcount > 64 {
+        return None;
+    }
+    for i in 0..gcount as usize {
+        let gi = groups.add(i * 0x38);
+        if !crate::gum::is_readable(gi as *const c_void, 0x38) {
+            continue;
+        }
+        if crate::rtti::red_string_read(gi.add(0x10)) == base_path {
+            return Some(gi);
+        }
+    }
+    None
+}
+
+/// Decodifica `ArchiveScope` (`RED4ext.SDK/include/RED4ext/ResourceDepot.hpp`, enum u32 real):
+/// `0=Invalid 1=Content(archive\pc\content) 2=DLC 3=Patch 4=Mod(archive\pc\mod + mods\*\archives)`.
+fn archive_scope_name(v: u32) -> &'static str {
+    match v {
+        0 => "Invalid",
+        1 => "Content",
+        2 => "DLC",
+        3 => "Patch",
+        4 => "Mod",
+        _ => "?",
+    }
+}
+
+/// Núcleo do comando `archivegroupdump` (2026-08-17, ArchiveXL `#37`; migrado pro `[hb-canal]`
+/// em 2026-08-16/17, rodada 41 — infra pendente desde a rodada 39/40) — extraído do braço de
+/// `run_cmd` pra ser chamável tanto dali (canal gated-por-executor, só drena perto/depois de
+/// `PHASE_REACHED_5`) quanto da thread do heartbeat (`[hb-canal]`, sempre viva, independente do
+/// executor). 100% read-only, zero mutação — só depende de `PATHB_DEPOT`, capturado pelo hook
+/// `InitializeArchives` bem mais cedo no boot (~t=15s) do que a janela de gameplay real, o que é
+/// o ganho real da migração: diagnósticos de depot deixam de competir com a janela de risco do
+/// lock nativo do motor (`SharedSpinLock::Lock()`, confirmado nas rodadas 26/32/35/36).
+unsafe fn run_archivegroupdump() {
+    let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+    if depot.is_null() {
+        log("[archivegroupdump] PATHB_DEPOT ainda não capturado (boot incompleto?)");
         return;
     }
-    let count0 = (g.add(0x0c) as *const u32).read();
-
-    // INJEÇÃO REAL gated pelo 2º marcador (~/.bwms-pathb-inject). Agora mira o grupo de MAIOR count
-    // (heap, cheio) — o crash do v5 era injetar no key==3 vazio (arr sentinela estático). Ver cont.81.
-    let do_inject = std::env::var("HOME")
-        .ok()
-        .map(|h| std::path::Path::new(&h).join(".bwms-pathb-inject").exists())
-        .unwrap_or(false);
-    if !do_inject {
+    let depot = depot as *mut u8;
+    let groups = (depot.add(0x10) as *const *mut u8).read();
+    let gcount = (depot.add(0x1c) as *const u32).read();
+    if groups.is_null() || gcount == 0 || gcount > 64 {
+        log(&format!("[archivegroupdump] grupos inválidos (ptr={groups:p} n={gcount})"));
+        return;
+    }
+    log(&format!("[archivegroupdump] depot={depot:p} gcount={gcount}"));
+    for i in 0..gcount as usize {
+        let gi = groups.add(i * 0x38);
+        if !crate::gum::is_readable(gi as *const c_void, 0x38) {
+            log(&format!("[archivegroupdump]   [{i:02}] @{gi:p} ILEGÍVEL"));
+            continue;
+        }
+        let cnt = (gi.add(0x0c) as *const u32).read();
+        let base_path = crate::rtti::red_string_read(gi.add(0x10));
+        let scope_raw = (gi.add(0x30) as *const u32).read();
         log(&format!(
-            "[pathb] grupo de maior count g={g:p} count={count0} — injeção pulada (gated ~/.bwms-pathb-inject)"
+            "[archivegroupdump]   [{i:02}] @{gi:p} archives={cnt} basePath='{base_path}' scope={scope_raw}({})",
+            archive_scope_name(scope_raw)
         ));
-        return;
     }
+}
 
-    // caminho absoluto do nosso archive de teste. A dylib mora em <jogo>/red4ext/libcp77_console.dylib.
-    let mut game_dir = String::new();
+/// ArchiveXL `#37`/`ResolveArchiveGroup` — METADE DE ESCRITA (2026-08-17, rodada offline seguinte,
+/// avançando o que a auditoria anterior tinha deixado de fora deliberadamente). Implementa o
+/// passo 2 do algoritmo real (`ArchiveService.cpp::ResolveArchiveGroup`): quando nenhum grupo
+/// existente bate o `basePath` pedido, cria um `ArchiveGroup` NOVO (zerado, `basePath` setado,
+/// `scope=Mod`) inserido ANTES do 1º grupo cujo `scope != Mod` — replica
+/// `aDepot->groups.Emplace(firstNonModGroup)` (`DynArray<T>::Emplace`,
+/// `RED4ext.SDK/Containers/DynArray.hpp`) byte-a-byte, incluindo o fallback pra "insere no fim"
+/// quando TODOS os grupos são `Mod` (ou o depot está vazio).
+///
+/// **Correção de uma suposição da rodada anterior desta mesma sessão** (o comentário de
+/// `resolve_archive_group_by_path` acima apontava pro padrão "allocator-vft-trailer" do TweakDB
+/// como pré-requisito pra crescer este array). Lendo o header REAL do `DynArray<T>` genérico
+/// (não só `ArchiveGroup`/`ResourceDepot`): `GetAllocator()` tem 2 casos — com `capacity==0` o
+/// allocator mora no PRÓPRIO campo `entries` (union); com `capacity>0` ele mora "no fim do
+/// buffer de entries, alinhado" (1 slot extra logo após `entries[capacity-1]`). **Isso confirma
+/// que o "allocator-vft-trailer" é uma propriedade do `DynArray<T>` GENÉRICO, não algo exclusivo
+/// da `SortedUniqueArray` do TweakDB** — mas essa trilha só importa se o MOTOR chamar
+/// `GetAllocator()` de volta (só acontece em `~DynArray()` ou em `Reserve()`→`SetCapacity()`,
+/// nunca em leitura/iteração normal). A técnica de grow JÁ PROVADA AO VIVO deste projeto
+/// (`dynarray_push_ptr` em `register.rs`, usada em produção por `GameObject.AddTag`/
+/// `CClass.props`/`CClass.funcs`/`ReflectionEnum.AddConstant`) já realoca via `rtti::pool_alloc`
+/// SEM NUNCA escrever esse trailer — e funciona porque nenhum desses 4 arrays é
+/// destruído/redimensionado pelo PRÓPRIO motor depois que o BWMS mexe neles (configurados 1x,
+/// lidos o resto da vida do processo). `depot->groups` é inicializado 1x no boot
+/// (`InitializeArchives`) e nunca mais tocado pela engine pelo resto da sessão — mesma categoria,
+/// mesmo risco aceito pelos 4 casos já em produção, agora só explicitado por escrito.
+///
+/// Escopo consciente: só suporta `basePath` < 20 bytes (limite do `CString` inline/SSO, mesmo
+/// limite documentado no RED4ext `#351`/`write_cstring_inline_ret`) — paths mais longos
+/// exigiriam alocação heap de `CString` (não implementada neste projeto, fora de escopo; a
+/// função aborta com log explícito nesse caso, nunca escreve parcial). **Nunca chamada de
+/// nenhum hook/caminho de produção** — só o comando de canal `archivegroupcreate` abaixo, e
+/// GATED atrás de `~/.bwms-flatwrite` (mesma trava de `mkarr`/`mkflat`/`clone` — categoria
+/// "muta memória viva do motor", não só TweakDB).
+unsafe fn create_archive_group_by_path(depot: *mut u8, base_path: &str) -> Option<*mut u8> {
+    // passo 1 do algoritmo real: se já existe, devolve ele (nunca duplica).
+    if let Some(existing) = resolve_archive_group_by_path(depot, base_path) {
+        return Some(existing);
+    }
+    if base_path.as_bytes().len() >= 20 {
+        log("[archivegroupcreate] basePath >= 20 bytes — CString heap não implementado neste projeto, abortado (fora de escopo)");
+        return None;
+    }
+    const STRIDE: usize = 0x38;
+    let groups = (depot.add(0x10) as *const *mut u8).read();
+    let cap = (depot.add(0x18) as *const u32).read();
+    let size = (depot.add(0x1c) as *const u32).read();
+    if size > 64 || cap > 128 {
+        log(&format!("[archivegroupcreate] cap/size implausível (cap={cap} size={size}) — abortado"));
+        return None;
+    }
+    // valida a leitura sobre `cap` (não só `size`) — cobre também o caso raro `cap>0 && size==0`
+    // (array reservado mas nunca preenchido: `groups` já é um ponteiro de dado real nesse caso,
+    // per `DynArray<T>::GetAllocator()`, não o union "allocator no lugar de entries" que só vale
+    // com `cap==0`).
+    if cap > 0 && (groups.is_null() || !crate::gum::is_readable(groups as *const c_void, (cap as usize) * STRIDE)) {
+        log("[archivegroupcreate] buffer de groups ilegível — abortado");
+        return None;
+    }
+    // acha o índice de inserção: 1º grupo com scope != Mod(4); se nenhum bater (ou depot vazio),
+    // insere no fim — mesmo fallback do `std::find_if`/`end()` real.
+    let mut insert_idx = size as usize;
+    for i in 0..size as usize {
+        let gi = groups.add(i * STRIDE);
+        if !crate::gum::is_readable(gi as *const c_void, STRIDE) {
+            log(&format!("[archivegroupcreate] grupo [{i}] ilegível — abortado"));
+            return None;
+        }
+        let scope = (gi.add(0x30) as *const u32).read();
+        if scope != 4 {
+            insert_idx = i;
+            break;
+        }
+    }
+    let new_group: *mut u8 = if size < cap {
+        // slack já disponível no buffer atual — shift em memória, sem realocar (mesmo idioma de
+        // `DynArray<T>::ShiftEntries`: desloca a cauda 1 slot pra frente antes de zerar o novo).
+        let tail = size as usize - insert_idx;
+        if tail > 0 {
+            core::ptr::copy(
+                groups.add(insert_idx * STRIDE),
+                groups.add((insert_idx + 1) * STRIDE),
+                tail * STRIDE,
+            );
+        }
+        let slot = groups.add(insert_idx * STRIDE);
+        core::ptr::write_bytes(slot, 0, STRIDE);
+        // size escrito por último — mesma disciplina de `dynarray_push_ptr` (engine nunca vê
+        // um size > que o buffer publicado permite).
+        core::ptr::write_unaligned(depot.add(0x1c) as *mut u32, size + 1);
+        slot
+    } else {
+        // cheio: realoca via `rtti::pool_alloc` (mesma técnica já provada em produção pros 4
+        // outros arrays citados na doc acima — SEM allocator-trailer, risco aceito explícito).
+        let new_cap = cap.saturating_mul(2).max(size + 4).max(4);
+        let new_buf = crate::rtti::pool_alloc(new_cap as usize * STRIDE, 8) as *mut u8;
+        if new_buf.is_null() {
+            log("[archivegroupcreate] pool_alloc falhou — abortado");
+            return None;
+        }
+        if insert_idx > 0 {
+            core::ptr::copy_nonoverlapping(groups, new_buf, insert_idx * STRIDE);
+        }
+        let slot = new_buf.add(insert_idx * STRIDE);
+        core::ptr::write_bytes(slot, 0, STRIDE);
+        let tail = size as usize - insert_idx;
+        if tail > 0 {
+            core::ptr::copy_nonoverlapping(
+                groups.add(insert_idx * STRIDE),
+                new_buf.add((insert_idx + 1) * STRIDE),
+                tail * STRIDE,
+            );
+        }
+        // republica entries -> cap -> size (size por último, mesma disciplina de dynarray_push_ptr).
+        core::ptr::write_unaligned(depot.add(0x10) as *mut u64, new_buf as u64);
+        core::ptr::write_unaligned(depot.add(0x18) as *mut u32, new_cap);
+        core::ptr::write_unaligned(depot.add(0x1c) as *mut u32, size + 1);
+        log(&format!(
+            "[archivegroupcreate] groups realocou: cap {cap}->{new_cap} entries {groups:p}->{new_buf:p} size {size}->{}",
+            size + 1
+        ));
+        slot
+    };
+    // basePath (CString inline SSO, mesmo layout/técnica de `register::write_cstring_inline_ret`,
+    // já provado ao vivo — RED4ext `#351`) + scope=Mod(4).
+    const CSTRING_SIZE: usize = 0x20;
+    let bp_bytes = base_path.as_bytes();
+    core::ptr::write_bytes(new_group.add(0x10), 0, CSTRING_SIZE);
+    core::ptr::copy_nonoverlapping(bp_bytes.as_ptr(), new_group.add(0x10), bp_bytes.len());
+    core::ptr::write_unaligned(new_group.add(0x10 + 0x14) as *mut u32, bp_bytes.len() as u32);
+    core::ptr::write_unaligned(new_group.add(0x30) as *mut u32, 4u32);
+    log(&format!(
+        "[archivegroupcreate] '{base_path}' -> grupo NOVO @{new_group:p} (idx={insert_idx}, scope=Mod)"
+    ));
+    Some(new_group)
+}
+
+/// Codeware `#16`/`#198` (`ResourceDepot.ArchiveExists`). Fonte real (`App/Depot/ResourceDepot.hpp`):
+/// varre `depot->groups`, filtra `scope==Mod`, compara `std::filesystem::path(archive.path).filename()`
+/// contra o nome pedido. Layout de `ArchiveInfo` (name RedString@+0x10, stride 0x50) CONFIRMADO
+/// ao vivo em 2026-08-10 (`archivenamedump`, refutando a incerteza registrada em
+/// `notes/RE-archiveinfo-inject-2026-07-17.md` sobre a RE estática original) — paths reais lidos
+/// corretos (`basegame_1_engine.archive` etc.). **Divergência documentada**: em vez de filtrar por
+/// `scope==Mod` (campo de scope do GRUPO ainda não mapeado com certeza — `+0x30` do grupo é
+/// "key" 3=content/1=memoryresident por uma nota antiga, não confirmadamente "Mod"), varre TODOS
+/// os grupos — superset seguro (nunca dá falso-negativo pra archive de mod real; risco de
+/// falso-positivo só em colisão de nome de arquivo entre mod e vanilla, praticamente nulo).
+pub unsafe fn archive_exists_by_name(name: &str) -> bool {
+    let depot = PATHB_DEPOT.load(Ordering::Relaxed) as *mut u8;
+    if depot.is_null() {
+        log("[archiveexists] depot ainda não capturado (InitializeArchives não rodou) — abortado");
+        return false;
+    }
+    let groups = (depot.add(0x10) as *const *mut u8).read();
+    let gcount = (depot.add(0x1c) as *const u32).read();
+    if groups.is_null() || gcount == 0 || gcount > 64 {
+        return false;
+    }
+    for gi_idx in 0..gcount as usize {
+        let gi = groups.add(gi_idx * 0x38);
+        if !crate::gum::is_readable(gi as *const c_void, 0x38) {
+            continue;
+        }
+        let cnt = (gi.add(0x0c) as *const u32).read();
+        let arr = (gi as *const *const u8).read();
+        if arr.is_null() || cnt == 0 || cnt > 100_000 {
+            continue;
+        }
+        for i in 0..cnt as usize {
+            let entry = arr.add(i * 0x50);
+            if !crate::gum::is_readable(entry as *const c_void, 0x50) {
+                continue;
+            }
+            let path = crate::rtti::red_string_read(entry.add(0x10));
+            let filename = path.rsplit(['/', '\\']).next().unwrap_or(&path);
+            if filename == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `<jogo>/` a partir do path da PRÓPRIA dylib carregada (`<jogo>/red4ext/libcp77_console.dylib`,
+/// sempre presente — é o próprio processo rodando). Reusado por `pathb_inject`/`facade_register_*`/
+/// `register::tramp_game_file_exists` (Codeware `Utils.Compatibility.GameFileExists`).
+pub(crate) unsafe fn game_dir_from_dylib() -> Option<String> {
     let n = _dyld_image_count();
     for i in 0..n {
         let nm = _dyld_get_image_name(i);
@@ -1854,34 +2821,38 @@ unsafe fn pathb_inject(depot: *mut u8) {
         }
         if let Ok(s) = std::ffi::CStr::from_ptr(nm).to_str() {
             if let Some(p) = s.strip_suffix("/red4ext/libcp77_console.dylib") {
-                game_dir = p.to_string();
-                break;
+                return Some(p.to_string());
             }
         }
     }
-    if game_dir.is_empty() {
-        log("[pathb] não achei o dir do jogo (via dylib image) — abortado");
-        return;
+    None
+}
+
+/// `axl-pathb-injection-arbitrary`: injeta um .archive REAL cujo nome NÃO casa o glob nativo
+/// (basegame_*/audio_*/lang_*) no grupo `g` do ResourceDepot via `LoadArchives` @0x103eda488
+/// (abre+parseia+APENDA, BYPASSA o filtro do glob). `depot`/`g` já resolvidos pelo chamador
+/// (`find_pathb_content_group`); `abs_path` é o `.archive` a carregar (path absoluto real).
+/// Segura o lock exclusivo do depot durante a injeção. Devolve `true` se `count` subiu.
+unsafe fn load_archive_into_group(depot: *mut u8, g: *mut u8, abs_path: &str) -> bool {
+    use core::arch::asm;
+    if !std::path::Path::new(abs_path).is_file() {
+        log(&format!("[pathb] arquivo ausente em {abs_path} — abortado"));
+        return false;
     }
-    let apath = format!("{game_dir}/archive/Mac/content/zz_bwms_pathb.archive");
-    if !std::path::Path::new(&apath).is_file() {
-        log(&format!("[pathb] archive de teste ausente em {apath} — abortado"));
-        return;
-    }
-    let cpath = match std::ffi::CString::new(apath.clone()) {
+    let cpath = match std::ffi::CString::new(abs_path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            log(&format!("[pathb] path '{abs_path}' tem byte nulo interno — abortado"));
+            return false;
+        }
     };
-    let cscope = std::ffi::CString::new("content").unwrap();
+    let count0 = (g.add(0x0c) as *const u32).read();
 
     // ctor de CString inline (0x20B): void(out@x0, cstr@x1). O item da fileList É uma CString (stride 0x20).
     let cstr_ctor = crate::rebase(0x1_0002_cdb8);
     let mut s_path = [0u8; 0x20];
-    let mut s_scope = [0u8; 0x20];
     asm!("blr {f}", f = in(reg) cstr_ctor,
         in("x0") s_path.as_mut_ptr(), in("x1") cpath.as_ptr(), clobber_abi("C"));
-    asm!("blr {f}", f = in(reg) cstr_ctor,
-        in("x0") s_scope.as_mut_ptr(), in("x1") cscope.as_ptr(), clobber_abi("C"));
 
     // fileList = DynArray<CString>{ ptr=&s_path, cap=1, count=1 } (16B). LoadArchives itera stride 0x20.
     #[repr(C)]
@@ -1896,14 +2867,15 @@ unsafe fn pathb_inject(depot: *mut u8) {
         count: 1,
     };
 
-    // SCOPE: o crash report do boot #9 provou que o RDAR-open (0x103e2ebd4) deref o scope como PONTEIRO
-    // e a minha CString hand-built de "content" (SSO inline) fazia ele deref os BYTES "content" como
-    // endereço (fault @0x...746e65746e6f7b = "content"). A RE oferecia "pass the group's own name": o
-    // ArchiveSet tem a RedString de nome/scope PRÓPRIA (válida, construída pelo jogo) em g+0x10. Uso ela.
-    let scope_ptr = g.add(0x10) as *const u8; // RedString do próprio grupo (game-built, layout certo)
-    let _ = &s_scope; // (mantido só p/ não quebrar o build; scope agora vem do grupo)
+    // SCOPE: o crash report do boot #9 (2026-07-17) provou que o RDAR-open (0x103e2ebd4) deref o
+    // scope como PONTEIRO e uma CString hand-built de "content" (SSO inline) fazia ele deref os
+    // BYTES "content" como endereço. Fix: usar a RedString de nome/scope PRÓPRIA do grupo (já
+    // construída pelo jogo, layout certo) em `g+0x10`.
+    let scope_ptr = g.add(0x10) as *const u8;
 
-    log(&format!("[pathb] injetando no content group g={g:p} (archives ANTES={count0}) scope=g+0x10 segurando o lock..."));
+    log(&format!(
+        "[pathb] injetando '{abs_path}' no content group g={g:p} (archives ANTES={count0}) scope=g+0x10 segurando o lock..."
+    ));
     // lock EXCLUSIVO do depot REAL (SharedSpinLock @depot+0x78 — confirmado no disasm de
     // InitializeArchives: `add x19,x0,#0x78; bl 0x1000020c0`). acquire nativo; release = store-release 0.
     let lock = depot.add(0x78);
@@ -1923,15 +2895,148 @@ unsafe fn pathb_inject(depot: *mut u8) {
 
     let ok = count1 >= count0 + 1;
     let verdict = if ok {
-        ">>> PATH-B OK: .archive fora do glob (zz_bwms_pathb) INJETADO no content-group (depot REAL, thread do jogo, com lock) via LoadArchives — count subiu +1 <<<"
+        ">>> INJETADO no content-group (depot REAL, thread do jogo, com lock) via LoadArchives — count subiu <<<"
     } else if count1 == count0 {
         "FALHA: count inalterado — o open() rejeitou o archive (magic/versão) ou o append não ocorreu"
     } else {
         "ATENÇÃO: count mudou de forma inesperada (concorrência?)"
     };
     log(&format!(
-        "[pathb] g={g:p} | archives ANTES={count0} DEPOIS={count1} | path={apath} | {verdict}"
+        "[pathb] g={g:p} | archives ANTES={count0} DEPOIS={count1} | path={abs_path} | {verdict}"
     ));
+    ok
+}
+
+/// Regressão do achado original `axl-pathb-injection-arbitrary`: injeta um .archive de TESTE fixo
+/// (`zz_bwms_pathb.archive`), gated pelo marcador de dev de sempre (`~/.bwms-pathb-inject`) — só
+/// mantido pra não perder a prova ao vivo já feita (10 boots, 2026-07-17). A capacidade REAL pra
+/// mods é `facade_register_archive`/`facade_register_dir` (abaixo), sem marker, path arbitrário.
+unsafe fn pathb_inject(depot: *mut u8) {
+    let do_inject = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::Path::new(&h).join(".bwms-pathb-inject").exists())
+        .unwrap_or(false);
+    if !do_inject {
+        return;
+    }
+    let Some(g) = find_pathb_content_group(depot) else { return };
+    let Some(game_dir) = game_dir_from_dylib() else {
+        log("[pathb] não achei o dir do jogo (via dylib image) — abortado");
+        return;
+    };
+    let apath = format!("{game_dir}/archive/Mac/content/zz_bwms_pathb.archive");
+    load_archive_into_group(depot, g, &apath);
+}
+
+/// Prefixos vanilla (`basegame_`/`audio_`/`lang_`/`dlc_`, o próprio glob nativo que
+/// `RegisterArchive`/Path-B existe pra CONTORNAR): um archive com um desses nomes quase certamente
+/// já está carregado pela via normal. Achado 2026-08-09: re-injetar `basegame_4_gamedata.archive`
+/// (produção, grande) via este bypass CROU (`EXC_BAD_ACCESS`, thread `redDispatcher5`, dentro de
+/// `load_archive_into_group`) — causa raiz não isolada, mas o caso de uso é sempre ilegítimo (um
+/// mod nunca precisa re-registrar conteúdo vanilla), então recusar aqui é estritamente mais seguro
+/// sem perder capacidade real nenhuma.
+fn is_vanilla_archive_name(path: &str) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    ["basegame_", "audio_", "lang_", "dlc_"]
+        .iter()
+        .any(|pfx| name.starts_with(pfx))
+}
+
+/// `ArchiveXL.RegisterArchive(path: String) -> Bool` (`PENDENCIAS-UNIFICADAS.md`, Facade.hpp) —
+/// capacidade REAL pra mods, generalização do `axl-pathb-injection-arbitrary` já provado: qualquer
+/// mod pode registrar um `.archive` seu em runtime (chamável de `OnAttach`/bootstrap redscript),
+/// sem precisar que o nome bata o glob nativo (`basegame_*`/`audio_*`/`lang_*`). `path` absoluto
+/// USA como está; relativo resolve contra o diretório do jogo (`<jogo>/<path>`).
+/// Codeware `#16`/`#198` (`PENDENCIAS-UNIFICADAS.md`) — `ResourceDepot.ResourceExists(path)`,
+/// a API redscript-facing que um mod chamaria via `import Codeware.Depot.*`. Composição de 2
+/// peças JÁ PROVADAS, zero RE nova: `PATHB_DEPOT` (o depot real, capturado 1x em
+/// `InitializeArchives`, sempre instalado desde o Facade — mesma fonte que `RegisterArchive`
+/// já usa) + `ResourceDepot::CheckResource@0x103ed9e9c` (achado 2026-07-16, PROVADO via
+/// `axl-copy-makeexist`: `bool(depot*, ResourcePath hash)`). Chamada DIRETA (sem hook/replace —
+/// só invoca o endereço como função pura), zero mutação, zero side-effect.
+pub unsafe fn resource_exists(path: &str) -> bool {
+    let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+    if depot.is_null() {
+        log("[depot] ResourceExists: depot ainda não capturado (InitializeArchives não rodou) — abortado");
+        return false;
+    }
+    let check_addr = crate::rebase(0x1_03ed_9e9c);
+    if !crate::gum::is_readable(check_addr as *const c_void, 4) {
+        log("[depot] ResourceExists: CheckResource ilegível — abortado");
+        return false;
+    }
+    let hash = bwms_hashes::resource_path_hash(path);
+    let f: unsafe extern "C" fn(*mut c_void, u64) -> u8 = std::mem::transmute(check_addr);
+    let r = f(depot, hash) != 0;
+    log(&format!("[depot] ResourceExists('{path}', hash={hash:#018x}) = {r}"));
+    r
+}
+
+pub unsafe fn facade_register_archive(path: &str) -> bool {
+    if is_vanilla_archive_name(path) {
+        log(&format!(
+            "[facade] RegisterArchive: '{path}' tem nome de prefixo VANILLA (basegame_/audio_/lang_/dlc_) — \
+             recusado (já carregado pela via normal; ver achado 2026-08-09 de crash ao re-injetar)"
+        ));
+        return false;
+    }
+    let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+    if depot.is_null() {
+        log("[facade] RegisterArchive: depot ainda não capturado (InitializeArchives não rodou, ou hook recusou) — abortado");
+        return false;
+    }
+    let abs = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        match game_dir_from_dylib() {
+            Some(gd) => format!("{gd}/{path}"),
+            None => {
+                log("[facade] RegisterArchive: path relativo mas não achei o dir do jogo — abortado");
+                return false;
+            }
+        }
+    };
+    let Some(g) = find_pathb_content_group(depot as *mut u8) else { return false };
+    load_archive_into_group(depot as *mut u8, g, &abs)
+}
+
+/// `ArchiveXL.RegisterDir(path: String) -> Bool` — registra TODOS os `.archive` (não-recursivo)
+/// de um diretório via `facade_register_archive` (mesma regra path absoluto/relativo-ao-jogo).
+/// Devolve `true` se o diretório foi lido e PELO MENOS 1 arquivo foi injetado com sucesso.
+pub unsafe fn facade_register_dir(path: &str) -> bool {
+    let abs_dir = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        match game_dir_from_dylib() {
+            Some(gd) => format!("{gd}/{path}"),
+            None => {
+                log("[facade] RegisterDir: path relativo mas não achei o dir do jogo — abortado");
+                return false;
+            }
+        }
+    };
+    let entries = match std::fs::read_dir(&abs_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            log(&format!("[facade] RegisterDir: não consegui ler '{abs_dir}': {err}"));
+            return false;
+        }
+    };
+    let mut any_ok = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("archive") {
+            if let Some(s) = p.to_str() {
+                if facade_register_archive(s) {
+                    any_ok = true;
+                }
+            }
+        }
+    }
+    any_ok
 }
 
 // ===== `red4ext-attach-detach-contract`: 2 hooks EMPILHADOS no MESMO alvo (LIFO) + Detach único =====
@@ -2087,6 +3192,393 @@ pub(crate) unsafe fn prove_attach_detach() {
     log(&format!(
         "[attachdetach] hooks_apos_1={hooks_after_1} hooks_apos_2={hooks_after_2} | cadeia(h2={h2},h1={h1},orig={o1}):{chain_ok} | hooks_apos_detach={hooks_after_detach} byte_exato={byte_exact} | replacements_pararam_depois(h2={h2b},h1={h1b}):{only_orig_after_detach} | {verdict}"
     ));
+}
+
+// CET `FunctionOverride` (não-Lua, `fnoverride.rs`, 2026-08-11) — handlers de teste pro comando
+// `fnoverridetest`/`fnoverridereplace`. `NativeHandler = unsafe extern "C" fn(ctx, frame, aOut, a4)`.
+unsafe extern "C" fn fnoverride_test_before(_ctx: *mut c_void, _frame: *mut c_void, _out: *mut c_void, _a4: i64) {
+    log("[fnoverride-test] BEFORE disparou");
+}
+unsafe extern "C" fn fnoverride_test_after(_ctx: *mut c_void, _frame: *mut c_void, _out: *mut c_void, _a4: i64) {
+    log("[fnoverride-test] AFTER disparou");
+}
+unsafe extern "C" fn fnoverride_test_replace(_ctx: *mut c_void, _frame: *mut c_void, out: *mut c_void, _a4: i64) {
+    log("[fnoverride-test] REPLACE disparou — escrevendo 999 no lugar do retorno original");
+    if !out.is_null() {
+        core::ptr::write_unaligned(out as *mut i32, 999);
+    }
+}
+
+/// `findinksystembss`/`walkinksystem`/`inksystemvalidate` (2026-08-14) — teste estrutural de
+/// "isto PARECE um `Red::InkSystem*` vivo?", read-only, sem crash possível (só
+/// `gum::is_readable` + reads).
+///
+/// Layout confirmado no header vendorizado REAL (`enablers/Codeware/src/Red/InkSystem.hpp`,
+/// não chutado): `inputWidget: WeakHandle<inkWidget>@0x2E8` (16B: {instance*,rc_block*}),
+/// `keyboardState: KeyboardState@0x2F8` (u16 bitfield, só 6 bits reais + 10 bits SEMPRE
+/// reservados/zero, `enablers/Codeware/src/Red/Input.hpp`), `requestsHandler:
+/// WeakHandle<ISystemRequestsHandler>@0x370` (16B), `layerManagers:
+/// DynArray<SharedPtr<InkLayerManager>>@0x380` (16B: {entries*,cap:u32,size:u32}).
+/// `InkSystem::Instance` é `Core::RawPtr` (ponteiro GLOBAL cru, MESMA categoria de
+/// `ResourceGameDepot`/`JournalManager` — não vtable/singleton-Get()) — por isso NÃO dá pra
+/// usar a técnica de `findcgameengine` (vtable-match): não há vtable conhecida pra comparar.
+///
+/// **RODADA 2026-08-14 (apertando o filtro — antes ruidoso demais).** A versão anterior deste
+/// filtro (só "ponteiro plausível-ou-null" por campo, faixa+alinhamento, SEM dereferenciar +
+/// `size<=cap<=64` aceitando até `cap==0`) classificou **987 de 1020 objetos visitados** como
+/// candidato num BFS real (`walkinksystem <root> 3 4000`) — ruído demais pra ser um sinal útil,
+/// e a validação cruzada independente (`requestsHandler` vs `BwmsGetSystemRequestsHandler()`)
+/// testou os 4 candidatos mais fortes dessa rodada e NENHUM bateu (ver `HISTORICO.md`
+/// 2026-08-14, "inksystemvalidate"). Reescrito pra exigir MÚLTIPLOS sinais convergindo
+/// SIMULTANEAMENTE (o mesmo padrão de rigor que já funcionou nesta base noutros achados —
+/// "vários sinais fracos juntos, nenhum sozinho decisivo" é exatamente o que faltava aqui):
+///
+/// 1. **Ponteiro "mapeado", não só "plausível"** (`is_mapped_ptr_or_null`): além de
+///    faixa+alinhamento, agora DEREFERENCIA o valor (`gum::is_readable(v, 8)`) — um qword que
+///    parece ponteiro mas não aponta pra memória mapeada é descartado na hora, não só aceito
+///    como "ponteiro plausível" (o critério antigo, que nunca lia o que o ponteiro apontava).
+/// 2. **Invariante de nulidade PAREADA nos 2 `WeakHandle`** (`inputWidget`/`requestsHandler`):
+///    por `SharedPtrBase<T>` (`RED4ext.SDK/Memory/SharedPtr.hpp`), TODO construtor real seta
+///    `instance`/`refCount` JUNTOS — nunca um null e o outro não (ctor default: os 2 null;
+///    copy/move/swap: os 2 sempre movidos/copiados como par). Exigir `(instance==0) ==
+///    (refCount==0)` elimina candidatos onde só 1 dos 2 slots vira ponteiro por coincidência.
+/// 3. **`RefCnt` plausível quando presente**: se `refCount!=0`, lê os 2 `u32`
+///    (`strongRefs`/`weakRefs`, `RED4ext.SDK/Memory/SharedPtr.hpp::RefCnt`) e exige valores
+///    pequenos e sãos (`<=10_000` cada) — um refcount real nunca tem bilhões de referências.
+/// 4. **`keyboardState` — os 10 bits reservados TÊM que ser 0**: `Red::KeyboardState`
+///    (`Red/Input.hpp`) só define 6 bits reais (`shiftLeft/Right`,`controlLeft/Right`,
+///    `altLeft/Right`); os outros 10 (`b10`) são padding NUNCA escrito pelo motor — exigir
+///    `kb & 0xFC00 == 0` é invariante estrutural rígido, não heurística frouxa.
+/// 5. **`layerManagers` NÃO-VAZIO** (`cap>=1`, ERA `cap>=0`): a lista de layer managers
+///    (HUD/Popup/Menu/etc.) é povoada no BOOT — um `InkSystem` vivo NUNCA tem `cap==0`. A
+///    versão antiga aceitava `cap=0/size=0` como caso trivial-válido — exatamente o ruído
+///    estrutural que dominava os 987 falsos-candidatos (a maioria de um heap grande tem VÁRIOS
+///    arrays vazios por coincidência, então "cap==size==0" é um sinal quase inútil sozinho).
+///    Mantido o teto `<=64` (nº plausível de layer managers nomeados).
+/// 6. **1º elemento do array de fato inspecionado** (NOVO — a versão antiga nunca olhava
+///    DENTRO do array, só os 2 campos de tamanho): lê `layerManagers.entries[0]` como
+///    `SharedPtr<InkLayerManager>` (16B, mesmo layout `SharedPtrBase`) e aplica os MESMOS
+///    testes 1+2 (mapeado + nulidade pareada) + exige `instance!=0` — com `size>=1` já
+///    garantido pelo sinal 5, o slot 0 tem que conter um layer manager de verdade, não lixo
+///    herdado de outro array.
+///
+/// Resultado esperado: de "987 candidatos" pra "poucas dezenas ou menos" no mesmo BFS. Devolve
+/// `(keyboardState, layerManagers.cap, layerManagers.size)` se bater, `None` senão — MESMA
+/// assinatura de antes, os 3 call-sites (`findinksystembss`/`walkinksystem`/
+/// `inksystemvalidate`) não mudam.
+unsafe fn inksystem_shape_matches(candidate: u64) -> Option<(u16, u32, u32)> {
+    if candidate < 0x10000 || candidate % 8 != 0 {
+        return None;
+    }
+    let is_plausible_ptr_or_null = |v: u64| v == 0 || (v > 0x10000 && v % 8 == 0);
+    // Sinal 1: não só "parece ponteiro" — DEREFERENCIA pra confirmar que aponta pra memória
+    // mapeada de verdade. Um qword 8-alinhado>0x10000 aleatório raramente sobrevive a isso.
+    let is_mapped_ptr_or_null =
+        |v: u64| v == 0 || (is_plausible_ptr_or_null(v) && gum::is_readable(v as *const c_void, 8));
+
+    let f_inputwidget = candidate + 0x2E8;
+    let f_kbstate = candidate + 0x2F8;
+    let f_reqhandler = candidate + 0x370;
+    let f_layermanagers = candidate + 0x380;
+    if !gum::is_readable(f_inputwidget as *const c_void, 16)
+        || !gum::is_readable(f_kbstate as *const c_void, 2)
+        || !gum::is_readable(f_reqhandler as *const c_void, 16)
+        || !gum::is_readable(f_layermanagers as *const c_void, 16)
+    {
+        return None;
+    }
+
+    // Sinais 1+2 — inputWidget: WeakHandle{instance,refCount}, mapeados + nulidade pareada.
+    let iw0 = (f_inputwidget as *const u64).read_unaligned(); // instance
+    let iw1 = (f_inputwidget as *const u64).add(1).read_unaligned(); // refCount
+    if !is_mapped_ptr_or_null(iw0) || !is_mapped_ptr_or_null(iw1) || (iw0 == 0) != (iw1 == 0) {
+        return None;
+    }
+
+    // Sinal 4 — keyboardState: os 10 bits reservados (b10) TÊM que ser 0 (nunca escritos pelo
+    // motor real; `Red::KeyboardState` só define os 6 bits baixos).
+    let kb = (f_kbstate as *const u16).read_unaligned();
+    if kb & 0xFC00 != 0 {
+        return None;
+    }
+
+    // Sinais 1+2+3 — requestsHandler: mesma checagem de inputWidget + sanidade do RefCnt
+    // apontado (se presente).
+    let rh0 = (f_reqhandler as *const u64).read_unaligned(); // instance
+    let rh1 = (f_reqhandler as *const u64).add(1).read_unaligned(); // refCount (RefCnt*)
+    if !is_mapped_ptr_or_null(rh0) || !is_mapped_ptr_or_null(rh1) || (rh0 == 0) != (rh1 == 0) {
+        return None;
+    }
+    if rh1 != 0 {
+        // RefCnt{strongRefs:u32, weakRefs:u32} — contadores reais são sempre pequenos.
+        let strong = (rh1 as *const u32).read_unaligned();
+        let weak = (rh1 as *const u32).add(1).read_unaligned();
+        if strong > 10_000 || weak > 10_000 {
+            return None;
+        }
+    }
+
+    // Sinal 5 — layerManagers: NÃO-VAZIO (cap>=1, era >=0) + size dentro do cap + invariante
+    // cap==0<=>entries==0 (defesa em profundidade, redundante com cap>=1 mas barata de manter).
+    let lm_entries = (f_layermanagers as *const u64).read_unaligned();
+    let lm_cap = (f_layermanagers.wrapping_add(8) as *const u32).read_unaligned();
+    let lm_size = (f_layermanagers.wrapping_add(12) as *const u32).read_unaligned();
+    if !is_mapped_ptr_or_null(lm_entries) {
+        return None;
+    }
+    if lm_cap < 1 || lm_cap > 64 || lm_size < 1 || lm_size > lm_cap {
+        return None;
+    }
+    if (lm_cap == 0) != (lm_entries == 0) {
+        return None;
+    }
+
+    // Sinal 6 — 1º elemento do array de fato inspecionado (a versão antiga nunca olhava DENTRO
+    // do array): SharedPtr<InkLayerManager>{instance,refCount}, mesmos testes de mapeamento +
+    // nulidade pareada + `instance!=0` (com size>=1 já garantido, o slot 0 tem que ser um layer
+    // manager real, não lixo herdado de um array de outro tipo).
+    if !gum::is_readable(lm_entries as *const c_void, 16) {
+        return None;
+    }
+    let e0_instance = (lm_entries as *const u64).read_unaligned();
+    let e0_refcount = (lm_entries as *const u64).add(1).read_unaligned();
+    if e0_instance == 0
+        || !is_mapped_ptr_or_null(e0_instance)
+        || !is_mapped_ptr_or_null(e0_refcount)
+        || (e0_instance == 0) != (e0_refcount == 0)
+    {
+        return None;
+    }
+
+    Some((kb, lm_cap, lm_size))
+}
+
+/// `get_inksystem_singleton(reg)` (2026-08-14, Codeware `#100`/`#120`, continuação da sessão que
+/// CONFIRMOU `Red::InkSystem::Get()` via `findinksystembss`+`inksystemvalidate`) — versão
+/// CHAMÁVEL/CACHEADA do mesmo mecanismo de descoberta decisivo (varredura de forma na BSS +
+/// cross-validação contra `BwmsGetSystemRequestsHandler()` no MESMO instante), pra qualquer
+/// native que precise do ponteiro `Red::InkSystem*` sem repetir a varredura manual toda vez
+/// (`GetLayers`/`GetLayer`/`GetWorldWidgets` chamam isto internamente). Reusa
+/// `inksystem_shape_matches` (filtro estrutural já endurecido) + o MESMO padrão de
+/// cross-validação já provado (`candidato+0x370` == `BwmsGetSystemRequestsHandler()`, 2
+/// mecanismos independentes convergindo).
+///
+/// Cache (`INKSYSTEM_CACHED`): uma vez confirmado nesta sessão de boot, reusa o ponteiro sem
+/// re-varrer — só re-valida a FORMA (barato, sem I/O de rede/RTTI) antes de reusar, pra pegar o
+/// caso raro de heap realocado embaixo do candidato antigo.
+pub(crate) unsafe fn get_inksystem_singleton(reg: &rtti::Registry) -> Option<u64> {
+    // 1) cache já validado nesta sessão — revalida só a FORMA (barato) antes de reusar.
+    let cached = INKSYSTEM_CACHED.load(Ordering::SeqCst);
+    if cached != 0 && inksystem_shape_matches(cached).is_some() {
+        return Some(cached);
+    }
+
+    // 2) resolve o 2º mecanismo (despacho RTTI real) UMA VEZ — reusado pra cada candidato.
+    let f = register::get_function(reg, "BwmsGetSystemRequestsHandler");
+    if !rtti::sane(f) {
+        log("[get_inksystem_singleton] BwmsGetSystemRequestsHandler não resolveu (declaração ausente do bundle?) — abortando");
+        return None;
+    }
+    let rf = rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+    let res = rtti::call_func(&rf, std::ptr::null_mut(), &[])?;
+    let handler_instance = u64::from_le_bytes(res[0..8].try_into().unwrap());
+    if handler_instance == 0 {
+        log("[get_inksystem_singleton] BwmsGetSystemRequestsHandler()->instance==0 — abortando (sem handler vivo ainda)");
+        return None;
+    }
+
+    // 3) varre os offsets do cluster BSS já confirmados nesta investigação (default +
+    // o offset alternativo que achou o candidato decisivo em 2026-08-14) — cross-valida CADA
+    // candidato de forma contra o handler já resolvido no passo 2, no MESMO instante.
+    const SCAN_BASES: [u64; 2] = [0x1_0900_0000, 0x108d00000];
+    const CHUNK: usize = 65536;
+    const SIZE_MB: u64 = 4;
+    const MAX_SHAPE_CHECKS: u32 = 20000;
+    let mut buf = vec![0u8; CHUNK];
+    for &start_static in &SCAN_BASES {
+        let scan_start = crate::rebase(start_static) as usize;
+        let scan_end = scan_start + (SIZE_MB * 1024 * 1024) as usize;
+        let mut p = scan_start;
+        let mut checks = 0u32;
+        'scan: while p < scan_end {
+            let this_len = CHUNK.min(scan_end - p);
+            if gum::read_chunk(p, &mut buf[..this_len]) {
+                let mut i = 0usize;
+                while i + 8 <= this_len {
+                    let candidate = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+                    if candidate > 0x10000 && candidate % 8 == 0 {
+                        checks += 1;
+                        if checks > MAX_SHAPE_CHECKS {
+                            break 'scan;
+                        }
+                        if inksystem_shape_matches(candidate).is_some() {
+                            let f_reqhandler = candidate + 0x370;
+                            if gum::is_readable(f_reqhandler as *const c_void, 16) {
+                                let cand_instance = (f_reqhandler as *const u64).read_unaligned();
+                                if cand_instance != 0 && cand_instance == handler_instance {
+                                    INKSYSTEM_CACHED.store(candidate, Ordering::SeqCst);
+                                    log(&format!(
+                                        "[get_inksystem_singleton] CONFIRMADO {candidate:#x} (cross-validado contra BwmsGetSystemRequestsHandler(), cacheado)"
+                                    ));
+                                    return Some(candidate);
+                                }
+                            }
+                        }
+                    }
+                    i += 8;
+                }
+            }
+            p += this_len;
+        }
+    }
+    log("[get_inksystem_singleton] nenhum candidato bateu a cross-validação nesta varredura — None");
+    None
+}
+
+/// Validação OFFLINE (zero jogo, zero boot) do filtro `inksystem_shape_matches` acima —
+/// possível porque `gum::is_readable` lê via `mach_vm_read_overwrite(mach_task_self_, ...)`,
+/// ou seja, SEMPRE a memória do PRÓPRIO processo chamador. Rodando dentro de `cargo test`, esse
+/// "próprio processo" é o binário de teste — então dá pra montar um buffer LOCAL com o layout
+/// EXATO de `Red::InkSystem` (endereços reais desta memória, não fabricados) e confirmar que o
+/// filtro aceita/rejeita exatamente como projetado, sem precisar do jogo rodando. Isso responde
+/// ao pedido da rodada (2026-08-14): "se identificar um jeito de validar o filtro OFFLINE, use
+/// isso" — não havia dump de memória salvo em `cp77-symbols/` pra reusar, mas construir um
+/// candidato sintético em memória real do processo de teste é uma alternativa igualmente válida
+/// (e mais forte: cobre também os casos NEGATIVOS, um dump gravado só cobriria 1 estado).
+#[cfg(test)]
+mod inksystem_shape_tests {
+    use super::inksystem_shape_matches;
+    use std::ptr::write_unaligned;
+
+    /// Monta um buffer de 0x400 bytes (mesmo `SPAN` usado por `walkinksystem`) com um candidato
+    /// BEM-FORMADO no layout exato que `inksystem_shape_matches` espera:
+    /// - `inputWidget@0x2E8`/`requestsHandler@0x370`: `WeakHandle{instance,refCount}`, ambos
+    ///   auto-referenciando o início do buffer (`base`) — sempre ponteiro mapeado válido nesta
+    ///   memória de teste.
+    /// - `requestsHandler.refCount` (`base`) aponta pro `storage[0]`, que guarda um `RefCnt`
+    ///   pequeno e são de propósito (`strongRefs=1, weakRefs=1`) — sem isso, o valor cru de
+    ///   `base` (um endereço de heap de verdade, quase sempre >10_000 nos bits baixos) seria
+    ///   mal-interpretado como contador implausível e reprovaria por engano.
+    /// - `layerManagers@0x380`: `entries` aponta pra `base+0x40` (região SEPARADA de
+    ///   `storage[0]`, sem colisão), onde vive o elemento `[0]` `{instance=base,
+    ///   refCount=base}` — não-nulo, mapeado, par consistente. `cap=4, size=3`.
+    /// - `keyboardState@0x2F8` = `0x2A` (só bits baixos, nenhum bit reservado `b10`).
+    fn build_valid_candidate() -> (Box<[u64; 128]>, u64) {
+        let mut storage = Box::new([0u64; 128]); // 128*8 = 0x400 bytes, 8-alinhado
+        let base = storage.as_ptr() as u64;
+        assert!(base > 0x10000 && base % 8 == 0, "endereço de heap do teste fora do esperado: {base:#x}");
+        unsafe {
+            let p = storage.as_mut_ptr() as *mut u8;
+            // storage[0] (byte 0x00): RefCnt{strongRefs=1,weakRefs=1} — alvo de requestsHandler.refCount.
+            write_unaligned(p as *mut u32, 1u32);
+            write_unaligned(p.add(4) as *mut u32, 1u32);
+            // entries[0] (byte 0x40, região separada de storage[0]) — {instance,refCount} = base.
+            write_unaligned(p.add(0x40) as *mut u64, base);
+            write_unaligned(p.add(0x48) as *mut u64, base);
+            // inputWidget@0x2E8
+            write_unaligned(p.add(0x2E8) as *mut u64, base);
+            write_unaligned(p.add(0x2E8 + 8) as *mut u64, base);
+            // keyboardState@0x2F8 — só bits baixos (shiftLeft+controlLeft+altLeft, ex.), 0 nos reservados.
+            write_unaligned(p.add(0x2F8) as *mut u16, 0x2Au16);
+            // requestsHandler@0x370 — refCount aponta pro RefCnt são em storage[0].
+            write_unaligned(p.add(0x370) as *mut u64, base);
+            write_unaligned(p.add(0x370 + 8) as *mut u64, base);
+            // layerManagers@0x380 — entries aponta pro elemento[0] em base+0x40, cap=4 size=3.
+            write_unaligned(p.add(0x380) as *mut u64, base + 0x40);
+            write_unaligned(p.add(0x388) as *mut u32, 4u32);
+            write_unaligned(p.add(0x38C) as *mut u32, 3u32);
+        }
+        (storage, base)
+    }
+
+    #[test]
+    fn candidato_bem_formado_passa() {
+        let (_storage, base) = build_valid_candidate();
+        let got = unsafe { inksystem_shape_matches(base) };
+        let (kb, cap, size) = got.expect("candidato sintético bem-formado deveria bater");
+        assert_eq!(cap, 4);
+        assert_eq!(size, 3);
+        assert_eq!(kb & 0xFC00, 0, "keyboardState do candidato não devia ter bit reservado setado");
+    }
+
+    /// O ACHADO-CHAVE desta rodada: este é o padrão que dominava os 987/1020 "candidatos" do
+    /// filtro antigo — um bloco de heap zerado batia `cap==0<=>entries==0` (trivialmente
+    /// satisfeito) e os 2 ponteiros null-ou-null passavam o teste frouxo de "plausível". O
+    /// filtro novo EXIGE `layerManagers.cap>=1`, matando essa classe inteira de falso-positivo.
+    #[test]
+    fn zerado_por_completo_e_rejeitado_era_o_ruido_dominante() {
+        let storage = Box::new([0u64; 128]);
+        let base = storage.as_ptr() as u64;
+        let got = unsafe { inksystem_shape_matches(base) };
+        assert!(got.is_none(), "bloco 100% zerado não pode mais bater — cap=0 agora é rejeitado");
+    }
+
+    #[test]
+    fn keyboardstate_com_bit_reservado_e_rejeitado() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe { write_unaligned((storage.as_mut_ptr() as *mut u8).add(0x2F8) as *mut u16, 0xFFFFu16) };
+        assert!(unsafe { inksystem_shape_matches(base) }.is_none(), "bit reservado (b10) setado tinha que reprovar");
+    }
+
+    #[test]
+    fn nulidade_despareada_em_inputwidget_e_rejeitada() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe {
+            // instance != 0 mas refCount == 0 — nunca acontece num WeakHandle/SharedPtrBase real
+            // (todo construtor seta os 2 juntos, `RED4ext.SDK/Memory/SharedPtr.hpp`).
+            write_unaligned((storage.as_mut_ptr() as *mut u8).add(0x2E8 + 8) as *mut u64, 0);
+        }
+        assert!(
+            unsafe { inksystem_shape_matches(base) }.is_none(),
+            "nulidade despareada (instance≠0, refCount=0) tinha que reprovar"
+        );
+    }
+
+    #[test]
+    fn layermanagers_vazio_e_rejeitado_era_aceito_pelo_filtro_antigo() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe {
+            let p = storage.as_mut_ptr() as *mut u8;
+            write_unaligned(p.add(0x380) as *mut u64, 0);
+            write_unaligned(p.add(0x388) as *mut u32, 0);
+            write_unaligned(p.add(0x38C) as *mut u32, 0);
+        }
+        assert!(
+            unsafe { inksystem_shape_matches(base) }.is_none(),
+            "layerManagers vazio (cap=0) tinha que reprovar — o filtro antigo aceitava isso"
+        );
+    }
+
+    #[test]
+    fn size_maior_que_cap_e_rejeitado() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe { write_unaligned((storage.as_mut_ptr() as *mut u8).add(0x38C) as *mut u32, 999u32) };
+        assert!(unsafe { inksystem_shape_matches(base) }.is_none(), "size>cap tinha que reprovar");
+    }
+
+    #[test]
+    fn primeiro_elemento_do_array_nulo_e_rejeitado() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe { write_unaligned((storage.as_mut_ptr() as *mut u8).add(0x40) as *mut u64, 0) };
+        assert!(
+            unsafe { inksystem_shape_matches(base) }.is_none(),
+            "1º elemento do array nulo (size>=1 mas slot0 vazio) tinha que reprovar — sinal novo, o filtro antigo nunca olhava dentro do array"
+        );
+    }
+
+    #[test]
+    fn refcount_implausivel_e_rejeitado() {
+        let (mut storage, base) = build_valid_candidate();
+        unsafe {
+            // requestsHandler.refCount continua apontando pro storage[0], mas o strongRefs
+            // gravado lá vira um número absurdo (nenhum RefCnt real tem bilhões de referências).
+            write_unaligned(storage.as_mut_ptr() as *mut u32, 0xFFFF_FFFFu32);
+        }
+        assert!(
+            unsafe { inksystem_shape_matches(base) }.is_none(),
+            "RefCnt com contador implausível (bilhões) tinha que reprovar"
+        );
+    }
 }
 
 fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str) {
@@ -2485,6 +3977,1776 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         }
         return;
     }
+    // equiprawv5 (2026-08-03): verificação DEFINITIVA — chama `BwmsCheckItemQty(game)` (redscript,
+    // TransactionSystem.GetItemQuantity real) com GameInstance resolvido em Rust, mesmo padrão do
+    // `fbtest` acima. Confirma se `QueueRequest` via frame real (equiprawv5) de fato deu o item.
+    if cmd == "itemqty" {
+        unsafe {
+            if player.is_null() {
+                log("[itemqty] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsCheckItemQty");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: crate::rtti::ret_type_of(f), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(r) => log(&format!("[itemqty] BwmsCheckItemQty(game) -> qty={}", i32::from_le_bytes([r[0],r[1],r[2],r[3]]))),
+                            None => log("[itemqty] call_func não completou"),
+                        }
+                    } else {
+                        log("[itemqty] BwmsCheckItemQty não resolveu");
+                    }
+                }
+                None => log("[itemqty] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "equipslotcheck" {
+        unsafe {
+            if player.is_null() {
+                log("[equipslotcheck] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsCheckEquipSlot");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: crate::rtti::ret_type_of(f), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(r) => log(&format!("[equipslotcheck] BwmsCheckEquipSlot(game) -> equipped={}", r[0] != 0)),
+                            None => log("[equipslotcheck] call_func não completou"),
+                        }
+                    } else {
+                        log("[equipslotcheck] BwmsCheckEquipSlot não resolveu");
+                    }
+                }
+                None => log("[equipslotcheck] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // enumcomp: axl-fullbody-torso (cont.41) — enumera DIRETO os componentes reais do player
+    // (Entity+0xA0, offset ground-truth já usado em cw-entity-builder) e conta quantos são
+    // SkinnedMeshComponent, logando enabled/res_ptr de cada um. Observe-only, zero mutação.
+    if cmd == "enumcomp" {
+        unsafe {
+            log(&register::run_enum_skinnedmesh(reg, player));
+        }
+        return;
+    }
+    // scanattach2: axl-attachment-apply / itens #40, #41, #54 (2026-08-19) — dump SOB DEMANDA do
+    // array `unk90`+0xB0 (candidato `DynArray<AttachmentSlotData>`, cap~23) do componente REAL
+    // `gameAttachmentSlots` do player, sem depender de um firing do hook `EquipStart`. Útil pra
+    // reler o estado ATUAL pós-`give`+`equiprawv7` (equip real). Observe-only, zero mutação.
+    if cmd == "scanattach2" {
+        unsafe {
+            log(&register::scan_attachslots_now(reg, player));
+        }
+        return;
+    }
+    // attachslotcheck <SlotSuffix>: ArchiveXL #40/#41/#54 (2026-08-19) — teste ao vivo da
+    // composição pura de IsSlotEmpty/IsSlotSpawning. `SlotSuffix` é o sufixo depois de
+    // "AttachmentSlots." (ex. `attachslotcheck Torso` -> `AttachmentSlots.Torso`).
+    if let Some(suffix) = cmd.strip_prefix("attachslotcheck ") {
+        unsafe {
+            let full_name = format!("AttachmentSlots.{suffix}");
+            let tdbid = bwms_hashes::tweak_db_id(&full_name);
+            match register::attachslot_check_by_id(reg, player, tdbid) {
+                Some((is_empty, is_spawning, resolved_name)) => log(&format!(
+                    "[attachslotcheck] '{full_name}' tdbid={tdbid:#018x} resolved_name={resolved_name} \
+                     IsSlotEmpty={is_empty} IsSlotSpawning={is_spawning}"
+                )),
+                None => log(&format!(
+                    "[attachslotcheck] '{full_name}' tdbid={tdbid:#018x} — slot NÃO achado no array (componente ausente ou slotID sem match)"
+                )),
+            }
+        }
+        return;
+    }
+    // toggle <cname>: axl-fullbody-torso (cont.41) — ACHADO: 'torso'/'legs'/'shoes' existem como
+    // entSkinnedMeshComponent reais do player, mesh carregado (res_ptr válido), mas enabled=0.
+    // Este comando escreve enabled=1 no componente com o CName pedido (offset +0x8b, já usado
+    // com segurança em IComponent::Toggle desde 2026-07-28). ESCRITA REAL — não gated por
+    // padrão além de precisar de dev_mode (mesmo canal de todo comando de console).
+    if let Some(rest) = cmd.strip_prefix("toggle ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_toggle_component_by_cname(reg, player, name));
+        }
+        return;
+    }
+    // togglerebuild <cname>: axl-fullbody-torso (cont.41) — `toggle` sozinho persiste mas não
+    // muda o visual (confirmado por screenshot); esta variante TAMBÉM chama o método virtual
+    // "rebuild render proxy" (vtable+0x288, já observado seguro) na mesma instância, testando
+    // se a reconstrução do proxy é o passo que falta pro mesh aparecer.
+    if let Some(rest) = cmd.strip_prefix("togglerebuild ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_toggle_and_rebuild(reg, player, name));
+        }
+        return;
+    }
+    // togglefull <cname>: axl-fullbody-torso (cont.42) — RE offline achou 2 leitores reais de
+    // `enabled` (vtable+0x2d0/0x2d8, não o wrapper já testado); notificação de render exige
+    // +0x24a==1 E +0x253 bit2, ambos falsos no torso por padrão. Seta os 3 campos + rebuild.
+    if let Some(rest) = cmd.strip_prefix("togglefull ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_toggle_full_and_rebuild(reg, player, name));
+        }
+        return;
+    }
+    // dissolve <cname>: axl-fullbody-torso (cont.42) — `+0x24a` é enum de estado (0/1/2), não
+    // bool; simula a progressão 1→dispatch→2→dispatch que o sistema de dissolve/fade faria.
+    if let Some(rest) = cmd.strip_prefix("dissolve ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_toggle_dissolve_sequence(reg, player, name));
+        }
+        return;
+    }
+    // forceopacity <cname>: axl-fullbody-torso (cont.42, 4ª rodada) — bypassa o gate de dissolve
+    // inteiro: lê o proxy real (componente+0x1d8), força os 2 bits de +0x23 + SetOpacity flag
+    // em +0x21, chama a função de commit (`0x1016a7344`) DIRETO.
+    if let Some(rest) = cmd.strip_prefix("forceopacity ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_force_proxy_opacity(reg, player, name));
+        }
+        return;
+    }
+    // dumpcomp <cname>: axl-fullbody-torso (cont.41) — dump hex bruto (0x300 bytes) do componente
+    // achado por CName, pra comparação offline contra um componente sabidamente visível (ex.
+    // pescoço FPP) e achar o offset real do gate de visibilidade (chunkMask ou equivalente).
+    if let Some(rest) = cmd.strip_prefix("dumpcomp ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_dump_component_by_cname(reg, player, name));
+        }
+        return;
+    }
+    // renderproxyvis <cname>: Codeware #254 (Rendering.hpp, Raw::RenderProxy::IsVisible) —
+    // leitura pura de campo, zero endereço nativo. renderProxy@+0x1e0 (SharedPtr.instance,
+    // offset do header GERADO entSkinnedMeshComponent.hpp, mesma família já provada pelo
+    // chunkmaskget/#22) -> Flags@proxy+0x23, IsVisible=(flags&6)==6. Observe-only.
+    if let Some(rest) = cmd.strip_prefix("renderproxyvis ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_render_proxy_visible(reg, player, name));
+        }
+        return;
+    }
+    // dumpat <0xhex>: variante de dumpcomp que aceita ponteiro cru (já achado via enumcomp),
+    // pra comparar um componente habilitado sem precisar adivinhar o CName exato.
+    if let Some(rest) = cmd.strip_prefix("dumpat ") {
+        let hexstr = rest.trim().trim_start_matches("0x");
+        if let Ok(addr) = u64::from_str_radix(hexstr, 16) {
+            unsafe {
+                log(&register::run_dump_component_at(addr as *mut std::os::raw::c_void));
+            }
+        } else {
+            log(&format!("[dumpat] hex inválido: '{rest}'"));
+        }
+        return;
+    }
+    // dumpres <0xptr_componente>: dump do RESOURCE apontado por res_ptr@+0x1f8 do componente
+    // (não o componente em si). Hipótese: gate de visibilidade dentro do resource, não no comp.
+    if let Some(rest) = cmd.strip_prefix("dumpres ") {
+        let hexstr = rest.trim().trim_start_matches("0x");
+        if let Ok(addr) = u64::from_str_radix(hexstr, 16) {
+            unsafe {
+                log(&register::run_dump_resource_at(addr as *mut std::os::raw::c_void));
+            }
+        } else {
+            log(&format!("[dumpres] hex inválido: '{rest}'"));
+        }
+        return;
+    }
+    // xformcap: Codeware `#24` (2026-08-19, RE ao vivo dedicada) — captura observe-only do
+    // ponteiro `IPlacedComponent*` real do player via `Entity+0xB0` (`transformComponent`,
+    // offset confirmado por leitura de fonte `Red/Entity.hpp:54` + item #60 do catálogo
+    // ArchiveXL — NUNCA lido ao vivo antes de hoje). Loga o ponteiro do player, o ponteiro do
+    // componente, e os 2 endereços-alvo candidatos pro watchpoint de hardware (`+0xC0`
+    // localTransform / `+0xE0` worldTransform) — prontos pra colar num `lldb watchpoint set
+    // expression`. Zero escrita, zero call, só leitura crua de memória já mapeada.
+    if cmd == "xformcap" {
+        unsafe {
+            if player.is_null() {
+                return log("[xformcap] player null");
+            }
+            let player_addr = player as u64;
+            let field_addr = player_addr + 0xB0;
+            if !crate::gum::is_readable(field_addr as *const c_void, 8) {
+                return log(&format!("[xformcap] player={player_addr:#x} +0xB0={field_addr:#x} ILEGÍVEL"));
+            }
+            let comp_ptr = (field_addr as *const u64).read();
+            if comp_ptr == 0 {
+                return log(&format!("[xformcap] player={player_addr:#x} transformComponent@+0xB0={field_addr:#x} -> NULO"));
+            }
+            let watch_local = comp_ptr + 0xC0;
+            let watch_world = comp_ptr + 0xE0;
+            let local_ok = crate::gum::is_readable(watch_local as *const c_void, 0x20);
+            let world_ok = crate::gum::is_readable(watch_world as *const c_void, 0x20);
+            log(&format!(
+                "[xformcap] player={player_addr:#x} transformComponent(Entity+0xB0)={comp_ptr:#x} | localTransform(+0xC0)={watch_local:#x} legivel={local_ok} | worldTransform(+0xE0)={watch_world:#x} legivel={world_ok}"
+            ));
+        }
+        return;
+    }
+    // chunkmaskget <cname>: ArchiveXL `#22` (2026-08-12) — leitura PURA de chunkMask/isEnabled/
+    // kind do componente achado por CName (offsets confirmados contra o header RTTI oficial,
+    // ver register.rs). Observe-only, zero mutação — 1º passo seguro antes de `chunkmaskover`.
+    if let Some(rest) = cmd.strip_prefix("chunkmaskget ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_get_chunk_mask_by_cname(reg, player, name));
+        }
+        return;
+    }
+    // chunkmaskover <cname> <hexmask>: ArchiveXL `#22` — composição PURA de
+    // `EntityState::ApplyChunkMaskOverride` (campo cru `chunkMask`, offset por tipo: 0x198
+    // Mesh / 0x248 Skinned+Garment / 0x240 MorphTarget, header RTTI oficial). ESCRITA REAL —
+    // mesma disciplina de `toggle`/`mkflat` (canal de dev, sem gate extra além do próprio
+    // dev_mode). ⚠️ NUNCA TESTADO AO VIVO (ver register.rs pro raciocínio de confiança).
+    if let Some(rest) = cmd.strip_prefix("chunkmaskover ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let name = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(mask) => unsafe {
+                log(&register::run_apply_chunk_mask_override_by_cname(reg, player, name, mask));
+            },
+            Err(_) => log(&format!("[chunkmaskover] uso: chunkmaskover <cname> <hexmask> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    // appearancenameget/appearancenameover <cname> [hash-hex]: ArchiveXL `#22` (round 2,
+    // 2026-08-12) — wire do `component_get_appearance_name`/`component_set_appearance_name`
+    // já codados na rodada anterior mas nunca ligados a comando nenhum. Mesma disciplina
+    // observe-only-primeiro de chunkmaskget/chunkmaskover.
+    if let Some(rest) = cmd.strip_prefix("appearancenameget ") {
+        let name = rest.trim();
+        unsafe {
+            log(&register::run_get_appearance_name_by_cname(reg, player, name));
+        }
+        return;
+    }
+    if let Some(rest) = cmd.strip_prefix("appearancenameover ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let name = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(cname_hash) => unsafe {
+                log(&register::run_set_appearance_name_by_cname(reg, player, name, cname_hash));
+            },
+            Err(_) => log(&format!("[appearancenameover] uso: appearancenameover <cname> <hash-hex> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    // vtagcount/vtagapply <tag>: ArchiveXL `#21`/`#22` (round 2, 2026-08-12) — a tabela de 14
+    // tags built-in (`GetTagManager`, item `#21`, já fechada offline) composta com a escrita
+    // de chunkMask (`#22`) numa capacidade genuinamente nova: aplicar uma tag conhecida
+    // ("hide_Torso"/"HighHeels"/etc.) em TODOS os componentes do player que baterem por nome.
+    // `vtagcount` é dry-run (zero mutação), sempre testar antes de `vtagapply`.
+    if let Some(rest) = cmd.strip_prefix("vtagcount ") {
+        let tag = rest.trim();
+        unsafe {
+            log(&register::run_visual_tag_override_count(reg, player, tag));
+        }
+        return;
+    }
+    if let Some(rest) = cmd.strip_prefix("vtagapply ") {
+        let tag = rest.trim();
+        unsafe {
+            log(&register::run_visual_tag_override_apply(reg, player, tag));
+        }
+        return;
+    }
+    // vtagapplymod/vtagremovemod <tag> <modhash-hex>: item `#22` round 6 (2026-08-12) —
+    // variante MULTI-MOD de vtagapply: 2 chamadas com `modhash` DIFERENTE na MESMA
+    // tag/componente agora COMBINAM (AND-hiding/OR-showing, fiel ao `ComponentState` real) em
+    // vez de "o último a chamar vence". `vtagremovemod` desfaz só a contribuição daquele
+    // modhash (uninstall-safety) — se era o último override do componente, volta pro baseline
+    // cacheado no 1º apply.
+    if let Some(rest) = cmd.strip_prefix("vtagapplymod ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let tag = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(mod_hash) => unsafe {
+                log(&register::run_visual_tag_override_apply_for_mod(reg, player, tag, mod_hash));
+            },
+            Err(_) => log(&format!("[vtagapplymod] uso: vtagapplymod <tag> <modhash-hex> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    if let Some(rest) = cmd.strip_prefix("vtagremovemod ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let tag = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(mod_hash) => unsafe {
+                log(&register::run_visual_tag_override_remove_for_mod(reg, player, tag, mod_hash));
+            },
+            Err(_) => log(&format!("[vtagremovemod] uso: vtagremovemod <tag> <modhash-hex> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    // vtagapplymodrefresh/vtagremovemodrefresh: igual acima, mas TAMBÉM chama
+    // `RefreshAppearance` (já provado ao vivo via `togglerebuild`) nos componentes
+    // `SkinnedFamily` tocados — fecha "campo escrito" -> "efeito visual real". Categoria de
+    // risco separada de propósito (dispatch de função nativa, não só campo cru).
+    if let Some(rest) = cmd.strip_prefix("vtagapplymodrefresh ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let tag = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(mod_hash) => unsafe {
+                log(&register::run_visual_tag_override_apply_for_mod_refresh(reg, player, tag, mod_hash));
+            },
+            Err(_) => log(&format!("[vtagapplymodrefresh] uso: vtagapplymodrefresh <tag> <modhash-hex> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    if let Some(rest) = cmd.strip_prefix("vtagremovemodrefresh ") {
+        let mut it = rest.trim().splitn(2, ' ');
+        let tag = it.next().unwrap_or("").trim();
+        let hexstr = it.next().unwrap_or("").trim().trim_start_matches("0x");
+        match u64::from_str_radix(hexstr, 16) {
+            Ok(mod_hash) => unsafe {
+                log(&register::run_visual_tag_override_remove_for_mod_refresh(reg, player, tag, mod_hash));
+            },
+            Err(_) => log(&format!("[vtagremovemodrefresh] uso: vtagremovemodrefresh <tag> <modhash-hex> (hex inválido: '{hexstr}')")),
+        }
+        return;
+    }
+    if cmd == "equiprawv7" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv7] player null");
+                return;
+            }
+            // Mesmo fix cirúrgico do equiprawv6 (idempotente — se já instalado nesta boot, só
+            // reaponta o alvo). Precisa rodar ANTES da chamada em bytecode pra QueueRequest não
+            // crashar em GetInvokable()==null.
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[equiprawv7] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[equiprawv7] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            log("[equiprawv7] fix de GetInvokable instalado/reapontado — chamando BwmsEquipViaQuery...");
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsEquipViaQuery");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[equiprawv7] BwmsEquipViaQuery(game) chamado — ZERO CRASH, ver [equiprawv7] no log do reds"),
+                            None => log("[equiprawv7] call_func não completou"),
+                        }
+                    } else {
+                        log("[equiprawv7] BwmsEquipViaQuery não resolveu");
+                    }
+                }
+                None => log("[equiprawv7] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-29-equipcyber (2026-08-14): mesmo padrão de equiprawv7, mas equipa `Items.MantisBlades`
+    // (cyberware de braço REAL) em vez da T-shirt — teste DECISIVO do item ArchiveXL #29
+    // (`ComputePuppetArmsState`). Precisa de `give Items.MantisBlades` antes (posse real).
+    if cmd == "equipcyber" {
+        unsafe {
+            if player.is_null() {
+                log("[equipcyber] player null");
+                return;
+            }
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[equipcyber] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[equipcyber] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            log("[equipcyber] fix de GetInvokable instalado/reapontado — chamando BwmsEquipCyberwareViaQuery...");
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsEquipCyberwareViaQuery");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[equipcyber] BwmsEquipCyberwareViaQuery(game) chamado — ZERO CRASH, ver [equipcyber] no log do reds"),
+                            None => log("[equipcyber] call_func não completou"),
+                        }
+                    } else {
+                        log("[equipcyber] BwmsEquipCyberwareViaQuery não resolveu");
+                    }
+                }
+                None => log("[equipcyber] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-29-drawcyber (2026-08-18): teste DECISIVO #2 do item ArchiveXL #29 — achado honesto de
+    // 2026-08-14 (proofs/2026-08-14-archivexl-29-armsdetect-DECISIVO-tentado-INCONCLUSIVO.log)
+    // confirmou que `equipcyber` move o item pra posse real (RightArm) mas não popula
+    // `AttachmentSlots.WeaponRight` (a arma precisa estar DESEMBAINHADA/em uso). Mesmo padrão de
+    // `equipcyber`, mas chama `BwmsDrawCyberwareAndCheckArms` (bwms-tppcam.reds) — despacha
+    // `DrawItemRequest{itemID=CreateQuery(Items.MantisBlades)}` via QueueRequest (mesmo fix de
+    // GetInvokable, já instalado se `equiprawv7`/`equipcyber` já rodaram nesta boot) e, na
+    // sequência, chama `ComputePuppetArmsState` de novo e loga o ordinal (marcador 9613 +
+    // EnumInt). Rodar depois de `give Items.MantisBlades` + `equipcyber`.
+    if cmd == "drawcyber" {
+        unsafe {
+            if player.is_null() {
+                log("[drawcyber] player null");
+                return;
+            }
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[drawcyber] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[drawcyber] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            log("[drawcyber] fix de GetInvokable instalado/reapontado — chamando BwmsDrawCyberwareAndCheckArms...");
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsDrawCyberwareAndCheckArms");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[drawcyber] BwmsDrawCyberwareAndCheckArms(game) chamado — ZERO CRASH, ver [drawcyber]/[variant_log] no log do reds"),
+                            None => log("[drawcyber] call_func não completou"),
+                        }
+                    } else {
+                        log("[drawcyber] BwmsDrawCyberwareAndCheckArms não resolveu");
+                    }
+                }
+                None => log("[drawcyber] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-29-armscheck (2026-08-14): re-dispara o teste do item #29 SOB DEMANDA (não só no
+    // OnGameAttached original, que roda ANTES de qualquer equip manual via canal) — chama
+    // `BwmsPuppetArmsStateSmoke.Run(player)` direto via resolve_func (mesmo padrão de
+    // `EquipmentSystem::QueueRequest`, classe redscript comum, não native), passando o player
+    // real como `ref<PlayerPuppet>` (Arg::Handle, mesmo idioma já provado em `custsys call`).
+    if cmd == "armscheck" {
+        unsafe {
+            if player.is_null() {
+                log("[armscheck] player null");
+                return;
+            }
+            // DIAGNÓSTICO 2026-08-17: `resolve_func` (== class_by_name + resolve_in_class) sempre
+            // falhava aqui, sem dar pra saber SE era a classe que não resolvia ou o método. Separado
+            // em 2 passos pra isolar. Fallback via `resolve_class_via_validator_getclass` — MESMO
+            // padrão já confirmado necessário pra `IGameSystem` (register.rs, cw-callbacksystem-rtti,
+            // 2026-07-13): `class_by_name`/GetClass@vtbl+0x10 do singleton de `Registry::obtain()`
+            // já provou NÃO resolver toda classe genuinamente registrada no RTTI por "razão ainda não
+            // mapeada" — candidato de baixo risco pra uma classe scc-compilada pura (sem native/forge),
+            // categoria NUNCA antes testada via resolve_func neste projeto (todo outro call-site é
+            // classe vanilla ou native-forjada pelo Rust).
+            let cls_direct = reg.class_by_name("BwmsPuppetArmsStateSmoke");
+            let (cls, via) = if crate::rtti::sane(cls_direct) {
+                (cls_direct, "class_by_name")
+            } else {
+                let cls_fb = crate::register::resolve_class_via_validator_getclass("BwmsPuppetArmsStateSmoke");
+                (cls_fb, "resolve_class_via_validator_getclass(fallback)")
+            };
+            if !crate::rtti::sane(cls) {
+                log("[armscheck] classe 'BwmsPuppetArmsStateSmoke' NÃO resolveu por NENHUMA via (class_by_name nem o fallback do validador) — não é problema de método, é a classe em si");
+                return;
+            }
+            match crate::rtti::resolve_in_class(cls, "Run") {
+                Some(rf) => {
+                    log(&format!("[armscheck] classe resolvida via {via}; método 'Run' achado (is_static={})", rf.is_static));
+                    match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Handle(player, crate::console::refcnt())]) {
+                        Some(_) => log("[armscheck] BwmsPuppetArmsStateSmoke.Run(player) chamado — ver marcadores 9611/9612 no log"),
+                        None => log("[armscheck] call_func não completou"),
+                    }
+                }
+                None => log(&format!("[armscheck] classe resolvida via {via}, mas resolve_in_class('Run') falhou — método não achado nas tabelas cls+0x48/cls+0x58")),
+            }
+        }
+        return;
+    }
+    // axl-transmog-apply (2026-08-05): mesmo padrão de equiprawv7, com BwmsVisualEquipViaQuery
+    // (EquipVisualsRequest em vez de EquipRequest) — testa se ChangeAppearanceToItem dispara sem
+    // precisar da UI de Wardrobe/espelho. O fix de GetInvokable já é global pra QUALQUER request
+    // que passe por QueueRequest, então não precisa reinstalar se equiprawv7 já rodou nesta boot,
+    // mas reaponta de qualquer forma (idempotente, barato).
+    if cmd == "transmogviaquery" {
+        unsafe {
+            if player.is_null() {
+                log("[transmogviaquery] player null");
+                return;
+            }
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[transmogviaquery] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[transmogviaquery] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsVisualEquipViaQuery");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[transmogviaquery] BwmsVisualEquipViaQuery(game) chamado — ZERO CRASH, ver [transmogviaquery]/[axl-transmog] no log"),
+                            None => log("[transmogviaquery] call_func não completou"),
+                        }
+                    } else {
+                        log("[transmogviaquery] BwmsVisualEquipViaQuery não resolveu");
+                    }
+                }
+                None => log("[transmogviaquery] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // 2026-08-05 (auditoria de blind spots): testa persistent/@replaceMethod/TweakXL.Facade
+    // numa chamada só — mesmo padrão de transmogviaquery (resolve global, passa GameInstance
+    // real via PlayerPuppet.GetGame, não GetGameInstance() interno).
+    if cmd == "blindspottest" {
+        unsafe {
+            if player.is_null() {
+                log("[blindspot] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsRunBlindspotTests");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[blindspot] BwmsRunBlindspotTests(game) chamado — ZERO CRASH, ver [blindspot] no log"),
+                            None => log("[blindspot] call_func não completou"),
+                        }
+                    } else {
+                        log("[blindspot] BwmsRunBlindspotTests não resolveu");
+                    }
+                }
+                None => log("[blindspot] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "playertest" {
+        unsafe {
+            if player.is_null() {
+                log("[cw-player] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            // NOTA (2026-08-07): `register::get_function` (CRTTISystem::GetFunction, vtbl+0x30)
+            // NÃO é confiável pra achar função de SCRIPT pura (só acha o que a gente registrou
+            // via Rust — já documentado no projeto como "PARQUEADO, não é o resolvedor real do
+            // binder"). Pra chamar `PlayerSystem.GetPlayer()` (redscript puro, via @addMethod),
+            // usa `resolve_func`/`call_func` — o mesmo mecanismo já provado dezenas de vezes
+            // neste projeto (getf/setf/callf), que caminha o array de métodos real da classe.
+            match gi {
+                Some(gi) => {
+                    let ps_handle = crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetPlayerSystem")
+                        .and_then(|f| crate::rtti::call_func(&f, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]));
+                    match ps_handle {
+                        Some(h) => {
+                            let ps_ptr = usize::from_le_bytes(h[..8].try_into().unwrap()) as *mut c_void;
+                            log(&format!("[cw-player] GameInstance.GetPlayerSystem(game) -> {ps_ptr:p}"));
+                            if !ps_ptr.is_null() {
+                                // Codeware `#45` (2026-08-11, achado do agente de pesquisa): "PlayerSystem"
+                                // é só um ALIAS script-time que o `scc` resolve em compile-time — o CNAME
+                                // REAL na RTTI é `gamePlayerSystem` (mesma categoria de divergência já
+                                // documentada #81-85, script-name vs native-name). Bug latente desde que
+                                // esta linha foi escrita, nunca pego porque o bypass `callon`/`class_of`
+                                // (2026-08-10) contorna resolução por nome.
+                                match crate::rtti::resolve_func(reg, "gamePlayerSystem", "GetPlayer") {
+                                    Some(gp) => match crate::rtti::call_func(&gp, ps_ptr, &[]) {
+                                        Some(pb) => {
+                                            let p_ptr = usize::from_le_bytes(pb[..8].try_into().unwrap()) as *mut c_void;
+                                            log(&format!(
+                                                "[cw-player] PlayerSystem.GetPlayer() -> {p_ptr:p} (igual ao player capturado={})",
+                                                p_ptr == player
+                                            ));
+                                        }
+                                        None => log("[cw-player] call_func(GetPlayer) não completou"),
+                                    },
+                                    None => log("[cw-player] PlayerSystem.GetPlayer não resolveu (o @addMethod não bindou?)"),
+                                }
+                                match crate::rtti::resolve_func(reg, "gamePlayerSystem", "GetInventoryPuppet") {
+                                    Some(gip) => match crate::rtti::call_func(&gip, ps_ptr, &[]) {
+                                        Some(pb) => {
+                                            let inv_ptr = usize::from_le_bytes(pb[..8].try_into().unwrap()) as *mut c_void;
+                                            log(&format!(
+                                                "[cw-player] PlayerSystem.GetInventoryPuppet() -> {inv_ptr:p} (defined={})",
+                                                !inv_ptr.is_null()
+                                            ));
+                                        }
+                                        None => log("[cw-player] call_func(GetInventoryPuppet) não completou"),
+                                    },
+                                    None => log("[cw-player] PlayerSystem.GetInventoryPuppet não resolveu"),
+                                }
+                            }
+                        }
+                        None => log("[cw-player] GameInstance.GetPlayerSystem falhou"),
+                    }
+                }
+                None => log("[cw-player] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // `sysvtdump` (2026-08-11, RED4ext.SDK #472) — diagnóstico READ-ONLY (zero chamada) dos
+    // primeiros slots da vtable do `GameInstance*` real. A 1ª tentativa de chamar +0x08 direto
+    // (offset do header vendorizado Windows) CROU — hipótese: mesma convenção Itanium dual-dtor
+    // já estabelecida neste projeto (Mac tem 2 dtor slots vs 1 no MSVC, desloca tudo +0x08).
+    // Dump os slots 0x00-0x50 pra julgar plausibilidade (padrão de prólogo ARM64) antes de
+    // qualquer retry de chamada.
+    if cmd == "sysvtdump" {
+        unsafe {
+            if player.is_null() {
+                log("[sysvtdump] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let game_ptr = match gi {
+                Some(g) => usize::from_le_bytes(g[..8].try_into().unwrap()) as *mut c_void,
+                None => {
+                    log("[sysvtdump] PlayerPuppet.GetGame falhou");
+                    return;
+                }
+            };
+            log(&format!("[sysvtdump] game_ptr={game_ptr:p}"));
+            let base = crate::game_base();
+            for (off, slot, bytes) in crate::rtti::game_instance_vtable_dump(game_ptr, 11) {
+                let vmaddr = if (slot as usize) > base { slot as usize - base + 0x1_0000_0000 } else { slot as usize };
+                let op0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let plausible = slot != 0 && op0 != 0 && op0 != 0xFFFFFFFF;
+                log(&format!(
+                    "[sysvtdump] +{off:#x} slot={slot:#x} vmaddr={vmaddr:#010x} bytes={bytes:02x?} plausible={plausible}"
+                ));
+            }
+        }
+        return;
+    }
+    // `sysbytype <classname> <slot_off_hex>` (2026-08-11, RED4ext.SDK #472) — resolve um system
+    // genérico via `GameInstance::GetSystem(IType*)`, agora com offset EXPLÍCITO (achado via
+    // `sysvtdump` primeiro) em vez do +0x08 hardcoded que crashou. Cross-valida contra
+    // `GameInstance.GetPlayerSystem` (native já provado) quando classname=="gamePlayerSystem".
+    if let Some(rest) = cmd.strip_prefix("sysbytype ") {
+        let mut parts = rest.split_whitespace();
+        let class_name = parts.next().unwrap_or("");
+        let slot_off = parts
+            .next()
+            .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x08);
+        unsafe {
+            if player.is_null() {
+                log("[sysbytype] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let game_ptr = match gi {
+                Some(g) => usize::from_le_bytes(g[..8].try_into().unwrap()) as *mut c_void,
+                None => {
+                    log("[sysbytype] PlayerPuppet.GetGame falhou");
+                    return;
+                }
+            };
+            let itype = reg.class_by_name(class_name);
+            if itype.is_null() {
+                log(&format!("[sysbytype] class_by_name('{class_name}') não resolveu"));
+                return;
+            }
+            let sys_ptr = crate::rtti::game_instance_get_system(game_ptr, itype, slot_off);
+            log(&format!("[sysbytype] GetSystem('{class_name}', slot_off={slot_off:#x}) -> {sys_ptr:p} game={game_ptr:p} itype={itype:p}"));
+            if class_name == "gamePlayerSystem" {
+                let ps_handle = crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetPlayerSystem")
+                    .and_then(|f| crate::rtti::call_func(&f, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi.unwrap())]));
+                if let Some(h) = ps_handle {
+                    let known_ptr = usize::from_le_bytes(h[..8].try_into().unwrap()) as *mut c_void;
+                    log(&format!(
+                        "[sysbytype] cross-check: GameInstance.GetPlayerSystem(game) -> {known_ptr:p} (match={})",
+                        known_ptr == sys_ptr
+                    ));
+                }
+            }
+        }
+        return;
+    }
+    // `updateregistrar` (2026-08-11, mesma sessão, RED4ext.SDK #461) — read-only: reporta o
+    // ponteiro `UpdateRegistrar*` capturado pelo probe `update_registrar_group_probe` (se já
+    // armado via `~/.bwms-updateregistrar-probe` e se o motor já chamou `RegisterUpdate` pra
+    // algum sistema vanilla, o que acontece naturalmente durante o boot). Zero mutação.
+    if cmd == "updateregistrar" {
+        let ptr = crate::selftest::UPDATE_REGISTRAR_CAPTURED_PTR.load(std::sync::atomic::Ordering::Relaxed);
+        if ptr == 0 {
+            log("[updateregistrar] nenhum ponteiro capturado ainda (probe armado? RegisterUpdate já disparou?)");
+        } else {
+            log(&format!("[updateregistrar] UpdateRegistrar* capturado = {:#018x}", ptr));
+        }
+        return;
+    }
+    // `registerupdate` (2026-08-11, mesma sessão, RED4ext.SDK #461) — a ÚLTIMA peça: constrói o
+    // `Callback<>` real (ABI mapeada) e chama `RegisterUpdate` no `UpdateRegistrar*` já capturado,
+    // registrando `bwms_update_tick_callback` (função MÍNIMA, só loga, nunca lê FrameInfo/JobQueue)
+    // pra confirmar que a chamada de registro NÃO crasha e que o callback DISPARA de verdade nos
+    // frames seguintes. Toca maquinaria de registro do motor ATIVAMENTE (não mais só observar) —
+    // gate PRÓPRIO (`~/.bwms-registerupdate-confirm`) além do probe já precisar estar armado.
+    if cmd == "registerupdate" {
+        let confirm = std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join(".bwms-registerupdate-confirm").exists())
+            .unwrap_or(false);
+        if !confirm {
+            log("[registerupdate] BLOQUEADO: crie ~/.bwms-registerupdate-confirm p/ habilitar (toca registro ativo do motor)");
+            return;
+        }
+        if player.is_null() {
+            log("[registerupdate] player null");
+            return;
+        }
+        unsafe {
+            crate::selftest::register_bwms_update_tick(player);
+        }
+        return;
+    }
+    // `gisysmapdump [n]` (2026-08-11, mesma sessão, RED4ext.SDK #472) — diagnóstico depois do
+    // 1º teste ao vivo de `sysbymap` ter dado NEGATIVO (itype não achado). Dump de TODAS as
+    // chaves reais do systemMap (não busca por 1 nome) — resolve cada chave de volta pra nome
+    // via `type_name_getname`, deixa comparar visualmente contra o que `class_by_name` resolve.
+    if let Some(rest) = cmd.strip_prefix("gisysmapdump") {
+        let n: usize = rest.trim().parse().unwrap_or(30);
+        unsafe {
+            if player.is_null() {
+                log("[gisysmapdump] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let game_ptr = match gi {
+                Some(g) => usize::from_le_bytes(g[..8].try_into().unwrap()) as *mut c_void,
+                None => {
+                    log("[gisysmapdump] PlayerPuppet.GetGame falhou");
+                    return;
+                }
+            };
+            crate::rtti::game_instance_dump_system_map(game_ptr, n);
+            let itype = reg.class_by_name("gamePlayerSystem");
+            log(&format!("[gisysmapdump] class_by_name('gamePlayerSystem') -> {itype:p} (comparar contra as chaves acima)"));
+        }
+        return;
+    }
+    // `sysbymap <classname>` (2026-08-11, sessão nova, RED4ext.SDK #472) — via SEGURA (zero
+    // execução de código do motor): lê `systemMap` @ `GameInstance+0x08` DIRETO em vez de chamar
+    // slot de vtable (mesmo campo-de-objeto, imune ao shift Itanium que já causou o crash da
+    // tentativa anterior por vtable-call). Cross-valida contra `GetPlayerSystem` (native já
+    // provado) quando classname=="gamePlayerSystem" — mesmo padrão do `sysbytype`.
+    if let Some(rest) = cmd.strip_prefix("sysbymap ") {
+        let class_name = rest.trim();
+        unsafe {
+            if player.is_null() {
+                log("[sysbymap] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let game_ptr = match gi {
+                Some(g) => usize::from_le_bytes(g[..8].try_into().unwrap()) as *mut c_void,
+                None => {
+                    log("[sysbymap] PlayerPuppet.GetGame falhou");
+                    return;
+                }
+            };
+            let itype = reg.class_by_name(class_name);
+            if itype.is_null() {
+                log(&format!("[sysbymap] class_by_name('{class_name}') não resolveu"));
+                return;
+            }
+            let sys_ptr = crate::rtti::game_instance_get_system_by_map(game_ptr, itype);
+            log(&format!("[sysbymap] GetSystem('{class_name}') -> {sys_ptr:p} game={game_ptr:p} itype={itype:p}"));
+            if class_name == "gamePlayerSystem" {
+                let ps_handle = crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetPlayerSystem")
+                    .and_then(|f| crate::rtti::call_func(&f, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi.unwrap())]));
+                if let Some(h) = ps_handle {
+                    let known_ptr = usize::from_le_bytes(h[..8].try_into().unwrap()) as *mut c_void;
+                    log(&format!(
+                        "[sysbymap] cross-check: GameInstance.GetPlayerSystem(game) -> {known_ptr:p} (match={})",
+                        known_ptr == sys_ptr
+                    ));
+                }
+            }
+        }
+        return;
+    }
+    // `workspotdump` — ArchiveXL `#49` (2026-08-12, sessão dedicada, catálogo exaustivo):
+    // `AIWorkspotManager::RegisterSpots` continua SEM endereço achado (ver nota completa em
+    // `register::run_workspot_manager_probe`) — este comando NÃO hooka nada, só confirma que o
+    // singleton é alcançável via `sysbymap`/systemMap (já provado, RED4ext.SDK #472) e lê o campo
+    // `Spots@+0x48` (offset confirmado no header vendorizado + `SortedArray<T>` do SDK real).
+    // Read-only, zero mutação, zero chamada de código do motor — mesmo padrão de `sysbymap`.
+    if cmd == "workspotdump" {
+        unsafe {
+            if player.is_null() {
+                log("[workspotdump] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(g) => {
+                    let game_ptr = usize::from_le_bytes(g[..8].try_into().unwrap()) as *mut c_void;
+                    log(&register::run_workspot_manager_probe(reg, game_ptr));
+                }
+                None => log("[workspotdump] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "transmogtryv2" {
+        unsafe {
+            if player.is_null() {
+                log("[transmogtryv2] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsTransmogTryV2");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[transmogtryv2] BwmsTransmogTryV2(game) chamado — ZERO CRASH, ver [transmogtryv2] no log do reds"),
+                            None => log("[transmogtryv2] call_func não completou"),
+                        }
+                    } else {
+                        log("[transmogtryv2] BwmsTransmogTryV2 não resolveu");
+                    }
+                }
+                None => log("[transmogtryv2] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "equipglasses" {
+        unsafe {
+            if player.is_null() {
+                log("[equipglasses] player null");
+                return;
+            }
+            // mesmo fix cirúrgico de GetInvokable (idempotente).
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[equipglasses] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[equipglasses] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsEquipGlassesViaQuery");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[equipglasses] BwmsEquipGlassesViaQuery(game) chamado — ver [equipglasses] no log do reds"),
+                            None => log("[equipglasses] call_func não completou"),
+                        }
+                    } else {
+                        log("[equipglasses] BwmsEquipGlassesViaQuery não resolveu");
+                    }
+                }
+                None => log("[equipglasses] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "equipoutfit" {
+        unsafe {
+            if player.is_null() {
+                log("[equipoutfit] player null");
+                return;
+            }
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[equipoutfit] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[equipoutfit] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsEquipOutfitViaQuery");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[equipoutfit] BwmsEquipOutfitViaQuery(game) chamado — ver [equipoutfit] no log do reds"),
+                            None => log("[equipoutfit] call_func não completou"),
+                        }
+                    } else {
+                        log("[equipoutfit] BwmsEquipOutfitViaQuery não resolveu");
+                    }
+                }
+                None => log("[equipoutfit] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    if cmd == "scanslots" {
+        unsafe {
+            if player.is_null() {
+                log("[scanslots] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsScanEmptySlots");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[scanslots] BwmsScanEmptySlots(game) chamado — ver [scanslots] no log do reds"),
+                            None => log("[scanslots] call_func não completou"),
+                        }
+                    } else {
+                        log("[scanslots] BwmsScanEmptySlots não resolveu");
+                    }
+                }
+                None => log("[scanslots] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // `scanspawn` — ArchiveXL `#54` (2026-08-12, sessão dedicada, catálogo exaustivo): irmão de
+    // `scanslots` (acima), mesma estrutura de dispatch, chamando `BwmsScanSpawningSlots` (native
+    // VANILLA `TransactionSystem.IsSlotSpawningAnyItem`, zero endereço nativo/hook — ver nota
+    // completa em `blackwall-mods-dev/bwms-tppcam.reds`). Read-only.
+    if cmd == "scanspawn" {
+        unsafe {
+            if player.is_null() {
+                log("[scanspawn] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsScanSpawningSlots");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) {
+                            Some(_) => log("[scanspawn] BwmsScanSpawningSlots(game) chamado — ver [scanspawn] no log do reds"),
+                            None => log("[scanspawn] call_func não completou"),
+                        }
+                    } else {
+                        log("[scanspawn] BwmsScanSpawningSlots não resolveu");
+                    }
+                }
+                None => log("[scanspawn] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // `axl-garment-apply` (2026-08-02): diagnóstico OBSERVE-ONLY (zero call_func, só leitura de
+    // memória) pra comparar o `CClassFunction` QUEBRADO de `EquipmentSystem::QueueRequest`
+    // (`GetInvokable()@+0x28` confirmado NULL pela RE) contra um `CClassFunction` que SABEMOS
+    // funcionar (`PlayerPuppet::GetGame`, chamado com sucesso centenas de vezes nesta sessão) —
+    // dump lado a lado dos primeiros 0xC0 bytes de cada descritor, pra achar a diferença
+    // estrutural real em vez de só teorizar. Zero risco: nenhuma chamada acontece, só leitura.
+    if cmd == "qrdiag" {
+        unsafe {
+            let qr = crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest");
+            let gg = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame");
+            for (label, rf) in [("QueueRequest(QUEBRADO)", qr), ("GetGame(FUNCIONA)", gg)] {
+                match rf {
+                    Some(rf) => {
+                        let p = rf.func as *const u8;
+                        if !gum::is_readable(p as *const c_void, 0xc0) {
+                            log(&format!("[qrdiag] {label}: descritor @ {p:p} ILEGÍVEL"));
+                            continue;
+                        }
+                        log(&format!("[qrdiag] {label}: descritor @ {p:p} is_static={}", rf.is_static));
+                        for off in (0x00..0xc0).step_by(8) {
+                            let v = (p.add(off) as *const u64).read_unaligned();
+                            let tag = if off == 0x18 { " <- ret_type" }
+                                else if off == 0x28 { " <- GetInvokable()" }
+                                else if off == 0x30 { " <- param_count(u32 low)" }
+                                else if off == 0xa8 { " <- flags" }
+                                else { "" };
+                            log(&format!("[qrdiag]   +{off:#04x}: {v:#018x}{tag}"));
+                        }
+                    }
+                    None => log(&format!("[qrdiag] {label}: resolve_func falhou")),
+                }
+            }
+        }
+        return;
+    }
+    // `axl-garment-apply` state-hooks (AddItem/AddCustomItem/ChangeItem/ChangeCustomItem/RemoveItem):
+    // provavelmente só disparam com uma ação real de EQUIPAR — NÃO usar `BwmsEquipPoller` agendado
+    // via `ds.DelayCallback` (esse mecanismo tem crash PRÓPRIO documentado, ~1min55s de execução
+    // sustentada, sessão 2026-07-15). Em vez disso: 1 disparo SÍNCRONO, ÚNICO, sem agendamento —
+    // mesmo padrão seguro do `fbtest` acima (resolve `game` via `PlayerPuppet.GetGame`, chama um
+    // global redscript UMA VEZ). `BwmsForceEquipOnce(game)` constrói um `BwmsEquipPoller` e chama
+    // `.Call()` DIRETAMENTE (não agenda), reusando 100% da lógica de EquipRequest já provada
+    // end-to-end em 2026-07-15 ("Skill 2"), sem o padrão de poller recorrente que causou o crash.
+    if cmd == "equiponce" {
+        unsafe {
+            if player.is_null() {
+                log("[equiponce] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsForceEquipOnce");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        if crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]).is_some() {
+                            log("[equiponce] BwmsForceEquipOnce(game) chamado via canal com GameInstance real");
+                        } else {
+                            log("[equiponce] call_func não completou");
+                        }
+                    } else {
+                        log("[equiponce] BwmsForceEquipOnce não resolveu (mod compilado?)");
+                    }
+                }
+                None => log("[equiponce] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-transmog-apply / axl-garment-apply (2026-08-02, /goal): via alternativa que NÃO passa por
+    // `EquipmentSystem::QueueRequest` (beco-sem-saída RE-esgotado, GetInvokable() null pro descritor
+    // dessa função específica — ver HISTORICO.md cont.3-6). Chama `TransactionSystem.ChangeItemAppearanceByItemID`
+    // direto (`BwmsTransmogTryOnce`, bwms-tppcam.reds) — mesma categoria "consumidora" já provada
+    // segura (GetVisualTags/RegisterPart/LoadAppearance), descriptor RTTI SEPARADO de QueueRequest.
+    if cmd == "transmogtry" {
+        unsafe {
+            if player.is_null() {
+                log("[transmogtry] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsTransmogTryOnce");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        if crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]).is_some() {
+                            log("[transmogtry] BwmsTransmogTryOnce(game) chamado via canal com GameInstance real");
+                        } else {
+                            log("[transmogtry] call_func não completou");
+                        }
+                    } else {
+                        log("[transmogtry] BwmsTransmogTryOnce não resolveu (mod compilado?)");
+                    }
+                }
+                None => log("[transmogtry] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-garment-apply / axl-transmog-apply (2026-08-02, /goal): via mais direta que `transmogtry` —
+    // chama `EquipmentSystem::QueueRequest` real (0x103b1f624, RE dedicada desta sessão) via transmute,
+    // TOTALMENTE fora do RTTI/executor (mesmo padrão de CreateRecord/RecordExists), contornando
+    // `GetInvokable()` (a causa raiz exata do crash do `equiponce`/`es.QueueRequest(req)` normal).
+    if cmd == "equiprawonce" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawonce] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsForceEquipRaw");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        if crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]).is_some() {
+                            log("[equiprawonce] BwmsForceEquipRaw(game) chamado via canal com GameInstance real");
+                        } else {
+                            log("[equiprawonce] call_func não completou");
+                        }
+                    } else {
+                        log("[equiprawonce] BwmsForceEquipRaw não resolveu (mod compilado?)");
+                    }
+                }
+                None => log("[equiprawonce] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-garment-apply / axl-transmog-apply (2026-08-02, /goal): 3ª via — QueueRequest via call_func
+    // NOSSO com ctx explícito (achado do agente que desmontou GetInvokable(), ver register.rs).
+    if cmd == "equipctxonce" {
+        unsafe {
+            if player.is_null() {
+                log("[equipctxonce] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            match gi {
+                Some(gi) => {
+                    let f = register::get_function(reg, "BwmsForceEquipCtx");
+                    if crate::rtti::sane(f) {
+                        let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                        if crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]).is_some() {
+                            log("[equipctxonce] BwmsForceEquipCtx(game) chamado via canal com GameInstance real");
+                        } else {
+                            log("[equipctxonce] call_func não completou");
+                        }
+                    } else {
+                        log("[equipctxonce] BwmsForceEquipCtx não resolveu (mod compilado?)");
+                    }
+                }
+                None => log("[equipctxonce] PlayerPuppet.GetGame falhou"),
+            }
+        }
+        return;
+    }
+    // axl-garment-apply / axl-transmog-apply (2026-08-03, /goal): achado ao vivo — `equipctxonce` E
+    // `equiprawonce` (que chamam um native de 2 params `handle` de DENTRO do bytecode de
+    // `BwmsForceEquipCtx`/`Raw`) crasham no MESMO 0x1021730ec de sempre, ANTES de qualquer log nosso
+    // aparecer (nem o Print imediatamente antes, nem o log de entrada do trampolim Rust). Isso aponta
+    // pro DESPACHO do native aninhado como o problema, não a lógica interna dele. Via nova: ZERO
+    // native aninhado. `BwmsPrepEquipSys`/`BwmsPrepEquipReq` só CONSTROEM e RETORNAM objetos (sem
+    // chamar nenhum native de 2-handle-params) — 2 chamadas TOP-LEVEL separadas (mesmo padrão
+    // provado de `getcustsys`: ponteiro do objeto = primeiros 8 bytes do retorno). O `transmute` pro
+    // endereço cru roda 100% aqui em `run_cmd`, sem NENHUM native aninhado no meio.
+    // 2026-08-03 (/goal): diagnóstico MÍNIMO/incremental — isola qual PEÇA exata da cadeia
+    // GetPlayerSystem/EquipmentSystem.GetInstance introduz o crash quando a função externa (chamada
+    // via nosso `call_func`) retorna `ref<T>` em vez de `Void`. `rettest` (só Print+null) já passou.
+    let rettest_fn: Option<&str> = match cmd {
+        "rettest2" => Some("BwmsTestRef2"),
+        "rettest3" => Some("BwmsTestRef3"),
+        "rettest4" => Some("BwmsTestRef4"),
+        "rettest5" => Some("BwmsTestRef5"),
+        "rettest6" => Some("BwmsPrepEquipSys"),
+        "rettest7" => Some("BwmsPrepEquipReq"),
+        _ => None,
+    };
+    if cmd == "rettest" || rettest_fn.is_some() {
+        let fname = rettest_fn.unwrap_or("BwmsTestReturnsRef");
+        unsafe {
+            if player.is_null() {
+                log(&format!("[{cmd}] player null"));
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log(&format!("[{cmd}] PlayerPuppet.GetGame falhou")); return; }
+            };
+            let f = register::get_function(reg, fname);
+            if !crate::rtti::sane(f) {
+                log(&format!("[{cmd}] {fname} não resolveu (mod compilado?)"));
+                return;
+            }
+            log(&format!("[{cmd}] resolvido f={f:p}, chamando {fname} agora..."));
+            let rf = crate::rtti::ResolvedFn { func: f, ret_type: crate::rtti::ret_type_of(f), is_static: true };
+            let r = crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            log(&format!("[{cmd}] call_func retornou: {:?} — zero crash até aqui!", r.is_some()));
+        }
+        return;
+    }
+    // axl-garment-apply/axl-transmog-apply (2026-08-03, /goal): 4ª via — 1 SÓ call_func top-level
+    // (Void), 2 natives aninhadas de 1-handle-arg cada capturam es/req via atomic; Rust lê depois e
+    // faz o transmute pro endereço cru. Evita os 2 bugs diagnosticados nesta madrugada (cont.17/19).
+    // axl-garment-apply/axl-transmog-apply (2026-08-03, /goal): diff de memória — compara um
+    // EquipRequest construído via bytecode REAL (BwmsPrepAndCapture, `new` sintético, mas como
+    // ÚNICA/1ª chamada substancial da sessão = sabidamente seguro) contra um via rtti::new_object,
+    // byte a byte, pra achar o campo que falta em +0x6b (achado cont.22). `dumpreqbc` = bytecode;
+    // `dumpreqru` = rtti::new_object puro.
+    // axl-garment-apply/axl-transmog-apply (2026-08-03, /goal): instala a sonda naked observe-only
+    // em 0x103b1f678 (dentro de QueueRequest, ANTES do dispatch por tabela runtime). Rodar ESTE
+    // comando ANTES de `equiprawv4` — loga x0/x1/x2/x3/x8 + buf16 antes/depois, sem mudar
+    // comportamento nenhum (a chamada real acontece igual).
+    if cmd == "qrprobeon" {
+        unsafe { crate::selftest::install_qr_dispatch_probe() };
+        return;
+    }
+    if cmd == "dumpreqbc" || cmd == "dumpreqru" {
+        unsafe {
+            if player.is_null() {
+                log(&format!("[{cmd}] player null"));
+                return;
+            }
+            let req_ptr: *mut c_void;
+            if cmd == "dumpreqbc" {
+                let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                    crate::rtti::call_func(&gg, player, &[]).map(|b| { let mut o=[0u8;16]; o.copy_from_slice(&b[..16]); o })
+                });
+                let gi = match gi { Some(g) => g, None => { log("[dumpreqbc] GetGame falhou"); return; } };
+                register::CAPTURED_ES_PTR.store(0, std::sync::atomic::Ordering::Relaxed);
+                register::CAPTURED_REQ_PTR.store(0, std::sync::atomic::Ordering::Relaxed);
+                let f = register::get_function(reg, "BwmsPrepAndCapture");
+                if !crate::rtti::sane(f) { log("[dumpreqbc] BwmsPrepAndCapture não resolveu"); return; }
+                let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+                req_ptr = register::CAPTURED_REQ_PTR.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+                log(&format!("[dumpreqbc] req via BYTECODE new: {req_ptr:p}"));
+            } else {
+                req_ptr = crate::rtti::new_object(reg, "gameEquipRequest");
+                log(&format!("[dumpreqru] req via rtti::new_object: {req_ptr:p}"));
+            }
+            if req_ptr.is_null() || !crate::rtti::sane(req_ptr) {
+                log(&format!("[{cmd}] req_ptr inválido"));
+                return;
+            }
+            let mut hex = String::new();
+            for i in 0..0x80usize {
+                let b = *(req_ptr as *const u8).add(i);
+                hex.push_str(&format!("{b:02x}"));
+                if i % 8 == 7 { hex.push(' '); }
+            }
+            log(&format!("[{cmd}] dump 0x80 bytes @ {req_ptr:p}: {hex}"));
+        }
+        return;
+    }
+    if cmd == "equiprawv3" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv3] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log("[equiprawv3] PlayerPuppet.GetGame falhou"); return; }
+            };
+            register::CAPTURED_ES_PTR.store(0, std::sync::atomic::Ordering::Relaxed);
+            register::CAPTURED_REQ_PTR.store(0, std::sync::atomic::Ordering::Relaxed);
+            let f = register::get_function(reg, "BwmsPrepAndCapture");
+            if !crate::rtti::sane(f) {
+                log("[equiprawv3] BwmsPrepAndCapture não resolveu (mod compilado?)");
+                return;
+            }
+            log("[equiprawv3] chamando BwmsPrepAndCapture (1 única call_func top-level, Void)...");
+            let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+            let r = crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            log(&format!("[equiprawv3] call_func retornou: {:?} — zero crash até aqui", r.is_some()));
+            let es_ptr = register::CAPTURED_ES_PTR.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+            let req_ptr = register::CAPTURED_REQ_PTR.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+            log(&format!("[equiprawv3] es_ptr={es_ptr:p} req_ptr={req_ptr:p} (via atomics, sem 2ª call_func)"));
+            if es_ptr.is_null() || req_ptr.is_null() || !crate::rtti::sane(es_ptr) || !crate::rtti::sane(req_ptr) {
+                log("[equiprawv3] es_ptr/req_ptr inválido — abortando antes do transmute");
+                return;
+            }
+            log("[equiprawv3] chamando 0x103b1f624 direto via transmute...");
+            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
+            tf(es_ptr, req_ptr);
+            log("[equiprawv3] transmute retornou — ZERO CRASH, via completa!");
+        }
+        return;
+    }
+    // axl-garment-apply/axl-transmog-apply (2026-08-03, /goal): 5ª via — achado decisivo (cont.21):
+    // o crash é especificamente `new T()` via `call_func` (bytecode) quando não é uma das 1ªs
+    // alocações da sessão. `rtti::new_object` JÁ EXISTE (replica CClass::CreateInstance 100% em
+    // Rust, usado pra outras coisas há sessões) — constrói `req` SEM bytecode nenhum, evitando o
+    // mecanismo problemático por completo. `es` continua via `BwmsPrepEquipSys` (call_func, mas SEM
+    // `new`, já provado seguro repetidas vezes hoje). Campos escritos via `resolve_prop_in_class`
+    // (offset real, não chute) — `itemID`/`slotIndex`/`addToInventory` (EquipRequest) +
+    // `owner` (PlayerScriptableSystemRequest, herdado).
+    if cmd == "equiprawv4" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv4] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log("[equiprawv4] PlayerPuppet.GetGame falhou"); return; }
+            };
+            let es_fn = register::get_function(reg, "BwmsPrepEquipSys");
+            if !crate::rtti::sane(es_fn) {
+                log("[equiprawv4] BwmsPrepEquipSys não resolveu");
+                return;
+            }
+            let es_rf = crate::rtti::ResolvedFn { func: es_fn, ret_type: crate::rtti::ret_type_of(es_fn), is_static: true };
+            let es_ret = crate::rtti::call_func(&es_rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            let es_ptr = es_ret.map(|r| u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]) as *mut c_void).unwrap_or(std::ptr::null_mut());
+            log(&format!("[equiprawv4] es_ptr={es_ptr:p} (via BwmsPrepEquipSys, call_func mas sem `new`)"));
+            if es_ptr.is_null() || !crate::rtti::sane(es_ptr) {
+                log("[equiprawv4] es_ptr inválido — abortando");
+                return;
+            }
+            // req: construído 100% em Rust via rtti::new_object (zero bytecode `new`).
+            let req_ptr = crate::rtti::new_object(reg, "gameEquipRequest");
+            log(&format!("[equiprawv4] req_ptr={req_ptr:p} (via rtti::new_object, ZERO bytecode new)"));
+            if req_ptr.is_null() || !crate::rtti::sane(req_ptr) {
+                log("[equiprawv4] req_ptr inválido — abortando");
+                return;
+            }
+            // FIX DECISIVO #3 v2 (2026-08-03, achado por 2ª RE offline dedicada, corrige a v1 de hoje):
+            // `rtti::new_object` chama `Construct()` via vtable mas NUNCA constrói o `WeakHandle<ISerializable>`
+            // auto-referente que mora DENTRO do próprio objeto, em `req+0x08..+0x17` (`ISerializable::ref`).
+            // A v1 do fix (chamar `make_handle` numa saída SEPARADA/throwaway) não tinha efeito nenhum —
+            // Handle_ctor escreve no `out` que você dá a ele, e uma saída throwaway nunca toca a memória
+            // real do objeto. Confirmado por disasm do handler de dispatch real (índice 24, 0x1022502f4):
+            // ele lê `req+0x10` (metade "refcount-block" do par) esperando um bloco real; com {0,0} o
+            // valor colapsa pra um inteiro pequeno lido de outro lugar, que acaba virando o ponteiro cru
+            // 0x2b deref'd no crash (slot 34 da vtable de EquipmentSystem, `ldr x8,[x0]`). Fix certo:
+            // Handle_ctor com a saída APONTANDO DIRETO pra req_ptr+0x08 (auto-referência real).
+            crate::rtti::make_handle((req_ptr as *mut u8).add(0x08) as *mut c_void, req_ptr);
+            log("[equiprawv4] req+0x08 (ISerializable::ref) construído via make_handle DIRETO no objeto (fix v2)");
+            let cls = reg.class_by_name("gameEquipRequest");
+            // itemID: ItemID (16 bytes), via from_tdbid (já existe, mesma via de Skill 2/equiponce).
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "itemID") {
+                if let Some(item16) = crate::rtti::from_tdbid(reg, "Items.Fixer_01_Set_TShirt") {
+                    std::ptr::copy_nonoverlapping(item16.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+                }
+            }
+            // owner: wref<GameObject> — FIX #2 (mesma RE): {player, NULL} cru não é um WeakHandle
+            // válido pro motor (falta o refcount-block real); constrói via make_handle (Handle_ctor)
+            // igual ao req_ptr acima, mesma técnica.
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "owner") {
+                let mut owner_pair = [0u8; 16];
+                crate::rtti::make_handle(owner_pair.as_mut_ptr() as *mut c_void, player);
+                std::ptr::copy_nonoverlapping(owner_pair.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+            }
+            // addToInventory: Bool (1 byte) = true.
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "addToInventory") {
+                *(req_ptr as *mut u8).add(voff as usize) = 1u8;
+            }
+            // slotIndex: Int32 = -1.
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "slotIndex") {
+                ((req_ptr as *mut u8).add(voff as usize) as *mut i32).write_unaligned(-1);
+            }
+            // FIX DECISIVO (2026-08-03, achado por RE dedicada offline): `ScriptableSystemRequest+0x40`
+            // é um campo C++ interno NÃO-refletido (confirmado pelo header vendorizado real do
+            // RED4ext.SDK: `uint8_t unk40[0x48-0x40]` em ScriptableSystemRequest.hpp) — QueueRequest LÊ
+            // esse campo (nunca escreve) esperando um ponteiro cru de volta pro `ScriptableSystem`/
+            // `EquipmentSystem` dono (o mesmo `this`), usado internamente pra enfileirar no ring buffer
+            // lock-free do próprio sistema (`CircularBuffer<THandle<ScriptableSystemRequest>>`). Nem
+            // `new EquipRequest()` em redscript nem `Construct()` genérico via vtable populam isso —
+            // fica null, e QueueRequest crasha lendo através dele (`+0x40..+0x5c` relativo). Fix: 1
+            // escrita de 8 bytes, offset fixo (não resolvível via RTTI — não é propriedade refletida).
+            (req_ptr as *mut u8).add(0x40).cast::<*mut c_void>().write_unaligned(es_ptr);
+            log(&format!("[equiprawv4] req+0x40={es_ptr:p} (fix do campo interno não-refletido) — req montado, chamando 0x103b1f624 direto..."));
+            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
+            tf(es_ptr, req_ptr);
+            log("[equiprawv4] transmute retornou — ZERO CRASH, via completa!");
+        }
+        return;
+    }
+    if cmd == "equiprawv5" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv5] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log("[equiprawv5] PlayerPuppet.GetGame falhou"); return; }
+            };
+            let es_fn = register::get_function(reg, "BwmsPrepEquipSys");
+            if !crate::rtti::sane(es_fn) {
+                log("[equiprawv5] BwmsPrepEquipSys não resolveu");
+                return;
+            }
+            let es_rf = crate::rtti::ResolvedFn { func: es_fn, ret_type: crate::rtti::ret_type_of(es_fn), is_static: true };
+            let es_ret = crate::rtti::call_func(&es_rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            let es_ptr = es_ret.map(|r| u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]) as *mut c_void).unwrap_or(std::ptr::null_mut());
+            log(&format!("[equiprawv5] es_ptr={es_ptr:p}"));
+            if es_ptr.is_null() || !crate::rtti::sane(es_ptr) {
+                log("[equiprawv5] es_ptr inválido — abortando");
+                return;
+            }
+            let req_ptr = crate::rtti::new_object(reg, "gameEquipRequest");
+            log(&format!("[equiprawv5] req_ptr={req_ptr:p}"));
+            if req_ptr.is_null() || !crate::rtti::sane(req_ptr) {
+                log("[equiprawv5] req_ptr inválido — abortando");
+                return;
+            }
+            crate::rtti::make_handle((req_ptr as *mut u8).add(0x08) as *mut c_void, req_ptr);
+            let cls = reg.class_by_name("gameEquipRequest");
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "itemID") {
+                if let Some(item16) = crate::rtti::from_tdbid(reg, "Items.Fixer_01_Set_TShirt") {
+                    std::ptr::copy_nonoverlapping(item16.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+                }
+            }
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "owner") {
+                let mut owner_pair = [0u8; 16];
+                crate::rtti::make_handle(owner_pair.as_mut_ptr() as *mut c_void, player);
+                std::ptr::copy_nonoverlapping(owner_pair.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+            }
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "addToInventory") {
+                *(req_ptr as *mut u8).add(voff as usize) = 1u8;
+            }
+            if let Some((voff, _, _)) = crate::rtti::resolve_prop_in_class(cls, "slotIndex") {
+                ((req_ptr as *mut u8).add(voff as usize) as *mut i32).write_unaligned(-1);
+            }
+            (req_ptr as *mut u8).add(0x40).cast::<*mut c_void>().write_unaligned(es_ptr);
+            log("[equiprawv5] req montado (mesmo setup do v4) — construindo CScriptStackFrame de verdade...");
+
+            // FIX DECISIVO #4 (2026-08-03, achado por RE dedicada + sonda ao vivo `qrprobeon`):
+            // `0x103b1f624` (QueueRequest) NÃO recebe `req` cru como 2º argumento — ele lê
+            // `x1[0]` (frame->code) como CURSOR DE OPCODE da VM redscript, indexando a MESMA
+            // OPCODE_TABLE (0x10908b798) que `rtti::call_func` já usa pra ler argumentos. Os
+            // crashes anteriores (0x6b/0x2b/0xEB, variando por boot) eram sempre bytes CRUS do
+            // vtable/heap de `req` reinterpretados como opcode — nunca foi um campo faltando em
+            // `req`, é o TIPO ERRADO de 2º argumento. `rtti::call_func` normal não serve aqui:
+            // ela despacha via `ADDR_EXEC`, que SEMPRE resolve a função via `GetInvokable()`
+            // antes de rodar — e `GetInvokable()` é um stub que retorna null incondicional pra
+            // QueueRequest (RE-esgotado, ver HISTORICO cont.14/16 desta mesma madrugada). Fix:
+            // construir o frame NÓS MESMOS (mesma receita exata de `call_func`: LocalVar+ParamEnd,
+            // CProperty sintética via GetType("handle:IScriptable"), Handle no local) e chamar
+            // `0x103b1f624` DIRETO com esse frame como x1 — bypassa ADDR_EXEC/GetInvokable por
+            // completo, mas dá a QueueRequest o formato de argumento que ela realmente espera.
+            let itype = crate::register::get_type(reg, "handle:IScriptable");
+            if itype.is_null() {
+                log("[equiprawv5] GetType(handle:IScriptable) falhou — abortando");
+                return;
+            }
+            let mut cprop = vec![0u8; 0x30];
+            (cprop.as_mut_ptr() as *mut u64).write_unaligned(itype as u64); // CProperty+0 = IType*
+
+            let mut locals = vec![0u8; 0x40 + 0x20]; // n=1 arg, mesma fórmula de call_func
+            let dst = locals.as_mut_ptr().add(0x20);
+            (dst as *mut *mut c_void).write_unaligned(req_ptr);
+            (dst.add(8) as *mut *mut c_void).write_unaligned(crate::console::refcnt());
+
+            let mut bc = vec![0u8; 16 + 1 * 9]; // mesma fórmula de call_func (n=1)
+            bc[0] = 0x18; // LocalVar
+            (bc.as_mut_ptr().add(1) as *mut *mut c_void).write_unaligned(cprop.as_mut_ptr() as *mut c_void);
+            bc[9] = 0x26; // ParamEnd
+
+            let mut fr = vec![0u8; 0x90];
+            (fr.as_mut_ptr() as *mut *mut c_void).write_unaligned(bc.as_mut_ptr() as *mut c_void);
+            (fr.as_mut_ptr().add(0x10) as *mut *mut c_void).write_unaligned(locals.as_mut_ptr() as *mut c_void);
+            (fr.as_mut_ptr().add(0x18) as *mut *mut c_void).write_unaligned(locals.as_mut_ptr() as *mut c_void);
+            (fr.as_mut_ptr().add(0x40) as *mut *mut c_void).write_unaligned(es_ptr);
+
+            log(&format!(
+                "[equiprawv5] frame montado (fr={:p} bc={:p} locals={:p} cprop={:p} itype={:p}) — chamando 0x103b1f624(es_ptr, &frame)...",
+                fr.as_ptr(), bc.as_ptr(), locals.as_ptr(), cprop.as_ptr(), itype
+            ));
+            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
+            tf(es_ptr, fr.as_mut_ptr() as *mut c_void);
+            log("[equiprawv5] transmute retornou — ZERO CRASH, via completa (frame real)!");
+        }
+        return;
+    }
+    if cmd == "equiprawv6" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv6] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log("[equiprawv6] PlayerPuppet.GetGame falhou"); return; }
+            };
+            let es_fn = register::get_function(reg, "BwmsPrepEquipSys");
+            if !crate::rtti::sane(es_fn) {
+                log("[equiprawv6] BwmsPrepEquipSys não resolveu");
+                return;
+            }
+            let es_rf = crate::rtti::ResolvedFn { func: es_fn, ret_type: crate::rtti::ret_type_of(es_fn), is_static: true };
+            let es_ret = crate::rtti::call_func(&es_rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            let es_ptr = es_ret.map(|r| u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]) as *mut c_void).unwrap_or(std::ptr::null_mut());
+            log(&format!("[equiprawv6] es_ptr={es_ptr:p}"));
+            if es_ptr.is_null() || !crate::rtti::sane(es_ptr) {
+                log("[equiprawv6] es_ptr inválido — abortando");
+                return;
+            }
+            let req_ptr = crate::rtti::new_object(reg, "gameEquipRequest");
+            log(&format!("[equiprawv6] req_ptr={req_ptr:p}"));
+            if req_ptr.is_null() || !crate::rtti::sane(req_ptr) {
+                log("[equiprawv6] req_ptr inválido — abortando");
+                return;
+            }
+            crate::rtti::make_handle((req_ptr as *mut u8).add(0x08) as *mut c_void, req_ptr);
+            let cls = reg.class_by_name("gameEquipRequest");
+            if let Some((voff, _, in_holder)) = crate::rtti::resolve_prop_in_class(cls, "itemID") {
+                log(&format!("[equiprawv6-diag] itemID voff={voff:#x} in_holder={in_holder}"));
+                if let Some(item16) = crate::rtti::from_tdbid(reg, "Items.Fixer_01_Set_TShirt") {
+                    std::ptr::copy_nonoverlapping(item16.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+                }
+            }
+            if let Some((voff, _, in_holder)) = crate::rtti::resolve_prop_in_class(cls, "owner") {
+                log(&format!("[equiprawv6-diag] owner voff={voff:#x} in_holder={in_holder}"));
+                let mut owner_pair = [0u8; 16];
+                crate::rtti::make_handle(owner_pair.as_mut_ptr() as *mut c_void, player);
+                std::ptr::copy_nonoverlapping(owner_pair.as_ptr(), (req_ptr as *mut u8).add(voff as usize), 16);
+            }
+            if let Some((voff, _, in_holder)) = crate::rtti::resolve_prop_in_class(cls, "addToInventory") {
+                log(&format!("[equiprawv6-diag] addToInventory voff={voff:#x} in_holder={in_holder}"));
+                *(req_ptr as *mut u8).add(voff as usize) = 1u8;
+            }
+            if let Some((voff, _, in_holder)) = crate::rtti::resolve_prop_in_class(cls, "slotIndex") {
+                log(&format!("[equiprawv6-diag] slotIndex voff={voff:#x} in_holder={in_holder}"));
+                ((req_ptr as *mut u8).add(voff as usize) as *mut i32).write_unaligned(-1);
+            }
+            (req_ptr as *mut u8).add(0x40).cast::<*mut c_void>().write_unaligned(es_ptr);
+            // DIAGNÓSTICO: dump dos 0x50 primeiros bytes de req_ptr logo antes da chamada, pra
+            // conferir visualmente se os campos foram escritos no lugar certo (comparado ao layout
+            // do header: vtable@0, ISerializable::ref@0x08, unk18@0x18, unk28@0x28(4B), nativeType
+            // @0x30, valueHolder@0x38, unk40(es_ptr)@0x40).
+            let dump: &[u8] = std::slice::from_raw_parts(req_ptr as *const u8, 0x80);
+            log(&format!("[equiprawv6-diag] req bytes[0..0x80]={:02x?}", dump));
+            log("[equiprawv6] req montado (mesmo setup do v4/v5) — fix cirúrgico de GetInvokable...");
+
+            // FIX DECISIVO #5 (2026-08-03): equiprawv5 provou que chamar `0x103b1f624` DIRETO com
+            // um frame à mão roda sem crash mas NÃO faz nada (nosso bytecode sintético só declara
+            // 1 arg via LocalVar+ParamEnd — não há instrução real de corpo depois disso, então o
+            // executor retorna sem invocar a lógica nativa de enfileiramento). A via CERTA é deixar
+            // o `ADDR_EXEC` de sempre (o mesmo que todo `rtti::call_func` já usa com sucesso pra
+            // dezenas de outras nativas) fazer TUDO — arg-parsing E dispatch pro código nativo real
+            // — mas ele SÓ despacha depois de chamar `this->GetInvokable()`, que é um stub que
+            // SEMPRE retorna null pra QueueRequest (RE já feita, `0x100339b2c`, cont.14 desta
+            // madrugada — causa-raiz original do crash antes de qualquer workaround). Fix: hookar
+            // `GetInvokable()` cirurgicamente (só pro descritor exato de QueueRequest, zero
+            // regressão nos outros usos) pra devolver `0x103b1f624` em vez de null, e então usar
+            // `rtti::call_func` NORMAL (a via já provada, não mais um transmute cru nosso).
+            let rf_qr = match crate::rtti::resolve_func(reg, "EquipmentSystem", "QueueRequest") {
+                Some(rf) => rf,
+                None => { log("[equiprawv6] resolve_func(EquipmentSystem, QueueRequest) falhou"); return; }
+            };
+            log(&format!("[equiprawv6] rf_qr.func={:p} — instalando fix de GetInvokable...", rf_qr.func));
+            if !crate::selftest::install_getinvokable_fix(rf_qr.func, 0x1_03b1_f624u64) {
+                log("[equiprawv6] install_getinvokable_fix falhou — abortando");
+                return;
+            }
+            log("[equiprawv6] fix instalado — chamando via rtti::call_func NORMAL (ADDR_EXEC)...");
+            let ret = crate::rtti::call_func(&rf_qr, es_ptr, &[crate::rtti::Arg::Handle(req_ptr, crate::console::refcnt())]);
+            log(&format!("[equiprawv6] call_func retornou={:?} — ZERO CRASH, via ADDR_EXEC completa!", ret.is_some()));
+        }
+        return;
+    }
+    if cmd == "equiprawv2" {
+        unsafe {
+            if player.is_null() {
+                log("[equiprawv2] player null");
+                return;
+            }
+            let gi: Option<[u8; 16]> = crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame").and_then(|gg| {
+                crate::rtti::call_func(&gg, player, &[]).map(|b| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&b[..16]);
+                    o
+                })
+            });
+            let gi = match gi {
+                Some(gi) => gi,
+                None => { log("[equiprawv2] PlayerPuppet.GetGame falhou"); return; }
+            };
+            let es_fn = register::get_function(reg, "BwmsPrepEquipSys");
+            let req_fn = register::get_function(reg, "BwmsPrepEquipReq");
+            if !crate::rtti::sane(es_fn) || !crate::rtti::sane(req_fn) {
+                log("[equiprawv2] BwmsPrepEquipSys/Req não resolveram (mod compilado?)");
+                return;
+            }
+            // FIX 2026-08-03 (achado ao vivo, 3 crashes): ret_type NÃO pode ser hardcoded null pra
+            // funções que retornam ref<T> (só é correto pra Void) — ADDR_EXEC usa esse valor
+            // DIRETO, um ret_type errado corrompe o processamento da chamada inteira, não só o
+            // retorno. Ver rtti::ret_type_of.
+            let es_rf = crate::rtti::ResolvedFn { func: es_fn, ret_type: crate::rtti::ret_type_of(es_fn), is_static: true };
+            let req_rf = crate::rtti::ResolvedFn { func: req_fn, ret_type: crate::rtti::ret_type_of(req_fn), is_static: true };
+            log("[equiprawv2] pré: chamando es_rf (1ª call_func desta invocação)...");
+            let es_ret = crate::rtti::call_func(&es_rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            log(&format!("[equiprawv2] es_ret={:?} — chamando req_rf agora (2ª call_func)...", es_ret.is_some()));
+            let req_ret = crate::rtti::call_func(&req_rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]);
+            log(&format!("[equiprawv2] req_ret={:?}", req_ret.is_some()));
+            let es_ptr = es_ret.map(|r| u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]) as *mut c_void).unwrap_or(std::ptr::null_mut());
+            let req_ptr = req_ret.map(|r| u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]) as *mut c_void).unwrap_or(std::ptr::null_mut());
+            log(&format!("[equiprawv2] es_ptr={es_ptr:p} req_ptr={req_ptr:p} — 2 chamadas top-level, zero native aninhado"));
+            if es_ptr.is_null() || req_ptr.is_null() || !crate::rtti::sane(es_ptr) || !crate::rtti::sane(req_ptr) {
+                log("[equiprawv2] es_ptr/req_ptr inválido — abortando antes do transmute");
+                return;
+            }
+            log("[equiprawv2] chamando 0x103b1f624 direto via transmute, DIRETO de run_cmd (zero aninhamento)");
+            let f: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
+            f(es_ptr, req_ptr);
+            log("[equiprawv2] transmute retornou — zero crash até aqui!");
+        }
+        return;
+    }
     if cmd == "onshutdowntest" {
         unsafe {
             if player.is_null() {
@@ -2553,6 +5815,32 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
     // registry pós-async. Ver `selftest::dump_factory_index`.
     if cmd == "factdump" {
         unsafe { crate::selftest::dump_factory_index() };
+        return;
+    }
+    if let Some(rest) = cmd.strip_prefix("factlookup") {
+        let name = rest.trim();
+        let name = if name.is_empty() { "bwms_test_weapon" } else { name };
+        unsafe { crate::selftest::factlookup_test(name) };
+        return;
+    }
+    if cmd == "factread" {
+        unsafe { crate::selftest::factread() };
+        return;
+    }
+    if cmd == "factread2" {
+        unsafe { crate::selftest::factread2() };
+        return;
+    }
+    if cmd == "factread3" {
+        unsafe { crate::selftest::factread3() };
+        return;
+    }
+    if cmd == "postload-probe" {
+        unsafe { crate::selftest::postload_probe(&reg) };
+        return;
+    }
+    if cmd == "factinject" {
+        unsafe { crate::selftest::factinject() };
         return;
     }
     if cmd == "cethooksproof" {
@@ -2626,6 +5914,7 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // READ-ONLY: `redscript-cheat-effects-proof` — checa HasGodMode sem mutar (ver console::hasgod).
         ["hasgod"] => return log(&format!("[hasgod] {:?}", unsafe { console::hasgod(reg, player) })),
         ["heal"] => return act("curado", unsafe { console::heal(reg, player) }),
+        ["staminacheck"] => return act("lido (ver log)", unsafe { console::staminacheck(reg, player) }),
         ["summon"] | ["car"] => return act("enviado", unsafe { console::summon(reg, player) }),
         // Codeware/registro nativo (rodar no jogo p/ destravar a fundação):
         // cwprobe = despeja o layout de uma função nativa real → acha o offset do
@@ -2656,6 +5945,122 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // + campos candidatos. Crava o layout + ajuda a achar o slot de RESOLVE (era gated → agora live).
         ["vt50drain"] => {
             crate::selftest::drain_vt50_ring();
+            return;
+        }
+        // Codeware `#120` — captura DINÂMICA de LR em `Red::InkSystem::Get()` (2026-08-14).
+        // `inkgethook` instala o probe observe-only (gate `~/.bwms-hook-inkget-lr`); rode
+        // `inkgetbaseline` em idle (~10-15s após o hook), depois `presskey <kc>` 3-5x, depois
+        // `inkgetpost` — loga os call-sites que só aparecem depois do keypress.
+        //
+        // TIMING (fix desta sessão, mesma lição corrigida do `checkreshook`/`#198`/`#199`
+        // acima): mande `inkgethook` IMEDIATAMENTE ao confirmar GAMEPLAY, durante a própria
+        // rajada de smoke-tests do `OnGameAttached` (enquanto o executor ainda dispara) — a 5ª
+        // tentativa desta linha confirmou `inkgethook`/`inkgetbaseline` funcionando quando
+        // enviados assim, mas `presskey`+`inkgetpost` (mandados ~20-27s depois) nunca foram
+        // processados: o executor já tinha parado de disparar (mesmo mecanismo do
+        // `checkresbaseline`/`checkrespost`, canal MORTO fora da rajada mesmo com
+        // `PHASE_REACHED_5=true`). `inkgetbaseline`/`inkgetpost` são 100% thread-safe (só
+        // drenam `INKGET_RING`/`AtomicU64` + comparam contra `INKGET_BASELINE`/`Mutex<BTreeSet>`
+        // + logam — ZERO chamada de VM/RTTI/callf, ZERO instalação de hook) — MOVIDAS pra
+        // também rodar pela THREAD DO HEARTBEAT (sempre viva, independente do executor — ver
+        // `lib.rs` ~526, bloco `["inkgetbaseline"]`/`["inkgetpost"]` no loop pós-boot). Ficam
+        // AQUI TAMBÉM (fallback: se o executor ainda estiver ativo quando o comando chegar,
+        // processa por aqui primeiro — resultado idêntico, ambos chamam a mesma função pura).
+        // `inkgethook` (este braço) continua existindo como comando MANUAL do canal do executor
+        // (útil pra reinstalar sob demanda/depurar), mas desde `cw-inkget-autoretry` (2026-08-16,
+        // `on_load`, thread dedicada logo após a thread de heartbeat) NÃO é mais o único jeito de
+        // instalar o probe: o dylib agora tenta sozinho, repetidamente (750ms, gate
+        // `~/.bwms-hook-inkget-lr`), independente do executor estar vivo ou não — resolve
+        // exatamente a fragilidade de timing descrita no parágrafo acima (janela do executor
+        // curta e imprevisível). Este braço manual fica como fallback/atalho, nunca conflita com
+        // o retry automático (mesma trava `INKGET_INSTALLED`, idempotente dos dois lados).
+        //
+        // `presskey`/`focusgame` (ver mais abaixo, ~7600+) DELIBERADAMENTE NÃO migram pro canal
+        // do heartbeat: ao contrário de inkgetbaseline/inkgetpost (leitura pura), `presskey`
+        // INJETA um evento de input REAL (CGEvent keyDown/keyUp) que tem efeito genuíno no jogo
+        // vivo — categoria de risco diferente (mutação, não leitura). Rodar via heartbeat
+        // tiraria a garantia do gate `PHASE_REACHED_5 && !exec_nested()` (o jogo poderia não
+        // estar pronto pra receber input ainda) e chamaria `NSApplication.
+        // activateIgnoringOtherApps:`/`CGEventPost` de uma thread Rust própria que nunca foi
+        // confirmada como sendo a main-thread do processo (AppKit não garante thread-safety fora
+        // dela) — risco novo, nunca testado, mesmo padrão de cautela do `checkreshook`.
+        //
+        // LIÇÃO DE TESTE (2026-08-14, achado ao testar esta migração ao vivo): o canal do
+        // heartbeat (`lib.rs` ~490) lê o arquivo INTEIRO e faz `split_whitespace()` sobre o
+        // CONTEÚDO TODO como se fosse UM comando só (`parts.as_slice()` == token array) — ao
+        // contrário do canal do executor (`lib.rs` ~1494), que faz `content.lines()` e despacha
+        // CADA linha separada via `run_cmd`. Um arquivo com múltiplos comandos por linha (ex.
+        // `focusgame\ninkgethook\ninkgetbaseline\n`) NUNCA bate em nenhum braço de match do
+        // heartbeat (vira um array de 3 tokens, não `["focusgame"]`) — fica só esperando o
+        // executor (que pode já estar morto). **Pra confiar no canal do heartbeat, sempre
+        // escrever/enviar UM comando por vez** (uma escrita = um comando, sem `\n` interno) —
+        // nunca bater múltiplos comandos na mesma escrita achando que "funciona igual ao canal
+        // do executor". Boot de verificação desta migração confirmou o `inkgetpost` sendo
+        // processado com sucesso via heartbeat (`[hb-canal] inkgetpost...` no log) quando enviado
+        // sozinho, mas um lote de 3 comandos (`focusgame`+`inkgethook`+`inkgetbaseline`) mandado
+        // junto se perdeu sem nenhum dos dois canais processá-lo.
+        ["inkgethook"] => {
+            unsafe { crate::selftest::install_inkget_probe() };
+            return;
+        }
+        ["inkgetbaseline"] => {
+            crate::selftest::inkget_baseline();
+            return;
+        }
+        ["inkgetpost"] => {
+            crate::selftest::inkget_post();
+            return;
+        }
+        // Codeware `#120` candidato `0x104a13088` (2026-08-17, achado por LR-tracing em `Get()` +
+        // disassembly offline — ver `HISTORICO.md`/`CATALOGO-EXAUSTIVO-CODEWARE.md` item `#120`).
+        // `ink120hook` instala sob demanda (independente do gate de boot `~/.bwms-hook-
+        // ink120cand`); `ink120dump` lê o ring (x0/x1/x2/x3 por chamada); `ink120reset` zera pra
+        // uma janela nova. Mesmo idioma do trio `inkgethook`/`inkgetbaseline`/`inkgetpost` acima.
+        ["ink120hook"] => {
+            unsafe { crate::selftest::install_ink120cand_probe() };
+            return;
+        }
+        ["ink120dump"] => {
+            crate::selftest::ink120cand_dump();
+            return;
+        }
+        ["ink120reset"] => {
+            crate::selftest::ink120cand_reset();
+            return;
+        }
+        // Codeware `#198`/`#199` (`ResourceLoader::LoadAsync`/`LoadResource`) — captura DINÂMICA
+        // de LR em `ResourceDepot::CheckResource` (2026-08-14, ancoragem alternativa ao
+        // `InkSystem::Get()` do `#120`). `checkreshook` instala o probe observe-only (gate
+        // `~/.bwms-hook-checkres-lr`); `CheckResource` dispara sozinho durante loading real —
+        // não precisa de `presskey`. NUNCA rodar junto de `copytest` (mesmo endereço, hooks
+        // conflitam).
+        //
+        // TIMING (CORRIGIDO 2026-08-14, 2ª rodada — invalida a lição da 1ª rodada, que dizia
+        // "espere uma janela de silêncio pós-gameplay antes de mandar"): esse conselho estava
+        // ERRADO. Achado ao vivo: o canal deste bloco só drena dentro de `cp77_tick()`, chamado
+        // só como efeito colateral de `exec_replacement` (o hook do executor de script) disparar.
+        // O executor PARA de disparar assim que a rajada inicial de smoke-tests do
+        // `OnGameAttached` termina e o jogo fica "quieto" — nesse ponto o canal fica MORTO pro
+        // resto do boot (`checkreshook` ficou intocado em `/tmp/cp77-cmd.txt` por 35s+ até o
+        // fim do boot, mesmo com `PHASE_REACHED_5=true`). A janela de "silêncio" NÃO é o momento
+        // certo pra mandar — é exatamente quando o canal para de ser servido. **Mande
+        // `checkreshook` IMEDIATAMENTE ao confirmar GAMEPLAY (durante a própria rajada, enquanto
+        // o executor ainda está disparando), sem ficar esperando quietude.** `checkresbaseline`/
+        // `checkrespost` já foram movidos pra rodar também pela THREAD DO HEARTBEAT (sempre viva,
+        // independente do executor — ver `lib.rs` ~495, bloco `["checkresbaseline"]`/
+        // `["checkrespost"]` no loop pós-boot) — só `checkreshook` continua exigindo o executor
+        // ativo (instala um `Interceptor::replace`, escreve código; mover isso pra outra thread é
+        // categoria de risco não testada).
+        ["checkreshook"] => {
+            unsafe { crate::selftest::install_checkres_probe() };
+            return;
+        }
+        ["checkresbaseline"] => {
+            crate::selftest::checkres_baseline();
+            return;
+        }
+        ["checkrespost"] => {
+            crate::selftest::checkres_post();
             return;
         }
         ["sweepdrain"] => {
@@ -2772,6 +6177,368 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // peekq <vmaddr-hex> [count] — lê N u64 num vmaddr ESTÁTICO (rebase p/ runtime), read-only.
         // Primitiva de RE: resolver ptr de handler global ([0x1090de530]), func-field de descritor de
         // native, etc. NÃO chama nada (sem crash). count clampado 1..32.
+        // RED4ext #475 (`CGameEngine::Get()`): a vtable REAL de `CGameEngine` foi identificada
+        // com alta confiança offline (`0x10728d218`, cross-validada por `dyld_info -fixups` contra
+        // o símbolo mangled `GetNativeTypeHash<CGameEngine>`) — mas o STORAGE do singleton nunca
+        // foi achado (2 rodadas de RE offline esgotadas, ver `RED4EXT-461-VIA-CARA-PLANO.md`-style
+        // achados no catálogo). Técnica NOVA (não tentada ainda): outros singletons do motor
+        // (`ResourceGameDepot`@[0x109003000+0x1f8], `JournalManager`@0x10900b580) vivem NUM
+        // CLUSTER DE PÁGINAS BSS conhecido (~0x109000000-0x109020000) — varre esse range procurando
+        // um qword cujo PRÓPRIO deref bate com a vtable confirmada de `CGameEngine` (candidato a
+        // singleton: `[slot]` = ponteiro pro objeto, `*[slot]` = vtable). 100% leitura, zero escrita,
+        // zero risco novo — mesma primitiva `gum::is_readable` já usada em toda parte do projeto.
+        // v2 (2026-08-11, mesma sessão): a 1ª versão (range fixo 128KB, `is_readable` por qword)
+        // rodou limpo (zero crash) mas deu zero candidatos — precisa varrer mais memória, MAS sem
+        // 1 syscall (`mach_vm_read_overwrite`) por qword (custo proibitivo em MB). Fix: lê em
+        // BLOCOS de 64KB (`gum::read_chunk`, sem o cap de 512B do `is_readable`) — reduz de
+        // milhões pra centenas de syscalls — e só faz o segundo `is_readable` (deref do
+        // candidato) pra qwords que PARECEM ponteiro (não-zero, 8-alinhado, acima de 0x10000) —
+        // ainda assim capado num teto absoluto de checagens pra nunca travar um frame.
+        // RED4ext `#406`/`#408`/`#409` — caça o singleton do `ResourceLoader` pela assinatura
+        // estrutural achada por string-xref em 2026-08-21 (ver `DATABASE.md`, seção ResourceLoader).
+        // Read-only: só `mach_vm_read_overwrite`, zero escrita, zero hook.
+        // Anda o mapa de tokens de um candidato achado pelo `findresloader`. Offset do mapa é
+        // argumento porque a RE deixou 2 hipóteses em aberto (`+0x00` pelo SDK, `+0x20` pela página
+        // de debug) — o dado decide qual.
+        ["restokens", ptr, off, n] => {
+            unsafe {
+                if let (Ok(p), Ok(o), Ok(m)) = (
+                    u64::from_str_radix(ptr.trim_start_matches("0x"), 16),
+                    usize::from_str_radix(off.trim_start_matches("0x"), 16),
+                    n.parse::<usize>(),
+                ) {
+                    crate::register::dump_res_loader_tokens(p, o, m);
+                } else {
+                    log("[restokens] uso: restokens <0xobj> <0xoffset-do-mapa> <max>");
+                }
+            }
+            return;
+        }
+        // Busca DIRIGIDA: procura o ponteiro do loader dentro de um objeto conhecido (o scan de
+        // globais foi eliminado por evidência; `#483` mostra que structs de recurso carregam
+        // `ResourceLoader*` como CAMPO).
+        ["loaderfrom", ptr] | ["loaderfrom", ptr, ..] => {
+            unsafe {
+                if let Ok(p) = u64::from_str_radix(ptr.trim_start_matches("0x"), 16) {
+                    crate::register::find_loader_from(p, 0x400);
+                } else {
+                    log("[loaderfrom] uso: loaderfrom <0xobj>");
+                }
+            }
+            return;
+        }
+        ["findresloader", rest @ ..] => {
+            unsafe {
+                let start = rest
+                    .first()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0x1_06e0_0000);
+                let mb = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(16);
+                let min_size = rest.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(64);
+                crate::register::find_res_loader(start, mb, min_size);
+            }
+            return;
+        }
+        ["findcgameengine", rest @ ..] => {
+            unsafe {
+                let target_vtbl = crate::rebase(0x10728d218) as u64;
+                if !crate::gum::is_readable(target_vtbl as *const c_void, 8) {
+                    log(&format!("[findcgameengine] vtable alvo {target_vtbl:#x} ILEGÍVEL — rebase pode estar errado, abortando"));
+                    return;
+                }
+                let start_static: u64 = rest
+                    .first()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0x1_0800_0000);
+                let size_mb: u64 = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(8).clamp(1, 64);
+                let scan_start = crate::rebase(start_static) as usize;
+                let scan_len = (size_mb * 1024 * 1024) as usize;
+                let scan_end = scan_start + scan_len;
+                log(&format!(
+                    "[findcgameengine] v2 vtable alvo (rebased) = {target_vtbl:#x}; varrendo {scan_start:#x}..{scan_end:#x} ({size_mb}MB, chunked+heurístico)"
+                ));
+                const CHUNK: usize = 65536;
+                const MAX_DEREF_CHECKS: u32 = 20000; // teto absoluto, nunca trava um frame
+                let mut buf = vec![0u8; CHUNK];
+                let mut found = 0u32;
+                let mut readable_chunks = 0u32;
+                let mut total_chunks = 0u32;
+                let mut deref_checks = 0u32;
+                let mut p = scan_start;
+                'outer: while p < scan_end {
+                    let this_len = CHUNK.min(scan_end - p);
+                    total_chunks += 1;
+                    if crate::gum::read_chunk(p, &mut buf[..this_len]) {
+                        readable_chunks += 1;
+                        let mut i = 0usize;
+                        while i + 8 <= this_len {
+                            let candidate = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+                            if candidate > 0x10000 && candidate % 8 == 0 {
+                                if deref_checks >= MAX_DEREF_CHECKS {
+                                    log(&format!("[findcgameengine] teto de {MAX_DEREF_CHECKS} derefs atingido em {:#x} — parando cedo", p + i));
+                                    break 'outer;
+                                }
+                                deref_checks += 1;
+                                if crate::gum::is_readable(candidate as *const c_void, 8) {
+                                    let vtbl = (candidate as *const u64).read_unaligned();
+                                    if vtbl == target_vtbl {
+                                        found += 1;
+                                        log(&format!(
+                                            "[findcgameengine] CANDIDATO ACHADO: slot={:#x} -> CGameEngine*={candidate:#x} vtbl={vtbl:#x}",
+                                            p + i
+                                        ));
+                                        // Validação cruzada v2 (offset exato +0x308/+0x10 já REFUTADO numa
+                                        // rodada anterior — `systemMap.size` deu 115 milhões, implausível).
+                                        // Em vez de confiar num offset único, varre os PRÓPRIOS campos do
+                                        // candidato (`0x00..0x350`, tamanho documentado de `CGameEngine`) por
+                                        // QUALQUER ponteiro plausível ("framework candidato"), e pra cada um,
+                                        // varre os primeiros campos DELE por outro ponteiro plausível
+                                        // ("gameInstance candidato") cujo próprio +0x10 pareça o `size` do
+                                        // `systemMap` (HashMap já confirmado pelo #472, size fica no offset
+                                        // +0x08 dentro do HashMap, que começa em GameInstance+0x08 → +0x10
+                                        // total) — plausível = inteiro pequeno (1..5000), não lixo/zero.
+                                        let mut cand_off = 0usize;
+                                        while cand_off < 0x350 {
+                                            let f_addr = candidate + cand_off as u64;
+                                            if crate::gum::is_readable(f_addr as *const c_void, 8) {
+                                                let f_val = (f_addr as *const u64).read_unaligned();
+                                                if f_val > 0x1000 && f_val % 8 == 0 && crate::gum::is_readable(f_val as *const c_void, 0x40) {
+                                                    let mut sub_off = 0usize;
+                                                    while sub_off < 0x40 {
+                                                        let g_addr = f_val + sub_off as u64;
+                                                        let g_val = (g_addr as *const u64).read_unaligned();
+                                                        if g_val > 0x1000 && g_val % 8 == 0 && crate::gum::is_readable(g_val as *const c_void, 8) {
+                                                            let sm_addr = g_val + 0x10;
+                                                            if crate::gum::is_readable(sm_addr as *const c_void, 4) {
+                                                                let sm_size = (sm_addr as *const u32).read_unaligned();
+                                                                if sm_size >= 1 && sm_size <= 5000 {
+                                                                    log(&format!(
+                                                                        "[findcgameengine] validação v2: candidato+{cand_off:#x}={f_val:#x} (framework?) -> +{sub_off:#x}={g_val:#x} (gameInstance?) -> systemMap.size@+0x10={sm_size} PLAUSÍVEL"
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        sub_off += 8;
+                                                    }
+                                                }
+                                            }
+                                            cand_off += 8;
+                                        }
+                                        log("[findcgameengine] validação v2 completa (varredura de campos do candidato)");
+                                    }
+                                }
+                            }
+                            i += 8;
+                        }
+                    }
+                    p += this_len;
+                }
+                log(&format!(
+                    "[findcgameengine] fim: {total_chunks} chunks ({readable_chunks} legíveis), {deref_checks} derefs testados, {found} candidato(s)"
+                ));
+            }
+            return;
+        }
+        // `findinksystembss` (2026-08-14, RED4ext #409/Codeware #100/#120) — varredura DIRETA
+        // e LIMITADA (read-only) de uma região de memória procurando qualquer qword cujo deref
+        // bate a "forma" estrutural de `Red::InkSystem` (ver `inksystem_shape_matches`).
+        // Diferente do `findcgameengine` (vtable-match contra vtable JÁ CONHECIDA), aqui NÃO HÁ
+        // vtable conhecida — `InkSystem::Instance` é `Core::RawPtr` (ponteiro GLOBAL cru, mesma
+        // categoria de `ResourceGameDepot`/`JournalManager`), então o filtro é MULTI-CAMPO em vez
+        // de vtable única. Região default = o mesmo cluster BSS já usado pra outros singletons
+        // (`ResourceGameDepot`@[0x109003000+0x1f8]/`JournalManager`@0x10900b580), size default 4MB
+        // (teto de segurança: clamp 1..16MB, nunca "o processo inteiro").
+        ["findinksystembss", rest @ ..] => {
+            unsafe {
+                let start_static: u64 = rest
+                    .first()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0x1_0900_0000);
+                let size_mb: u64 = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(4).clamp(1, 16);
+                let scan_start = crate::rebase(start_static) as usize;
+                let scan_len = (size_mb * 1024 * 1024) as usize;
+                let scan_end = scan_start + scan_len;
+                log(&format!(
+                    "[findinksystembss] varrendo {scan_start:#x}..{scan_end:#x} ({size_mb}MB) por forma-InkSystem (sem vtable conhecida, filtro multi-campo)"
+                ));
+                const CHUNK: usize = 65536;
+                const MAX_SHAPE_CHECKS: u32 = 20000; // teto absoluto, nunca trava um frame
+                let mut buf = vec![0u8; CHUNK];
+                let mut found = 0u32;
+                let mut readable_chunks = 0u32;
+                let mut total_chunks = 0u32;
+                let mut shape_checks = 0u32;
+                let mut p = scan_start;
+                'outer: while p < scan_end {
+                    let this_len = CHUNK.min(scan_end - p);
+                    total_chunks += 1;
+                    if crate::gum::read_chunk(p, &mut buf[..this_len]) {
+                        readable_chunks += 1;
+                        let mut i = 0usize;
+                        while i + 8 <= this_len {
+                            let candidate = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+                            if candidate > 0x10000 && candidate % 8 == 0 {
+                                if shape_checks >= MAX_SHAPE_CHECKS {
+                                    log(&format!("[findinksystembss] teto de {MAX_SHAPE_CHECKS} checagens atingido em {:#x} — parando cedo", p + i));
+                                    break 'outer;
+                                }
+                                shape_checks += 1;
+                                if let Some((kb, cap, size)) = inksystem_shape_matches(candidate) {
+                                    found += 1;
+                                    log(&format!(
+                                        "[findinksystembss] CANDIDATO: slot={:#x} -> InkSystem*={candidate:#x} keyboardState={kb:#06x} layerManagers.cap={cap} .size={size}",
+                                        p + i
+                                    ));
+                                }
+                            }
+                            i += 8;
+                        }
+                    }
+                    p += this_len;
+                }
+                log(&format!(
+                    "[findinksystembss] fim: {total_chunks} chunks ({readable_chunks} legíveis), {shape_checks} formas testadas, {found} candidato(s)"
+                ));
+            }
+            return;
+        }
+        // `walkinksystem <root_hex_runtime> [maxdepth] [maxvisit]` (2026-08-14) — 2º mecanismo,
+        // INDEPENDENTE do scan de BSS acima: ANCORADO num ponteiro runtime JÁ CONHECIDO/vivo
+        // (ex.: o `CGameEngine*` que `findcgameengine` já confirma achar, colado do log dele —
+        // InkSystem é dono de subsistema de UI/render, plausivelmente alcançável por poucos
+        // saltos de ponteiro a partir do engine). BFS bounded: lê os campos [0..span) de cada
+        // objeto visitado, testa CADA qword pointer-shaped contra `inksystem_shape_matches`;
+        // qwords que passam o pré-filtro (mas não a forma) viram nós do próximo nível, até
+        // `maxdepth`. Teto de visitas total (`maxvisit`, default 4000) — nunca varredura
+        // ilimitada. 100% leitura.
+        ["walkinksystem", root, rest @ ..] => {
+            let root_va = u64::from_str_radix(root.trim_start_matches("0x"), 16).unwrap_or(0);
+            if root_va == 0 {
+                return log("[walkinksystem] uso: walkinksystem <ptr-hex-runtime> [maxdepth] [maxvisit]");
+            }
+            let maxdepth: u32 = rest.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(2).clamp(1, 3);
+            let maxvisit: u32 = rest.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(4000).clamp(1, 20000);
+            const SPAN: usize = 0x400; // bytes por objeto visitado (cobre InkSystem+folga, CGameEngine 0x350)
+            unsafe {
+                log(&format!(
+                    "[walkinksystem] raiz={root_va:#x} maxdepth={maxdepth} maxvisit={maxvisit} span={SPAN:#x}"
+                ));
+                let mut frontier: Vec<u64> = vec![root_va];
+                let mut visited = std::collections::HashSet::new();
+                let mut found = 0u32;
+                let mut total_visits = 0u32;
+                for depth in 0..maxdepth {
+                    let mut next_frontier: Vec<u64> = Vec::new();
+                    for &obj in &frontier {
+                        if total_visits >= maxvisit {
+                            break;
+                        }
+                        if !visited.insert(obj) {
+                            continue;
+                        }
+                        total_visits += 1;
+                        if !crate::gum::is_readable(obj as *const c_void, 8) {
+                            continue;
+                        }
+                        let mut i = 0usize;
+                        while i + 8 <= SPAN {
+                            let addr = obj + i as u64;
+                            if crate::gum::is_readable(addr as *const c_void, 8) {
+                                let candidate = (addr as *const u64).read_unaligned();
+                                if candidate > 0x10000 && candidate % 8 == 0 && candidate != obj {
+                                    if let Some((kb, cap, size)) = inksystem_shape_matches(candidate) {
+                                        found += 1;
+                                        log(&format!(
+                                            "[walkinksystem] CANDIDATO (depth={depth}): {obj:#x}+{i:#x} -> InkSystem*={candidate:#x} keyboardState={kb:#06x} layerManagers.cap={cap} .size={size}"
+                                        ));
+                                    } else if depth + 1 < maxdepth {
+                                        next_frontier.push(candidate);
+                                    }
+                                }
+                            }
+                            i += 8;
+                        }
+                    }
+                    frontier = next_frontier;
+                    if frontier.is_empty() || total_visits >= maxvisit {
+                        break;
+                    }
+                }
+                log(&format!(
+                    "[walkinksystem] fim: {total_visits} objetos visitados, {found} candidato(s)"
+                ));
+            }
+            return;
+        }
+        // `inksystemvalidate <candidato-hex-runtime>` (2026-08-14, validação cruzada do
+        // candidato achado por `walkinksystem`) — 2ª fonte INDEPENDENTE pra confirmar
+        // `Red::InkSystem::Get()` (RED4ext #409/Codeware #100/#120), mesmo padrão que fechou
+        // `CGameEngine::Get()` (2 mecanismos diferentes batendo exato não é coincidência).
+        //
+        // Mecanismo: `InkSystem::requestsHandler@0x370` é um `WeakHandle<ink::ISystemRequestsHandler>`
+        // (16B: {instance*@+0, refCount*@+8} — layout confirmado em `RED4ext.SDK/Handle.hpp`,
+        // `SharedPtrBase<T>{instance@0x00,refCount@0x08}`, MESMO layout que `WeakHandle` herda via
+        // `WeakPtrWithAccess`). `BwmsGetSystemRequestsHandler()` (global 100% redscript, já
+        // deployada desde 2026-08-10 — `codeware-casts.reds`, item #101 — `new
+        // inkMenuScenario().GetSystemRequestsHandler()`, native VANILLA real) devolve um
+        // `wref<inkISystemRequestsHandler>` — MESMO tipo de WeakHandle, MESMA representação.
+        // Se `candidato+0x370` bate byte-a-byte contra o retorno dessa chamada, feita no MESMO
+        // instante do MESMO boot, são 2 fontes independentes (leitura crua de campo vs. despacho
+        // RTTI/bytecode real através do motor) confirmando a MESMA identidade de objeto.
+        ["inksystemvalidate", candidate_hex] => {
+            let candidate = u64::from_str_radix(candidate_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            if candidate == 0 {
+                return log("[inksystemvalidate] uso: inksystemvalidate <InkSystem*-hex-runtime>");
+            }
+            unsafe {
+                // 1) a forma básica ainda bate (mesmo filtro multi-campo do walkinksystem)?
+                let shape = inksystem_shape_matches(candidate);
+                let (kb, cap, size) = match shape {
+                    Some(t) => t,
+                    None => {
+                        return log(&format!(
+                            "[inksystemvalidate] candidato {candidate:#x} NÃO bate a forma InkSystem — abortando"
+                        ));
+                    }
+                };
+                // 2) lê candidato+0x370 (WeakHandle<ink::ISystemRequestsHandler>) DIRETO da memória.
+                let f_reqhandler = candidate + 0x370;
+                if !crate::gum::is_readable(f_reqhandler as *const c_void, 16) {
+                    return log(&format!("[inksystemvalidate] candidato={candidate:#x}+0x370 ilegível"));
+                }
+                let cand_instance = (f_reqhandler as *const u64).read_unaligned();
+                let cand_refcount = (f_reqhandler as *const u64).add(1).read_unaligned();
+
+                // 3) chama BwmsGetSystemRequestsHandler() — 2ª fonte, MESMO instante, MESMO boot.
+                let f = register::get_function(reg, "BwmsGetSystemRequestsHandler");
+                if !crate::rtti::sane(f) {
+                    return log(
+                        "[inksystemvalidate] BwmsGetSystemRequestsHandler não resolveu (declaração ausente do bundle deployado?)",
+                    );
+                }
+                let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                let res = match crate::rtti::call_func(&rf, std::ptr::null_mut(), &[]) {
+                    Some(r) => r,
+                    None => {
+                        return log("[inksystemvalidate] BwmsGetSystemRequestsHandler() não completou");
+                    }
+                };
+                let handler_instance = u64::from_le_bytes(res[0..8].try_into().unwrap());
+                let handler_refcount = u64::from_le_bytes(res[8..16].try_into().unwrap());
+
+                let inst_match = cand_instance != 0 && cand_instance == handler_instance;
+                let rc_match = cand_refcount != 0 && cand_refcount == handler_refcount;
+                log(&format!(
+                    "[inksystemvalidate] candidato={candidate:#x} (keyboardState={kb:#06x} layerManagers.cap={cap} .size={size}) | +0x370.instance={cand_instance:#x} +0x370.refCount={cand_refcount:#x} | BwmsGetSystemRequestsHandler()->instance={handler_instance:#x} .refCount={handler_refcount:#x} | instance_match={inst_match} refcount_match={rc_match}"
+                ));
+                if inst_match {
+                    log("[inksystemvalidate] >>> MATCH EXATO (instance) — candidato CONFIRMADO como Red::InkSystem::Get() <<<");
+                } else {
+                    log("[inksystemvalidate] >>> SEM MATCH — candidato NÃO confirmado por esta via <<<");
+                }
+            }
+            return;
+        }
         ["peekq", addr, rest @ ..] => {
             let n = rest.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).clamp(1, 32);
             let va = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap_or(0);
@@ -2790,6 +6557,133 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 }
                 return log(&out);
             }
+        }
+        // vtdump <hex_ptr> [n] — irmão do `peekq`, MAS pra ponteiro RUNTIME já resolvido (ex.:
+        // vtable de um objeto vivo, lido via `rd_u64(obj)`) — NÃO faz `rebase()` (que espera um
+        // vmaddr ESTÁTICO de arquivo; aplicar rebase de novo num ponteiro já pós-ASLR dava
+        // endereço errado). Read-only, nunca chama nada. count clampado 1..48 (cobre vtables
+        // maiores, ex. `TweakDB::FlatValue` tem 31 slots — ver `RED4ext.SDK/TweakDB.hpp`).
+        ["vtdump", addr, rest @ ..] => {
+            let n = rest.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8).clamp(1, 48);
+            let va = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap_or(0);
+            if va == 0 {
+                return log("[vtdump] uso: vtdump <ptr-hex-runtime> [count]");
+            }
+            unsafe {
+                let base = va as *const u8;
+                if !crate::gum::is_readable(base as *const c_void, n * 8) {
+                    return log(&format!("[vtdump] {va:#x} ILEGÍVEL"));
+                }
+                let mut out = format!("[vtdump] {va:#x}:");
+                let mut prev: Option<u64> = None;
+                let mut run_start = 0usize;
+                for i in 0..n {
+                    let q = (base.add(i * 8) as *const u64).read_unaligned();
+                    let same = prev == Some(q);
+                    out.push_str(&format!(" +{:#x}={q:#018x}{}", i * 8, if same { "=" } else { "" }));
+                    if !same {
+                        run_start = i;
+                    }
+                    prev = Some(q);
+                    let _ = run_start;
+                }
+                return log(&out);
+            }
+        }
+        // `flatvtable <nome>` — resolve um FlatValue REAL do TweakDB vivo (mesma via de `getflat`)
+        // e dumpa os 31 primeiros qwords da SUA vtable (não do FlatValue em si — do que
+        // `rd_u64(fv)` aponta). Serve pra confirmar/refutar ao vivo a hipótese do layout de
+        // `TweakDB::FlatValue` mapeado por leitura de `TweakDB.hpp` (2 dtors Itanium + 26
+        // `GetValueOffset_*` com corpo idêntico, prováveis alvo de ICF do compilador -> mesmo
+        // ponteiro repetido — + `GetValue`/`GetTypeName`/`GetDataPtr` nos últimos 3 slots,
+        // offsets 0x00-0xF0). TweakXL `ScriptInterface`/`GetFlat->Variant` (#43, PENDENCIAS-
+        // UNIFICADAS.md) depende de confirmar isso ANTES de chamar `GetTypeName` às cegas.
+        ["flatvtable", name] => {
+            unsafe {
+                let t = match crate::tweakdb_rt::singleton() {
+                    Some(s) => s,
+                    None => return log("[flatvtable] singleton indisponível"),
+                };
+                match crate::tweakdb_rt::get_flat_value(t, name) {
+                    None => log(&format!("[flatvtable] '{name}' não achado")),
+                    Some(fv) => {
+                        let vt = (fv as *const u64).read_unaligned();
+                        log(&format!("[flatvtable] '{name}' FlatValue={fv:p} vtable={vt:#x}"));
+                        if !crate::gum::is_readable(vt as *const c_void, 31 * 8) {
+                            return log("[flatvtable] vtable ILEGÍVEL");
+                        }
+                        let mut out = format!("[flatvtable] vtable dump ({vt:#x}):");
+                        for i in 0..31usize {
+                            let q = (vt as *const u8).add(i * 8) as *const u64;
+                            out.push_str(&format!(" +{:#x}={:#018x}", i * 8, q.read_unaligned()));
+                        }
+                        log(&out);
+                    }
+                }
+            }
+            return;
+        }
+        // `flatgettype <nome> <gtn|gdp>` (2026-08-10) — TweakXL `ScriptInterface.GetFlat->Variant`
+        // (#43). **ACHADO DE RISCO REAL (1ª tentativa, bundlando as 2 chamadas numa função só):
+        // TRAVOU o game thread (sem crash — zero .ips, zero ProblemReporter — command channel e
+        // heartbeat pararam de vez, só recuperou via SIGTERM). NÃO chamar as 2 juntas de novo.**
+        // Refatorado pra isolar QUAL das 2 trava (mesma técnica que resolveu o mistério de crash
+        // do garment em 2026-07-29 — 1 hook por boot, nunca bundlar 2 chamadas não-confirmadas):
+        // `gtn` chama SÓ `GetTypeName(CName*)` (vtable+0xE8); `gdp` chama SÓ `GetDataPtr()`
+        // (vtable+0xF0). Gated atrás de `~/.bwms-flatgettype-danger` — sem o marcador, só loga o
+        // endereço resolvido (read-only) sem chamar nada. O layout da vtable em si (dump
+        // comparativo, `flatvtable`) está CONFIRMADO e é seguro — o risco é especificamente
+        // CHAMAR o ponteiro resolvido.
+        ["flatgettype", name, which] => {
+            unsafe {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let danger = std::path::Path::new(&format!("{home}/.bwms-flatgettype-danger")).exists();
+                let t = match crate::tweakdb_rt::singleton() {
+                    Some(s) => s,
+                    None => return log("[flatgettype] singleton indisponível"),
+                };
+                let fv = match crate::tweakdb_rt::get_flat_value(t, name) {
+                    Some(fv) => fv,
+                    None => return log(&format!("[flatgettype] '{name}' não achado")),
+                };
+                let vt = (fv as *const u64).read_unaligned();
+                if !crate::gum::is_readable(vt as *const c_void, 0xF8) {
+                    return log("[flatgettype] vtable ILEGÍVEL");
+                }
+                let off: usize = match *which {
+                    "gtn" => 0xE8,
+                    "gdp" => 0xF0,
+                    _ => return log("[flatgettype] uso: flatgettype <nome> <gtn|gdp>"),
+                };
+                let func = ((vt as *const u8).add(off) as *const u64).read_unaligned();
+                if !crate::rtti::sane(func as *mut c_void) {
+                    return log("[flatgettype] endereço de método implausível -> abortado");
+                }
+                if !danger {
+                    return log(&format!(
+                        "[flatgettype] '{name}' {which}={func:#x} (READ-ONLY — sem ~/.bwms-flatgettype-danger, NÃO chama; ver risco de hang documentado acima)"
+                    ));
+                }
+                log(&format!("[flatgettype] '{name}' {which}={func:#x} CHAMANDO (danger armado)..."));
+                match *which {
+                    "gtn" => {
+                        let mut name_out: u64 = 0;
+                        let f: extern "C" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(func);
+                        let ret = f(fv as *mut c_void, &mut name_out as *mut u64);
+                        let type_name = crate::cname::resolve_cname(name_out);
+                        log(&format!(
+                            "[flatgettype] gtn OK -> CName {name_out:#x} ('{type_name}') ret_ptr={ret:p}"
+                        ));
+                    }
+                    "gdp" => {
+                        let f: extern "C" fn(*mut c_void) -> *mut c_void = std::mem::transmute(func);
+                        let data_ptr = f(fv as *mut c_void);
+                        log(&format!("[flatgettype] gdp OK -> {data_ptr:p} (esperado fv+0x08={:p})", fv.add(0x08)));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            return;
         }
         // RE offline 2026-07-13 (Facade/baseEngineInit.cpp): 0x10223a2ac é um getter de SINGLETON
         // clássico (flag lazy-init em 0x107d7e000+0x4c0, ponteiro cacheado em +0x4c8), chamado no
@@ -2862,6 +6756,127 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             }
             return;
         }
+        // `getrecords <classe> [limite]` (2026-08-10) — ArchiveXL #59, `GetRecords<R>`: lista
+        // TODOS os records de um TIPO enumerando `recordsByID` (read-only).
+        ["getrecords", class] => {
+            unsafe { crate::tweakdb_rt::getrecords_cmd(reg, class, 500_000) };
+            return;
+        }
+        ["getrecords", class, limit] => {
+            let n: usize = limit.parse().unwrap_or(500_000);
+            unsafe { crate::tweakdb_rt::getrecords_cmd(reg, class, n) };
+            return;
+        }
+        // `getrecbytype <classe> [limite]` (2026-08-10) — RED4ext.SDK #341, `GetRecordsByType`:
+        // lookup DIRETO no índice `recordsByType`@+0x88 (O(1) amortizado), cross-validado contra
+        // `getrecords` (scan completo filtrado) — mesma classe deve dar a MESMA contagem.
+        ["getrecbytype", class] => {
+            unsafe { crate::tweakdb_rt::getrecbytype_cmd(reg, class, 500_000) };
+            return;
+        }
+        // `mutexsharedtest` (2026-08-10) — RED4ext.SDK #429, `SharedSpinLock::LockShared`/
+        // `UnlockShared`: prova o par contra o lock real do TweakDB vivo (t+0x20). Restaura o
+        // byte do lock a 0 (livre) ao final — nenhum efeito colateral persistente.
+        ["mutexsharedtest"] => {
+            unsafe {
+                match crate::tweakdb_rt::singleton() {
+                    Some(t) => crate::tweakdb_rt::mutex_shared_test_cmd(t),
+                    None => log("[mutexsharedtest] singleton TweakDB indisponível"),
+                }
+            }
+            return;
+        }
+        // `dynarrtest` (2026-08-11) — RED4ext.SDK #284/#280, `DynArray<T>::Erase`/`RemoveAt`:
+        // buffer 100% NOSSO (nunca exposto ao motor), zero risco de crash de teardown.
+        ["dynarrtest"] => {
+            unsafe { crate::rtti::dynarray_removeat_selftest(); }
+            return;
+        }
+        // `garmentoffsets` (2026-08-11) — ArchiveXL #97, `Facade.EnableGarmentOffsets`/
+        // `DisableGarmentOffsets`: diagnóstico read-only do flag (a real API do ArchiveXL não
+        // tem getter — só existe pra provar o round-trip Enable/Disable ao vivo).
+        ["garmentoffsets"] => {
+            log(&format!("[garmentoffsets] enabled={}", crate::register::garment_offsets_enabled()));
+            return;
+        }
+        // `innertype <typeName>` (2026-08-10) — Codeware #197, `ReflectionType.GetInnerType()`:
+        // resolve um IType composto (array/handle/weak-handle) por nome e mostra o tipo interno.
+        ["innertype", type_name] => {
+            unsafe { crate::rtti::probe_inner_type(reg, type_name) };
+            return;
+        }
+        ["getrecbytype", class, limit] => {
+            let n: usize = limit.parse().unwrap_or(500_000);
+            unsafe { crate::tweakdb_rt::getrecbytype_cmd(reg, class, n) };
+            return;
+        }
+        // `createalias <record_id_hex> <alias_id_hex>` (2026-08-10) — ArchiveXL #59,
+        // `CreateRecordAlias`: cria uma entrada nova em `recordsByID` (via `CreateTDBRecord`,
+        // growth-safe) apontando pro MESMO instance do record fonte.
+        ["createalias", rid, aid] => {
+            unsafe {
+                let Some(t) = crate::tweakdb_rt::singleton() else {
+                    return log("[createalias] singleton indisponível");
+                };
+                let record_id = u64::from_str_radix(rid.trim_start_matches("0x"), 16).unwrap_or(0);
+                let alias_id = u64::from_str_radix(aid.trim_start_matches("0x"), 16).unwrap_or(0);
+                let ok = crate::tweakdb_rt::create_record_alias_by_id(t, reg, record_id, alias_id);
+                log(&format!("[createalias] record={record_id:#x} alias={alias_id:#x} -> {ok}"));
+            }
+            return;
+        }
+        // `mkvariant <tipo> <hex_value>` (2026-08-10) — RED4ext.SDK #316: constrói um Variant
+        // NOVO (`build_variant_inline`) e lê de volta com o decoder JÁ PROVADO
+        // (`variant_type_cname`+`variant_inline_u64`) — round-trip auto-contido, nunca sai do
+        // nosso processo (não é passado ao motor/redscript nesta prova).
+        ["mkvariant", ty, hex_val] => {
+            unsafe {
+                let v = u64::from_str_radix(hex_val.trim_start_matches("0x"), 16).unwrap_or(0);
+                match crate::rtti::build_variant_inline(reg, ty, v) {
+                    None => log(&format!("[mkvariant] tipo '{ty}' não resolveu (get_type falhou)")),
+                    Some(buf) => {
+                        let type_hash = crate::rtti::variant_type_cname(&buf);
+                        let type_name = crate::cname::resolve_cname(type_hash);
+                        let readback = crate::rtti::variant_inline_u64(&buf);
+                        log(&format!(
+                            "[mkvariant] construído tipo='{ty}' valor={v:#x} -> lido de volta: tipo='{type_name}' ({type_hash:#x}) valor={readback:#x} (round-trip {})",
+                            if type_name == *ty && readback == v { "OK" } else { "DIVERGIU" }
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+        // `resexists <path>` (2026-08-10) — Codeware `#16`/`#198`: testa `resource_exists`
+        // contra um path CONHECIDO (deve existir) e um INVENTADO (não deve).
+        ["resexists", path] => {
+            unsafe {
+                let r = resource_exists(path);
+                log(&format!("[resexists] '{path}' -> {r}"));
+            }
+            return;
+        }
+        // `archiveexists <nome>` (2026-08-10) — Codeware `#16`/`#198`: testa `archive_exists_by_name`
+        // contra um nome CONHECIDO (deve existir, ex. basegame_1_engine.archive) e um INVENTADO.
+        ["archiveexists", name] => {
+            unsafe {
+                let r = archive_exists_by_name(name);
+                log(&format!("[archiveexists] '{name}' -> {r}"));
+            }
+            return;
+        }
+        // `testunload` (2026-08-10) — RED4ext.SDK #45: dispara `unload_all_plugins()` DIRETO
+        // (sem passar por `exit_replacement`/exit real — achado ao vivo: SIGTERM não roda o
+        // `exit()` hookado do libc, só um quit real via UI faria; testar a via de PROCESSO real
+        // exigiria fechar o jogo pela UI, fora do alcance automatizado). Prova a peça central do
+        // mecanismo (o dlsym+chamada do `bwms_plugin_unload` de cada plugin) sem depender do
+        // caminho de exit — a integração em `exit_replacement` é 1 linha trivial já adicionada,
+        // mesma categoria de risco de qualquer outra chamada já feita ali (Session/End etc.).
+        ["testunload"] => {
+            crate::plugins::unload_all_plugins();
+            log("[testunload] unload_all_plugins() chamado diretamente (fora do exit real)");
+            return;
+        }
         ["depotdump"] => {
             unsafe {
                 let slot = crate::rebase(0x1_0900_3000) as *const u8;
@@ -2889,6 +6904,263 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             }
             return;
         }
+        // `archivenamedump [n]` (2026-08-10) — Codeware #16/#198 (`ArchiveExists`): DIAGNÓSTICO
+        // read-only, NÃO implementa a native ainda. Uma nota de RE histórica
+        // (`notes/RE-archiveinfo-inject-2026-07-17.md`) flagou que o layout ESTÁTICO original de
+        // `ArchiveInfo` (name/path RedString@+0x10..+0x30, stride 0x50) NÃO bateu contra o depot
+        // VIVO numa tentativa anterior (2026-07-17) — só os offsets de TOPO do grupo
+        // (`depot+0x10`/`+0x1c`, usados por `find_pathb_content_group`) foram reconfirmados desde
+        // então (via `RegisterArchive`/`RegisterDir`, fechados 2026-08-09, que só manipulam
+        // CONTAGEM, nunca leem nome). Este comando reusa `find_pathb_content_group` (confirmado) +
+        // tenta ler `red_string_read` no offset suspeito de cada ArchiveInfo — sem escrever nada,
+        // só pra CONFIRMAR ou REFUTAR o layout de nome antes de implementar `ArchiveExists` de verdade.
+        ["archivenamedump"] | ["archivenamedump", _] => {
+            let n: usize = match parts.get(1) {
+                Some(s) => s.parse().unwrap_or(5),
+                None => 5,
+            };
+            unsafe {
+                let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+                if depot.is_null() {
+                    return log("[archivenamedump] PATHB_DEPOT ainda não capturado (boot incompleto?)");
+                }
+                let Some(g) = find_pathb_content_group(depot as *mut u8) else {
+                    return log("[archivenamedump] find_pathb_content_group falhou");
+                };
+                let cnt = (g.add(0x0c) as *const u32).read();
+                let arr = (g as *const *const u8).read();
+                log(&format!("[archivenamedump] grupo @{g:p}: cnt={cnt} arr={arr:p} — dumpando {n} entries (stride 0x50 suposto)"));
+                if arr.is_null() || cnt == 0 {
+                    return log("[archivenamedump] array vazio/nulo");
+                }
+                for i in 0..(n.min(cnt as usize)) {
+                    let entry = arr.add(i * 0x50);
+                    if !crate::gum::is_readable(entry as *const c_void, 0x50) {
+                        log(&format!("[archivenamedump]   [{i:02}] entry@{entry:p} ILEGÍVEL"));
+                        continue;
+                    }
+                    let raw16: Vec<u8> = (0..0x10).map(|o| *entry.add(o)).collect();
+                    let s = crate::rtti::red_string_read(entry.add(0x10));
+                    log(&format!(
+                        "[archivenamedump]   [{i:02}] entry@{entry:p} bytes[0..0x10]={raw16:02x?} red_string@+0x10='{s}'"
+                    ));
+                }
+            }
+            return;
+        }
+        // `archivegroupdump` (2026-08-17, auditoria de consistência — ArchiveXL `#37`,
+        // `ResolveArchiveGroup`) — DIAGNÓSTICO read-only: lista TODOS os grupos do depot com
+        // basePath (offset +0x10) e scope (offset +0x30), decodificados via o header oficial
+        // vendorizado. Confirma (ou refuta) os 2 offsets novos antes de usar `resolve_archive_
+        // _group_by_path` de verdade em qualquer lugar. Zero escrita, zero mutação.
+        // 2026-08-16/17 (rodada 41): núcleo movido pra `run_archivegroupdump()` (lib.rs, junto de
+        // `archive_scope_name`) — este braço fica como fallback do canal gated-por-executor (útil
+        // se o executor ainda estiver ativo quando o comando chegar); o braço PRINCIPAL agora é o
+        // do `[hb-canal]` (loop pós-boot, thread do heartbeat, sempre viva) — ver logo abaixo.
+        ["archivegroupdump"] => {
+            unsafe { run_archivegroupdump() };
+            return;
+        }
+        // `archivegroupresolve <basePath>` (2026-08-17, ArchiveXL `#37`) — testa
+        // `resolve_archive_group_by_path` contra um basePath real (achado via `archivegroupdump`
+        // primeiro) e um inventado. Read-only, zero mutação.
+        ["archivegroupresolve", base_path] => {
+            unsafe {
+                let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+                if depot.is_null() {
+                    return log("[archivegroupresolve] PATHB_DEPOT ainda não capturado (boot incompleto?)");
+                }
+                match resolve_archive_group_by_path(depot as *mut u8, base_path) {
+                    Some(g) => log(&format!("[archivegroupresolve] '{base_path}' -> grupo @{g:p}")),
+                    None => log(&format!("[archivegroupresolve] '{base_path}' -> nenhum grupo bate (esperado se for path novo)")),
+                }
+            }
+            return;
+        }
+        // `archivegroupcreate <basePath>` (2026-08-17, ArchiveXL `#37`, metade de ESCRITA) —
+        // testa `create_archive_group_by_path` (grow+insert real do `depot->groups`, mutação de
+        // memória viva do motor). GATED ~/.bwms-flatwrite (mesma trava de `mkarr`/`mkflat`/`clone`
+        // — categoria de risco "muta array vivo do engine", não exclusiva de TweakDB). Rode
+        // `archivegroupdump` ANTES e DEPOIS pra confirmar visualmente: grupo novo no índice certo,
+        // scope=Mod, count total +1, e os grupos vizinhos intactos (mesmos basePath/scope de antes).
+        ["archivegroupcreate", base_path] => {
+            let on = std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::Path::new(&h).join(".bwms-flatwrite").exists())
+                .unwrap_or(false);
+            if !on {
+                return log("[archivegroupcreate] BLOQUEADO: crie ~/.bwms-flatwrite p/ habilitar");
+            }
+            unsafe {
+                let depot = PATHB_DEPOT.load(Ordering::Relaxed);
+                if depot.is_null() {
+                    return log("[archivegroupcreate] PATHB_DEPOT ainda não capturado (boot incompleto?)");
+                }
+                match create_archive_group_by_path(depot as *mut u8, base_path) {
+                    Some(g) => log(&format!("[archivegroupcreate] '{base_path}' -> grupo @{g:p} (ok, ver archivegroupdump p/ confirmar)")),
+                    None => log(&format!("[archivegroupcreate] '{base_path}' -> falhou (ver log anterior pro motivo)")),
+                }
+            }
+            return;
+        }
+        // axl-journal-apply: dump JournalManager entries array at runtime.
+        // jmdump — reads JM singleton + entries DynArray; safe (read-only).
+        ["jmdump"] => {
+            unsafe {
+                use crate::selftest::JOURNAL_MANAGER_GLOBAL_VM;
+                let jm_global = crate::rebase(JOURNAL_MANAGER_GLOBAL_VM) as *const *mut c_void;
+                if !crate::gum::is_readable(jm_global as *const c_void, 8) {
+                    return log("[jmdump] JM global not readable");
+                }
+                let jm_ptr = jm_global.read_unaligned();
+                if jm_ptr.is_null() {
+                    return log("[jmdump] JM global is null — not loaded yet");
+                }
+                log(&format!("[jmdump] JM = {jm_ptr:p}"));
+                if !crate::gum::is_readable(jm_ptr as *const c_void, 0x40) {
+                    return log("[jmdump] JM not readable");
+                }
+                let r64 = |off: usize| (jm_ptr.cast::<u8>().add(off) as *const u64).read_unaligned();
+                let r32 = |off: usize| (jm_ptr.cast::<u8>().add(off) as *const u32).read_unaligned();
+                // DynArray at +0x30: ptr(8)+cap(4)+sz(4)
+                let arr_buf = r64(0x30) as *const u64;
+                let arr_cap = r32(0x38);
+                let arr_sz  = r32(0x3c);
+                log(&format!("[jmdump] entries[+0x30]: ptr={arr_buf:p} cap={arr_cap} sz={arr_sz}"));
+                if arr_buf.is_null() || arr_sz == 0 { return; }
+                // Read first 8 elements as 8-byte-stride pointers, log vtable of each
+                let n = (arr_sz as usize).min(8);
+                for i in 0..n {
+                    let slot = arr_buf.add(i);
+                    if !crate::gum::is_readable(slot as *const c_void, 8) { break; }
+                    let elem = slot.read_unaligned() as *const u64;
+                    let vtbl = if !elem.is_null() && crate::gum::is_readable(elem as *const c_void, 16) {
+                        elem.read_unaligned()
+                    } else { 0 };
+                    let vtbl2 = if !elem.is_null() && crate::gum::is_readable(elem as *const c_void, 16) {
+                        elem.add(1).read_unaligned()
+                    } else { 0 };
+                    log(&format!("[jmdump] [{i}] obj={elem:p} +0={vtbl:#018x} +8={vtbl2:#018x}"));
+                }
+                // Also try 16-byte stride (Handle<T>)
+                log("[jmdump] -- 16-byte stride (Handle<T>) --");
+                let arr_buf16 = arr_buf as *const u8;
+                for i in 0..n {
+                    let slot_ptr = arr_buf16.add(i * 16) as *const u64;
+                    if !crate::gum::is_readable(slot_ptr as *const c_void, 16) { break; }
+                    let ptr_val = slot_ptr.read_unaligned() as *const u64;
+                    let rc_val  = slot_ptr.add(1).read_unaligned();
+                    let vtbl = if !ptr_val.is_null() && crate::gum::is_readable(ptr_val as *const c_void, 8) {
+                        ptr_val.read_unaligned()
+                    } else { 0 };
+                    log(&format!("[jmdump] [{i}] ptr={ptr_val:p} rc={rc_val:#018x} vtbl={vtbl:#018x}"));
+                }
+            }
+            return;
+        }
+        // axl-journal-apply WRITE PROOF: duplicate elem[0] at pos sz, increment sz.
+        // jmprove — proves DynArray is R/W and sz can grow; safe at gameplay (no concurrent load).
+        ["jmprove"] => {
+            unsafe {
+                use crate::selftest::JOURNAL_MANAGER_GLOBAL_VM;
+                let jm_global = crate::rebase(JOURNAL_MANAGER_GLOBAL_VM) as *const *mut c_void;
+                if !crate::gum::is_readable(jm_global as *const c_void, 8) {
+                    return log("[jmprove] JM global not readable");
+                }
+                let jm_ptr = jm_global.read_unaligned() as *mut u8;
+                if jm_ptr.is_null() { return log("[jmprove] JM null"); }
+                if !crate::gum::is_readable(jm_ptr as *const c_void, 0x40) {
+                    return log("[jmprove] JM not readable");
+                }
+                let r64 = |off: usize| (jm_ptr.add(off) as *const u64).read_unaligned();
+                let r32 = |off: usize| (jm_ptr.add(off) as *const u32).read_unaligned();
+                let arr_buf = r64(0x30) as *mut u8;
+                let cap = r32(0x38);
+                let sz  = r32(0x3c);
+                log(&format!("[jmprove] before: ptr={arr_buf:p} cap={cap} sz={sz}"));
+                if arr_buf.is_null() || sz == 0 || sz >= cap {
+                    return log(&format!("[jmprove] abort: null={} sz={sz} cap={cap}", arr_buf.is_null()));
+                }
+                if !crate::gum::is_readable(arr_buf as *const c_void, 16) {
+                    return log("[jmprove] arr[0] not readable");
+                }
+                // Element stride = 16 (Handle<T>: obj_ptr + rc_block_ptr)
+                let elem0_ptr = (arr_buf as *const u64).read_unaligned();
+                let elem0_rc  = (arr_buf.add(8) as *const u64).read_unaligned();
+                log(&format!("[jmprove] elem[0]: ptr=0x{elem0_ptr:016x} rc=0x{elem0_rc:016x}"));
+                // Write duplicate of elem[0] at slot sz
+                let inject = arr_buf.add((sz as usize) * 16);
+                if !crate::gum::is_readable(inject as *const c_void, 16) {
+                    return log("[jmprove] inject slot not readable");
+                }
+                (inject as *mut u64).write_unaligned(elem0_ptr);
+                (inject.add(8) as *mut u64).write_unaligned(elem0_rc);
+                // Increment sz in DynArray
+                (jm_ptr.add(0x3c) as *mut u32).write_unaligned(sz + 1);
+                let sz_after = r32(0x3c);
+                log(&format!("[jmprove] INJECT PROOF: sz {sz}→{sz_after} ✓"));
+            }
+            return;
+        }
+        // ArchiveXL #77 (JournalManager.hpp, 2026-08-11): dump read-only dos 6 slots de vtable
+        // nunca explorados (GetTrackedQuest/GetTrackedPointOfInterest/GetEntryByHash/GetEntryHash/
+        // TrackQuestByPath/TrackPointOfInterest). Windows offsets do header vendorizado (RawVFunc):
+        // 0x1F8/0x208/0x220/0x230/0x298/0x2A0. Convenção +0x08 Itanium já confirmada NESTA MESMA
+        // família de classe (gameIJournalManager é irmã de questIQuestsSystem, onde OnGameRestored
+        // Windows 0x150->Mac 0x158 já foi confirmado via getquestsys) aplicada aqui como candidato.
+        // Zero chamada — só lê o ponteiro de função + os primeiros 16 bytes crus (prólogo) pra
+        // julgar plausibilidade, mesmo padrão do diagnóstico ForceStartNode/#55.
+        ["journalvtdump"] => {
+            unsafe {
+                use crate::selftest::JOURNAL_MANAGER_GLOBAL_VM;
+                let jm_global = crate::rebase(JOURNAL_MANAGER_GLOBAL_VM) as *const *mut c_void;
+                if !crate::gum::is_readable(jm_global as *const c_void, 8) {
+                    return log("[journalvtdump] JM global not readable");
+                }
+                let jm_ptr = jm_global.read_unaligned();
+                if jm_ptr.is_null() {
+                    return log("[journalvtdump] JM global is null — not loaded yet");
+                }
+                log(&format!("[journalvtdump] JM = {jm_ptr:p}"));
+                if !crate::gum::is_readable(jm_ptr as *const c_void, 8) {
+                    return log("[journalvtdump] JM not readable");
+                }
+                let vt = (jm_ptr as *const u64).read_unaligned() as *const u8;
+                log(&format!("[journalvtdump] vtable = {vt:p}"));
+                let base = crate::game_base();
+                for (label, win_off) in [
+                    ("GetTrackedQuest", 0x1F8usize),
+                    ("GetTrackedPointOfInterest", 0x208usize),
+                    ("GetEntryByHash", 0x220usize),
+                    ("GetEntryHash", 0x230usize),
+                    ("TrackQuestByPath", 0x298usize),
+                    ("TrackPointOfInterest", 0x2A0usize),
+                ] {
+                    let mac_off = win_off + 0x08;
+                    let slot_ptr = vt.add(mac_off) as *const u64;
+                    if !crate::gum::is_readable(slot_ptr as *const c_void, 8) {
+                        log(&format!("[journalvtdump] vtbl+{mac_off:#x} ({label}, win={win_off:#x}) slot ilegível"));
+                        continue;
+                    }
+                    let fn_rt = slot_ptr.read_unaligned() as usize;
+                    let vmaddr = if fn_rt > base { fn_rt - base + 0x1_0000_0000 } else { fn_rt };
+                    let mut bytes16 = [0u8; 16];
+                    let mut prologue_ok = false;
+                    if crate::gum::is_readable(fn_rt as *const c_void, 16) {
+                        std::ptr::copy_nonoverlapping(fn_rt as *const u8, bytes16.as_mut_ptr(), 16);
+                        // Prólogo ARM64 comum: stp x29,x30,[sp,#-N]! (0xa9 no 4º byte de um par
+                        // stp de 32-bit, forma comum 0xa9bf7bfd/0xa9bd... ) ou sub sp,sp,#N
+                        // (0xd10x...). Checagem frouxa: 1º opcode não-zero e não-0xFFFFFFFF.
+                        let op0 = u32::from_le_bytes([bytes16[0],bytes16[1],bytes16[2],bytes16[3]]);
+                        prologue_ok = op0 != 0 && op0 != 0xFFFFFFFF;
+                    }
+                    log(&format!(
+                        "[journalvtdump] vtbl+{mac_off:#x} ({label}, win={win_off:#x}) rt={fn_rt:#x} vmaddr={vmaddr:#010x} bytes={bytes16:02x?} plausible={prologue_ok}"
+                    ));
+                }
+            }
+            return;
+        }
         // DIAGNÓSTICO de construção RED (rodar no MENU PRINCIPAL = save-safe):
         // rttidump = só LÊ a vtable + getters (seguro); newobj = tiro único de
         // CONSTRUÇÃO (arriscado — pode crashar; por isso no menu, sem save aberto).
@@ -2896,8 +7168,813 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             log(&unsafe { crate::rtti::dump_class(reg, class) });
             return;
         }
+        // vtbl <cls-name> <n_slots> — lista N slots da vtable de uma classe RTTI
+        // Usa o punteiro de instância da classe para achar a vtable e converte para vmaddr.
+        // Ex: vtbl gameuiCharacterCustomizationSystem 30
+        // 2026-08-05 (auditoria de blind spots): leitura PURA (zero chamada, zero risco — mesmo
+        // mecanismo já provado 4x: GetClass/GetEnum/RegisterType/RegisterFunction) dos slots da
+        // vtable do CRTTISystem que o SDK real documenta mas este projeto nunca usou —
+        // AddRegisterCallback(+0xC0)/AddPostRegisterCallback(+0xC8)/CreateScriptedClass(+0xE0)/
+        // CreateScriptedEnum(+0xE8). RE offline não achou NENHUM caller desses 4 no binário
+        // inteiro (o jogo vanilla nunca registra enum/classe scriptada em runtime) — sem
+        // endereço concreto não dá pra confirmar o ABI real, e chamar às cegas é a MESMA
+        // categoria de erro que já crashou este projeto antes. Só lê+loga os endereços aqui;
+        // uma rodada de RE offline dedicada disassembla o corpo real depois.
+        // 2026-08-05: teste ISOLADO de CreateScriptedEnum (ABI confirmada por RE de disassembly,
+        // ver register.rs::create_scripted_enum) com um enum de TESTE inofensivo, antes de tentar
+        // EInputAction de verdade — mesma disciplina de sempre (nunca testar a hipótese arriscada
+        // já indo pro alvo real).
+        ["mkenumtest"] => {
+            unsafe {
+                match crate::rtti::Registry::obtain() {
+                    None => log("[mkenumtest] Registry::obtain() falhou"),
+                    Some(reg) => {
+                        let ok = crate::register::create_scripted_enum(
+                            &reg,
+                            "BwmsTestEnum",
+                            1,
+                            &[("BWMS_A", 0), ("BWMS_B", 1), ("BWMS_C", 2)],
+                        );
+                        log(&format!("[mkenumtest] create_scripted_enum -> {ok}"));
+                        if ok {
+                            let e = reg.enum_by_name("BwmsTestEnum");
+                            log(&format!("[mkenumtest] enum_by_name('BwmsTestEnum') -> {e:p} (não-null = achou de volta no RTTI)"));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        ["crttivtbl"] => {
+            unsafe {
+                match crate::rtti::Registry::obtain() {
+                    None => log("[crttivtbl] Registry::obtain() falhou"),
+                    Some(reg) => {
+                        let base = crate::game_base();
+                        for (label, off) in [
+                            ("AddRegisterCallback", 0xC0usize),
+                            ("AddPostRegisterCallback", 0xC8usize),
+                            ("CreateScriptedClass", 0xE0usize),
+                            ("CreateScriptedEnum", 0xE8usize),
+                        ] {
+                            let fp = reg.vtbl_slot(off) as usize;
+                            if fp == 0 {
+                                log(&format!("[crttivtbl] +{off:#x} ({label}) ilegível/null"));
+                                continue;
+                            }
+                            let vmaddr = if fp > base { fp - base + 0x1_0000_0000 } else { fp };
+                            log(&format!("[crttivtbl] +{off:#x} ({label}) rt={fp:#x} vmaddr={vmaddr:#010x}"));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        ["vtbl", class, n_str] => {
+            let n: usize = n_str.parse().unwrap_or(20).min(64);
+            unsafe {
+                let obj = crate::rtti::new_object(&reg, class);
+                if obj.is_null() {
+                    log(&format!("[vtbl] new_object falhou para '{class}'"));
+                    return;
+                }
+                if !crate::gum::is_readable(obj, 8) {
+                    log(&format!("[vtbl] instância {obj:p} ilegível"));
+                    return;
+                }
+                let vtbl_ptr = (obj as *const u64).read_unaligned() as *const u64;
+                if vtbl_ptr.is_null() || !crate::gum::is_readable(vtbl_ptr as *const c_void, (n * 8) as usize) {
+                    log(&format!("[vtbl] vtable {vtbl_ptr:p} ilegível"));
+                    return;
+                }
+                log(&format!("[vtbl] class={class} vtbl={vtbl_ptr:p}"));
+                let base = crate::game_base();
+                for i in 0..n {
+                    let slot_ptr = vtbl_ptr.add(i) as *const u64;
+                    if !crate::gum::is_readable(slot_ptr as *const c_void, 8) { break; }
+                    let fn_rt = slot_ptr.read_unaligned() as usize;
+                    let vmaddr = if fn_rt > base { fn_rt - base + 0x1_0000_0000 } else { fn_rt };
+                    log(&format!("[vtbl] [{i:02}] rt={fn_rt:#x} vmaddr={vmaddr:#010x}"));
+                }
+            }
+            return;
+        }
         ["propdump", class] => {
             log(&unsafe { crate::rtti::dump_props(reg, class) });
+            return;
+        }
+        // RED4ext.SDK — introspecção fina de flags (`PENDENCIAS-UNIFICADAS.md`, "CClass::Flags
+        // 11 bits / CProperty.flags 13 bits / CBaseFunction.flags 13 bits — maioria nunca
+        // lida"). 3 comandos read-only, decodificam os bits nomeados dos 3 headers vendorizados.
+        ["classflags", name] => {
+            unsafe { crate::rtti::probe_class_flags(reg, name) };
+            return;
+        }
+        ["propflags", class, prop] => {
+            unsafe { crate::rtti::probe_property_flags(reg, class, prop) };
+            return;
+        }
+        ["funcflags", class, method] => {
+            unsafe { crate::rtti::probe_function_flags(reg, class, method) };
+            return;
+        }
+        // `funcflagsglobal <nome>` (2026-08-10) — RED4ext.SDK #186 (lado escrita): diagnóstico
+        // pra confirmar/refutar o "palpite" documentado em `register.rs::FLAG_STATIC` (bit2,
+        // nunca verificado contra o ground-truth de `decode_function_flags`, que diz bit1=
+        // isStatic/bit2=isFinal do header vendorizado). Testa contra uma native GLOBAL nossa
+        // (sempre estática) já registrada.
+        ["funcflagsglobal", name] => {
+            unsafe {
+                let f = register::get_function(reg, name);
+                if !crate::rtti::sane(f) {
+                    return log(&format!("[funcflagsglobal] '{name}' não resolveu"));
+                }
+                match crate::rtti::function_flags(f) {
+                    Some(raw) => log(&format!(
+                        "[funcflagsglobal] '{name}' flags={raw:#010x} -> {}",
+                        crate::rtti::decode_function_flags(raw)
+                    )),
+                    None => log(&format!("[funcflagsglobal] '{name}' flags ilegível")),
+                }
+            }
+            return;
+        }
+        // `funcflagswrite <nome-global> <hex-mask>` (2026-08-11) — RED4ext.SDK #186, fecha o
+        // lado ESCRITA por completo (13/13 bits nomeados). OR o mask nos flags já existentes
+        // (preserva isNative/isStatic) + lê de volta via o mesmo decode_function_flags já usado
+        // por funcflagsglobal. Campo é metadado puro — despacho nunca depende destes bits (ver
+        // nota em rtti::function_flags_write).
+        ["funcflagswrite", name, mask_hex] => {
+            unsafe {
+                let f = register::get_function(reg, name);
+                if !crate::rtti::sane(f) {
+                    return log(&format!("[funcflagswrite] '{name}' não resolveu"));
+                }
+                let mask = u32::from_str_radix(mask_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+                let before = crate::rtti::function_flags(f).unwrap_or(0);
+                let new_flags = before | mask;
+                let ok = crate::rtti::function_flags_write(f, new_flags);
+                log(&format!("[funcflagswrite] '{name}' before={before:#010x} mask={mask:#010x} write_ok={ok}"));
+                match crate::rtti::function_flags(f) {
+                    Some(raw) => log(&format!(
+                        "[funcflagswrite] '{name}' readback flags={raw:#010x} -> {}",
+                        crate::rtti::decode_function_flags(raw)
+                    )),
+                    None => log(&format!("[funcflagswrite] '{name}' readback ilegível")),
+                }
+            }
+            return;
+        }
+        // Codeware `Reflection.ReflectionFunc` — "introspecção de assinatura" (nome, retorno,
+        // params, is_native/is_static), junta `resolve_func`+`type_kind`+`function_flags`.
+        ["funcsig", class, method] => {
+            unsafe { crate::rtti::probe_function_signature(reg, class, method) };
+            return;
+        }
+        // Codeware `Reflection.ReflectionEnum`/`ReflectionBitfield.IsNative()`.
+        ["enumisnative", name] => {
+            unsafe { crate::rtti::probe_type_is_native(reg, name) };
+            return;
+        }
+        // Codeware `ReflectionClass.GetFunctions()`/`GetStaticFunctions()` (item #51).
+        ["funclistdump", class] => {
+            unsafe { crate::rtti::probe_class_own_functions(reg, class, 15) };
+            return;
+        }
+        ["funclistdump", class, n] => {
+            let n: usize = n.parse().unwrap_or(15).min(200);
+            unsafe { crate::rtti::probe_class_own_functions(reg, class, n) };
+            return;
+        }
+        // RED4ext.SDK — `CClass.defaults` (Map<CName,Variant*>@+0x158, PENDENCIAS-UNIFICADAS.md
+        // prosa "Restante"): valor-default de uma propriedade, nunca lido antes.
+        ["classdefault", class, prop] => {
+            unsafe { crate::rtti::probe_class_default(reg, class, prop) };
+            return;
+        }
+        // `newobjget <classe> <prop>` (2026-08-10) — RED4ext.SDK #102 (`CClass.defaults`): a via
+        // OFICIAL (ler o Map interno `CClass+0x158`) deu vazio nos 5 casos testados antes. Via
+        // alternativa: construir uma instância NOVA (`rtti::new_object`, já provado) e ler a prop
+        // (`find_property_in_class`+`prop_get_*`, já provado) — o valor que sai do `Construct()`
+        // real do motor É o default de fato, na prática mais confiável que o Map (que parece
+        // raramente populado). Read-only sobre um objeto DESCARTÁVEL (nunca registrado em lugar
+        // nenhum, sem side-effect fora de si mesmo).
+        ["newobjget", class, prop] => {
+            unsafe {
+                let cls = reg.class_by_name(class);
+                if cls.is_null() {
+                    return log(&format!("[newobjget] classe '{class}' não encontrada"));
+                }
+                let obj = crate::rtti::new_object(reg, class);
+                if obj.is_null() {
+                    return log(&format!("[newobjget] new_object('{class}') falhou"));
+                }
+                let p = crate::rtti::find_property_in_class(cls, prop);
+                if p.is_null() {
+                    return log(&format!("[newobjget] prop '{prop}' não achada em '{class}'"));
+                }
+                let vo = crate::rtti::prop_value_offset(p);
+                let u = crate::rtti::prop_get_u32(p, obj);
+                let f = crate::rtti::prop_get_f32(p, obj);
+                let b = crate::rtti::prop_get_bool(p, obj);
+                log(&format!(
+                    "[newobjget] {class}.{prop} (vo={vo:#x}, instância NOVA descartável @{obj:p}) = u32 {u:#x} / i32 {} / f32 {f} / bool {b}",
+                    u as i32
+                ));
+            }
+            return;
+        }
+        // RED4ext.SDK — "família de tipos-wrapper" (itens #129-158): introspecção genérica de
+        // categoria de tipo via `rtti::IType::GetType()` (macOS vtbl+0x28, shift de +0x08 vs
+        // Windows — 2 dtors Itanium, achado já documentado no código, nunca exposto como comando).
+        ["proptypekind", class, prop] => {
+            unsafe { crate::rtti::probe_property_type_kind(reg, class, prop) };
+            return;
+        }
+        // Codeware `Reflection.ReflectionEnum.AddConstant` (PENDENCIAS-UNIFICADAS.md, Codeware
+        // "Reflection... AddConstant"): cria enum de teste, adiciona constante, lê de volta.
+        ["enumaddconstprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::register::probe_enum_add_constant(&reg) };
+            } else {
+                log("[enumaddconst] Registry indisponível");
+            }
+            return;
+        }
+        ["proptypekindall", class] => {
+            unsafe { crate::rtti::probe_property_type_kind_all(reg, class, 20) };
+            return;
+        }
+        ["proptypekindall", class, n] => {
+            let n: usize = n.parse().unwrap_or(20).min(200);
+            unsafe { crate::rtti::probe_property_type_kind_all(reg, class, n) };
+            return;
+        }
+        // Codeware `#199`: varredura BFS pela hierarquia de `âncora` procurando um
+        // `type_kind()==11` (ResourceReference/Ref<T>) real, pra finalmente testar
+        // `IsReferenceLoaded`/`GetReferenceResource` contra um alvo positivo genuíno.
+        ["scan11", anchor] => {
+            unsafe { crate::rtti::scan_type_kind_across_hierarchy(reg, anchor, 3000) };
+            return;
+        }
+        ["scan11", anchor, max] => {
+            let max: usize = max.parse().unwrap_or(3000).min(20_000);
+            unsafe { crate::rtti::scan_type_kind_across_hierarchy(reg, anchor, max) };
+            return;
+        }
+        // Codeware `#199`: constrói uma instância sintética de `classe` e roda a MESMA lógica
+        // de `BwmsIsResourceReferenceLoaded`/`BwmsGetResourceReferenceResource` direto (bypass do
+        // marshalling redscript), sobre um campo `type_kind==11` REAL achado via `scan11`.
+        ["res11probe", class, prop] => {
+            unsafe { crate::register::probe_resource_helper_type11(reg, class, prop) };
+            return;
+        }
+        // Codeware `#199` (2026-08-18, continuação da continuação): `res11rec <classe> <prop>
+        // [cap]` — mesma sonda do `res11probe`, mas contra records REAIS do TweakDB vivo (via
+        // `get_records_of_class`, já provado pelo ArchiveXL #59) em vez de instância sintética.
+        ["res11rec", class, prop] => {
+            unsafe { crate::register::probe_resource_helper_type11_records(reg, class, prop, 5) };
+            return;
+        }
+        ["res11rec", class, prop, cap] => {
+            let cap: usize = cap.parse().unwrap_or(5).min(50);
+            unsafe { crate::register::probe_resource_helper_type11_records(reg, class, prop, cap) };
+            return;
+        }
+        // Codeware `#199` (2026-08-18, pivô final): `res11walk [max_layers] [max_nodes]` — anda a
+        // árvore real de widgets a partir de cada InkLayer->gameController procurando um campo
+        // `inkWidgetBrush` VIVO (não sintético), via natives vanilla (GetRootWidget/
+        // GetNumChildren/GetWidgetByIndex) chamadas direto por Rust.
+        ["res11walk"] => {
+            unsafe { crate::register::probe_widget_tree_for_brush(reg, 20, 500) };
+            return;
+        }
+        ["res11walk", max_layers, max_nodes] => {
+            let ml: usize = max_layers.parse().unwrap_or(20).min(200);
+            let mn: usize = max_nodes.parse().unwrap_or(500).min(20_000);
+            unsafe { crate::register::probe_widget_tree_for_brush(reg, ml, mn) };
+            return;
+        }
+        // `axl-customization-apply`: lista métodos RTTI (instância+estáticos) de uma classe.
+        // Ex: rttifuncs gameuiCharacterCustomizationSystem → GetHeadOptions/GetBodyOptions etc.
+        ["rttifuncs", class] => {
+            log(&unsafe { crate::rtti::dump_class_funcs(reg, class) });
+            return;
+        }
+        // `cw-controller-misc`: dado CClass+método, acha o CClassFunction* e despeja qwords
+        // em múltiplos offsets — identifica qual offset tem o ponteiro nativo C++ (no TEXT).
+        // Ex: nativefunc IComponent Toggle → despeja CFunc*+0x00..+0x60; candidato = vmaddr TEXT.
+        // `resolvefuncrobust <nome>` (2026-08-10) — RED4ext.SDK #55: compara `register::get_function`
+        // (vtbl+0x30, só acha o que foi RegisterFunction-ado pelo Rust) contra
+        // `rtti::resolve_global_function_robust` (varre GetGlobalFunctions, casa por nome/fullName)
+        // — prova se o fallback resolve uma global PURAMENTE ESCRIPTADA que a via rápida não acha.
+        ["resolvefuncrobust", name] => {
+            unsafe {
+                let fast = crate::register::get_function(reg, name);
+                let robust = crate::rtti::resolve_global_function_robust(reg, name);
+                log(&format!(
+                    "[resolvefuncrobust] '{name}': get_function(vtbl+0x30)={fast:p} | resolve_global_function_robust(varredura)={robust:p}"
+                ));
+            }
+            return;
+        }
+        ["nativefunc", class, method] => {
+            unsafe {
+                let cls = reg.class_by_name(class);
+                if cls.is_null() {
+                    log(&format!("[nativefunc] classe '{class}' não encontrada"));
+                    return;
+                }
+                match crate::rtti::resolve_in_class(cls, method) {
+                    None => log(&format!("[nativefunc] '{method}' não achado em '{class}'")),
+                    Some(rf) => {
+                        let f = rf.func as *const u8;
+                        log(&format!("[nativefunc] '{class}::{method}' func={f:p}"));
+                        let base = crate::game_base() as u64;
+                        for off in (0usize..=0x80).step_by(8) {
+                            if !crate::gum::is_readable(f.add(off) as *const c_void, 8) { break; }
+                            let v = (f.add(off) as *const u64).read_unaligned();
+                            let is_text = v > base && v < base + 0x800_0000;
+                            let vm = if is_text { format!("vmaddr={:#010x}", v - base + 0x1_0000_0000u64) } else { String::new() };
+                            log(&format!("[nativefunc] +{off:#04x}: {v:#018x} {vm}"));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // `getcustsys`: obtém o ptr do gameuiCharacterCustomizationSystem via GameInstance
+        // (player.GetGame() → GetCharacterCustomizationSystem()), atualiza CHAR_CUSTOM_SYS_PTR,
+        // e loga o ptr para uso em callon/custsys.
+        ["getcustsys"] => {
+            unsafe {
+                // BUG CORRIGIDO 2026-07-28: `class_of(player)` derivava a classe da INSTÂNCIA
+                // capturada — falha (game_cls=0x0) logo após save-load/transições de cena, mesmo
+                // com `player` não-nulo (mesmo padrão documentado em console.rs::auth_player,
+                // "player capturado costuma ser puppet transiente"). Fix: resolver "GetGame"
+                // DIRETO da classe estática "PlayerPuppet" (sempre registrada), sem depender do
+                // estado da instância — mesma receita robusta já usada em auth_player.
+                log(&format!("[getcustsys] player={player:p}"));
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[getcustsys] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[getcustsys] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            log(&format!("[getcustsys] GetGame()={game_ptr:#018x}"));
+                            if game_ptr == 0 { return; }
+                            // CAUSA RAIZ ACHADA 2026-07-28 (via `nativefunc ScriptGameInstance
+                            // GetQuestsSystem`, mesmo shape): a struct do CClassFunction tem
+                            // p_count=1 (campo +0x30, lido por `call_func::p_count`) — este native
+                            // espera 1 ARG explícito, não 0. `GetCharacterCustomizationSystem(self:
+                            // GameInstance)` é o padrão redscript "static com self explícito"
+                            // (chamado como `GameInstance.GetX(game)` no .script real, não
+                            // `game.GetX()`) — o GameInstance tem que ir no ARRAY DE ARGS
+                            // (`Arg::Raw`, o próprio comentário do enum já dizia "ex.: GameInstance")
+                            // com `ctx` sendo QUALQUER objeto válido (não o GameInstance) — exatamente
+                            // como `console.rs::auth_player` já fazia pra `GetPlayerSystem` (mesmo
+                            // padrão de assinatura). O crash de antes (EXC_BAD_ACCESS, endereço com
+                            // cara de hash) era ler PARÂMETRO FALTANTE como se fosse dado — `call_func`
+                            // só rejeita `args.len() > p_count`, nunca `args.len() < p_count`, então
+                            // a chamada com 0 args "passava" sem erro só pra crashar dentro do native.
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetCharacterCustomizationSystem") {
+                                None => log("[getcustsys] GetCharacterCustomizationSystem não achado em GameInstance"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[getcustsys] GetCharacterCustomizationSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        log(&format!("[getcustsys] gameuiCharacterCustomizationSystem={sys_ptr:#018x}"));
+                                        if sys_ptr != 0 {
+                                            crate::selftest::CHAR_CUSTOM_SYS_PTR.store(sys_ptr, std::sync::atomic::Ordering::Relaxed);
+                                            log("[getcustsys] CHAR_CUSTOM_SYS_PTR actualizado — custsys probe vai funcionar");
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // `axl-questphase-apply`: mesma ABI corrigida de `getcustsys` (GameInstance vai em
+        // Arg::Raw, não em ctx) aplicada a `GameInstance.GetQuestsSystem(game)`. Dado o ptr do
+        // questQuestsSystem vivo, dumpa a vtable nos 2 slots que a RE offline (agente dedicado,
+        // 2026-07-28) já apontou como candidatos: 0x158 (OnGameRestored, Windows 0x150 +0x08
+        // Itanium) e 0x368 (candidato pro caminho de Start, achado dentro de QuestsSystem::Tick).
+        ["getquestsys"] => {
+            unsafe {
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[getquestsys] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[getquestsys] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            if game_ptr == 0 { log("[getquestsys] GetGame()=0"); return; }
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetQuestsSystem") {
+                                None => log("[getquestsys] GetQuestsSystem não achado em GameInstance"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[getquestsys] GetQuestsSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        log(&format!("[getquestsys] questQuestsSystem={sys_ptr:#018x}"));
+                                        if sys_ptr == 0 { return; }
+                                        let obj = sys_ptr as *const u8;
+                                        if !crate::gum::is_readable(obj as *const c_void, 8) {
+                                            log("[getquestsys] instância ilegível");
+                                            return;
+                                        }
+                                        let vt = (obj as *const u64).read_unaligned() as *const u8;
+                                        let base = crate::game_base();
+                                        // ForceStartNode-cand (2026-08-10, cont.192): item ArchiveXL #55.
+                                        // `Raw::QuestsSystem::ForceStartNode = Core::RawVFunc<0x240,
+                                        // void(questIQuestsSystem::*)(const QuestNodeKey&, const
+                                        // DynArray<CName>&)>` no header vendorizado (Windows offset).
+                                        // Mesma convenção já confirmada NESTA classe (OnGameRestored:
+                                        // Windows 0x150 -> Mac 0x158, +0x08 Itanium) aplicada: candidato
+                                        // Mac = 0x240+0x08 = 0x248. Leitura pura, zero chamada.
+                                        for (label, slot_off) in [("OnGameRestored-cand", 0x158usize), ("Start-cand", 0x368usize), ("ForceStartNode-cand", 0x248usize)] {
+                                            let slot_ptr = vt.add(slot_off) as *const u64;
+                                            if !crate::gum::is_readable(slot_ptr as *const c_void, 8) {
+                                                log(&format!("[getquestsys] vtbl+{slot_off:#x} ({label}) ilegível"));
+                                                continue;
+                                            }
+                                            let fn_rt = slot_ptr.read_unaligned() as usize;
+                                            let vmaddr = if fn_rt > base { fn_rt - base + 0x1_0000_0000 } else { fn_rt };
+                                            log(&format!("[getquestsys] vtbl+{slot_off:#x} ({label}) rt={fn_rt:#x} vmaddr={vmaddr:#010x}"));
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // `axl-questphase-apply` (2026-08-05, via RE — passo 2): `questdump` (abaixo) achou os
+        // vtables ESTÁTICOS reais de `questRootInstance` (0x1_0070fd348 — confirmado pela string
+        // RTTI "questRootInstance" no site de registro do tipo) e da base `questPhaseInstance`
+        // (0x1_0070fd088, string "questPhaseInstance"). Só os 4 primeiros slots foram capturados
+        // (boilerplate comum ISerializable: GetNativeType/GetType/helper-compartilhado/destrutor)
+        // — `Start`/`ProcessPhaseResource`, se forem virtuais, ficam no slot 4+. Leitura direta e
+        // estática da região __DATA_CONST (sempre mapeada, não depende de instância viva nenhuma).
+        ["questvtabledump"] => {
+            unsafe {
+                for (label, vt_vmaddr) in [
+                    ("questRootInstance", 0x1070fd348u64),
+                    ("questPhaseInstance(base)", 0x1070fd088u64),
+                ] {
+                    let vt = crate::rebase(vt_vmaddr) as *const u8;
+                    if !crate::gum::is_readable(vt as *const c_void, 8) {
+                        log(&format!("[questvtabledump] {label} vtable={vt_vmaddr:#010x} ilegível"));
+                        continue;
+                    }
+                    log(&format!("[questvtabledump] === {label} vtable estático={vt_vmaddr:#010x} ==="));
+                    for slot in 0..24usize {
+                        let sp = vt.add(slot * 8) as *const u64;
+                        if !crate::gum::is_readable(sp as *const c_void, 8) {
+                            log(&format!("[questvtabledump] {label} slot{slot} ilegível"));
+                            break;
+                        }
+                        let fn_rt = sp.read_unaligned();
+                        let fn_vm = crate::un_rebase(fn_rt as *const c_void);
+                        log(&format!("[questvtabledump] {label} slot{slot} vmaddr={fn_vm:#010x}"));
+                    }
+                }
+            }
+            return;
+        }
+        // `axl-questphase-apply` (2026-08-05, via RE): `Start`/`ProcessPhaseResource` nunca
+        // aparecem no RTTI (confirmado exaustivamente, ver HISTORICO.md cont.24) — não dá pra
+        // achar por nome/registro de classe. Em vez disso, varredura CRUA de dados (não vtable)
+        // do `questQuestsSystem` vivo, mesmo padrão observe-only já provado em `wardrobesys`:
+        // pra cada qword que parece um ponteiro de heap plausível, lê o 1º qword DO ALVO — se
+        // cair dentro do `__TEXT` do binário (`un_rebase()!=0`), é candidato a VTABLE de um
+        // objeto C++ real (ex. `questRootInstance`, que o sistema provavelmente rastreia como
+        // membro) — dá uma âncora estática nova pra RE offline dedicada. Zero mutação, zero hook.
+        ["questdump"] => {
+            unsafe {
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[questdump] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[questdump] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            if game_ptr == 0 { log("[questdump] GetGame()=0"); return; }
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetQuestsSystem") {
+                                None => log("[questdump] GetQuestsSystem não achado em GameInstance"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[questdump] GetQuestsSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        log(&format!("[questdump] questQuestsSystem={sys_ptr:#018x}"));
+                                        if sys_ptr == 0 { return; }
+                                        let obj = sys_ptr as *const u8;
+                                        if !crate::gum::is_readable(obj as *const c_void, 0x400) {
+                                            log("[questdump] instância ilegível (menos de 0x400 bytes)");
+                                            return;
+                                        }
+                                        // 2026-08-05 (refinado por RE): a 1ª passada (só `un_rebase()!=0`)
+                                        // deu 100% falso-positivo — pegava qualquer coisa perto da base
+                                        // (funções em __TEXT,__text, plumbing de alocador). Vtables REAIS
+                                        // deste binário ficam em __DATA_CONST,__const (achado por RE,
+                                        // range estático 0x106e4a8d8..0x107392948) — filtro agora exige
+                                        // isso, e valida o candidato lendo os 4 slots seguintes: um vtable
+                                        // de verdade tem uma SEQUÊNCIA de ponteiros pra dentro de
+                                        // __TEXT,__text (0x100002070..0x104a396a0), não lixo aleatório.
+                                        const DATA_CONST_LO: u64 = 0x1_06e4_a8d8;
+                                        const DATA_CONST_HI: u64 = 0x1_0739_2948;
+                                        const TEXT_LO: u64 = 0x1_0000_2070;
+                                        const TEXT_HI: u64 = 0x1_04a3_96a0;
+                                        for off in (0x08usize..0x400).step_by(8) {
+                                            let v = (obj.add(off) as *const u64).read_unaligned();
+                                            if v == 0 { continue; }
+                                            let candidate = v as *const c_void;
+                                            if !crate::gum::is_readable(candidate, 8) { continue; }
+                                            let first_qword = (candidate as *const u64).read_unaligned();
+                                            let vmaddr = crate::un_rebase(first_qword as *const c_void);
+                                            if vmaddr < DATA_CONST_LO || vmaddr > DATA_CONST_HI { continue; }
+                                            let vt = first_qword as *const u8;
+                                            let mut slots_valid = 0u32;
+                                            let mut slot_log = String::new();
+                                            for slot in 0..4usize {
+                                                let sp = vt.add(slot * 8) as *const u64;
+                                                if !crate::gum::is_readable(sp as *const c_void, 8) { continue; }
+                                                let fn_rt = sp.read_unaligned();
+                                                let fn_vm = crate::un_rebase(fn_rt as *const c_void);
+                                                if fn_vm >= TEXT_LO && fn_vm <= TEXT_HI { slots_valid += 1; }
+                                                slot_log.push_str(&format!(" slot{slot}={fn_vm:#010x}"));
+                                            }
+                                            log(&format!("[questdump] +{off:#x} = {v:#018x} -> vtable-candidato={vmaddr:#010x} slots_validos={slots_valid}/4{slot_log}"));
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // `cw-player-scheduling-vehicle` (WardrobeSystem::ForgetItemID): a fonte real do Codeware
+        // (`WardrobeSystemEx.hpp`) já dá os offsets do Windows — `HashMap<CName,ItemID> ItemStore`
+        // em +0x48, `SharedSpinLock ItemStoreMutex` em +0xF4 — NÃO são endereços de função (que
+        // mudam entre plataformas), são offsets de DADOS/struct, que este projeto já confirmou
+        // repetidas vezes portarem 1:1 macOS↔Windows (`Core::OffsetPtr<0xNN>`). Em vez de tentar
+        // achar uma função nativa que NÃO EXISTE (RE já confirmou isso — ver DATABASE.md), lê os
+        // bytes crus nesses offsets de uma instância VIVA (mesma ABI de "static com self explícito"
+        // já provada em getquestsys/getcustsys) — observe-only, zero mutação, zero hook — só pra
+        // VALIDAR se os offsets batem (heurística: HashMap real tem cara de {ptr,count,cap} ou
+        // similar; SharedSpinLock real é 0 quando destravado).
+        ["wardrobesys"] => {
+            unsafe {
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[wardrobesys] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[wardrobesys] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            if game_ptr == 0 { log("[wardrobesys] GetGame()=0"); return; }
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetWardrobeSystem") {
+                                None => log("[wardrobesys] GetWardrobeSystem não achado em GameInstance"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[wardrobesys] GetWardrobeSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        log(&format!("[wardrobesys] WardrobeSystem={sys_ptr:#018x}"));
+                                        if sys_ptr == 0 { return; }
+                                        let obj = sys_ptr as *const u8;
+                                        if !crate::gum::is_readable(obj as *const c_void, 0x100) {
+                                            log("[wardrobesys] instância ilegível (menos de 0x100 bytes)");
+                                            return;
+                                        }
+                                        // dump bruto de +0x40..+0x60 (janela ao redor do candidato +0x48
+                                        // ItemStore) + +0xF0..+0x100 (janela ao redor do +0xF4 mutex)
+                                        for off in (0x40usize..0x60).step_by(8) {
+                                            let v = (obj.add(off) as *const u64).read_unaligned();
+                                            log(&format!("[wardrobesys] +{off:#x} = {v:#018x}"));
+                                        }
+                                        for off in (0xf0usize..0x100).step_by(8) {
+                                            let v = (obj.add(off) as *const u64).read_unaligned();
+                                            log(&format!("[wardrobesys] +{off:#x} = {v:#018x}"));
+                                        }
+                                        // 2026-07-31: enumeração COMPLETA, 100% observe-only (zero
+                                        // escrita), do HashMap<CName,ItemID> real em WardrobeSystem+0x48.
+                                        // Layout confirmado por agente de RE contra RED4ext.SDK/HashMap.hpp
+                                        // (ground-truth, ver DATABASE.md): indexTable@+0x00(rel ao HashMap,
+                                        // =WardrobeSystem+0x48), size@+0x08(u32), capacity@+0x0C(u32),
+                                        // nodes@+0x10(Node*), Node{next:u32@0,hashedKey:u32@4,key:CName
+                                        // u64@8,value:ItemID 16B@0x10}, stride=0x20. Caminha TODOS os
+                                        // buckets + cadeias — nunca escreve nada, só lê e loga. Serve pra
+                                        // validar o algoritmo de hash/bucket/cadeia ANTES de confiar numa
+                                        // implementação de Remove (que precisaria escrever).
+                                        let hm = obj.add(0x48);
+                                        let index_table = (hm as *const u64).read_unaligned() as *const u32;
+                                        let size_cap = (hm.add(0x08) as *const u64).read_unaligned();
+                                        let map_size = (size_cap & 0xFFFF_FFFF) as u32;
+                                        let capacity = (size_cap >> 32) as u32;
+                                        let nodes = (hm.add(0x10) as *const u64).read_unaligned() as *const u8;
+                                        log(&format!("[wardrobesys] HashMap: indexTable={index_table:p} size={map_size} capacity={capacity} nodes={nodes:p}"));
+                                        if capacity == 0 || capacity > 4096 || index_table.is_null() || nodes.is_null() {
+                                            log("[wardrobesys] capacity/ponteiros fora de faixa plausível, abortando enumeração");
+                                        } else if !crate::gum::is_readable(index_table as *const c_void, (capacity as usize) * 4) {
+                                            log("[wardrobesys] indexTable ilegível");
+                                        } else {
+                                            const STRIDE: usize = 0x20;
+                                            const INVALID: u32 = 0xFFFF_FFFF;
+                                            let mut found: u32 = 0;
+                                            for bucket in 0..capacity {
+                                                let mut idx = index_table.add(bucket as usize).read_unaligned();
+                                                let mut guard = 0;
+                                                while idx != INVALID && guard < capacity + 1 {
+                                                    guard += 1;
+                                                    let node = nodes.add(idx as usize * STRIDE);
+                                                    if !crate::gum::is_readable(node as *const c_void, STRIDE) {
+                                                        log(&format!("[wardrobesys] bucket={bucket} idx={idx} node ilegível, parando cadeia"));
+                                                        break;
+                                                    }
+                                                    let next = (node as *const u32).read_unaligned();
+                                                    let hashed_key = (node.add(4) as *const u32).read_unaligned();
+                                                    let key = (node.add(8) as *const u64).read_unaligned();
+                                                    let value_lo = (node.add(0x10) as *const u64).read_unaligned();
+                                                    let value_hi = (node.add(0x18) as *const u64).read_unaligned();
+                                                    found += 1;
+                                                    log(&format!("[wardrobesys] item#{found} bucket={bucket} idx={idx} hashedKey={hashed_key:#010x} CName={key:#018x} ItemID=({value_lo:#018x},{value_hi:#018x})"));
+                                                    idx = next;
+                                                }
+                                            }
+                                            log(&format!("[wardrobesys] enumeração completa: {found} entradas encontradas (map_size reportado={map_size})"));
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // `cw-player-scheduling-vehicle`: `WardrobeSystem::ForgetItemID` — implementação REAL de
+        // `HashMap<CName,ItemID>::Remove`, layout confirmado por agente de RE dedicado contra
+        // `RED4ext.SDK/include/RED4ext/HashMap.hpp` (ground-truth, 2 corroborações independentes:
+        // fonte + leitura ao vivo no Mac batendo exata — ver DATABASE.md). Algoritmo (RED4ext.SDK
+        // HashMap.hpp linhas ~196-239): hashedKey = XOR-fold do CName (já é hash FNV1a64) —
+        // (u32)hash ^ (u32)(hash>>32); bucket = hashedKey % capacity; caminha a cadeia por `.next`
+        // rastreando o ponteiro ANTERIOR (indexTable[bucket] ou node.next de quem veio antes);
+        // ao achar, desengancha (*prev = node.next), empurra o slot liberado na freelist
+        // (node.next = nodeList.nextIdx; nodeList.nextIdx = idx), decrementa `size`. Sob
+        // SharedSpinLock @+0xF4 (CAS 0->0xFF, mesmo padrão já provado em `tweakdb_rt::mutex00_lock`).
+        // **CODADO+build-verificado, mas DELIBERADAMENTE NÃO testado ao vivo contra o save real
+        // do usuário** — ao contrário de leituras (reversíveis por definição), uma ESCRITA errada
+        // num HashMap do motor pode corromper heap ou (pior) persistir uma mutação indesejada no
+        // save se `ItemStore` for serializado. `wardrobesys` (comando acima) já confirmou o
+        // read-path 100% (enumeração bateu EXATO com `size` reportado, incl. uma cadeia de colisão
+        // real). Faltaria: confirmar que remover não quebra nada visível (idealmente com o usuário
+        // testando/confirmando, ou numa save descartável) antes de considerar isso "provado".
+        ["wardrobeforget", cname_hex] => {
+            unsafe {
+                let target_cname: u64 = match u64::from_str_radix(cname_hex.trim_start_matches("0x"), 16) {
+                    Ok(v) => v,
+                    Err(_) => { log("[wardrobeforget] CName inválido (espera hex, ex: 8548a2140bb48d1c)"); return; }
+                };
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[wardrobeforget] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[wardrobeforget] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            if game_ptr == 0 { log("[wardrobeforget] GetGame()=0"); return; }
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetWardrobeSystem") {
+                                None => log("[wardrobeforget] GetWardrobeSystem não achado"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[wardrobeforget] GetWardrobeSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        if sys_ptr == 0 { log("[wardrobeforget] WardrobeSystem=0"); return; }
+                                        let ok = crate::selftest::wardrobe_forget_item(sys_ptr as *mut u8, target_cname);
+                                        log(&format!("[wardrobeforget] CName={target_cname:#018x} removido={ok}"));
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // Codeware `WardrobeSystem.ForgetItemID` (item #46/#208, 2026-08-11, 3ª rodada de
+        // candidatos baratos) — mesma cadeia GetGame/GetWardrobeSystem de `wardrobeforget` acima,
+        // mas remove por TDBID (scan-linear por `ItemID.tdbid`, ver
+        // `selftest::wardrobe_forget_by_tdbid`) em vez de CName exato — não precisa saber a
+        // CHAVE (appearanceName) de antemão, só o TweakDBID do item. Devolve a CONTAGEM removida
+        // (pode ser >1 se o mesmo tdbid tiver mais de uma entrada, mesma semântica da fonte real).
+        ["wardrobeforgettdbid", tdbid_hex] => {
+            unsafe {
+                let target_tdbid: u64 = match u64::from_str_radix(tdbid_hex.trim_start_matches("0x"), 16) {
+                    Ok(v) => v,
+                    Err(_) => { log("[wardrobeforgettdbid] TweakDBID inválido (espera hex, ex: 2c00011165)"); return; }
+                };
+                match crate::rtti::resolve_func(reg, "PlayerPuppet", "GetGame") {
+                    None => log("[wardrobeforgettdbid] PlayerPuppet.GetGame não resolvido"),
+                    Some(rf) => match crate::rtti::call_func(&rf, player, &[]) {
+                        None => log("[wardrobeforgettdbid] GetGame() não completou"),
+                        Some(r) => {
+                            let game_ptr = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                            if game_ptr == 0 { log("[wardrobeforgettdbid] GetGame()=0"); return; }
+                            let mut game_arg = [0u8; 16];
+                            game_arg[..8].copy_from_slice(&game_ptr.to_le_bytes());
+                            match crate::rtti::resolve_any(reg, &["ScriptGameInstance", "GameInstance", "gameScriptGameInstance"], "GetWardrobeSystem") {
+                                None => log("[wardrobeforgettdbid] GetWardrobeSystem não achado"),
+                                Some(rf2) => match crate::rtti::call_func(&rf2, player, &[crate::rtti::Arg::Raw(game_arg)]) {
+                                    None => log("[wardrobeforgettdbid] GetWardrobeSystem() não completou"),
+                                    Some(r2) => {
+                                        let sys_ptr = u64::from_le_bytes([r2[0],r2[1],r2[2],r2[3],r2[4],r2[5],r2[6],r2[7]]);
+                                        if sys_ptr == 0 { log("[wardrobeforgettdbid] WardrobeSystem=0"); return; }
+                                        let removed = crate::selftest::wardrobe_forget_by_tdbid(sys_ptr as *mut u8, target_tdbid);
+                                        log(&format!("[wardrobeforgettdbid] TDBID={target_tdbid:#018x} removidos={removed}"));
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        // `axl-customization-apply`: usa o ptr salvo por getcustsys/CharCustomA probe para
+        // inspecionar e chamar métodos do gameuiCharacterCustomizationSystem.
+        // custsys probe → loga ptr + valida via class_of
+        // custsys call <method> → callon <ptr_salvo> <method> via RTTI
+        ["custsys", action @ ..] => {
+            unsafe {
+                let ptr = crate::selftest::CHAR_CUSTOM_SYS_PTR.load(std::sync::atomic::Ordering::Relaxed);
+                if ptr == 0 {
+                    log("[custsys] ptr não capturado — use getcustsys primeiro");
+                    return;
+                }
+                log(&format!("[custsys] ptr={ptr:#018x} action={}", action.join(" ")));
+                let obj = ptr as *mut std::ffi::c_void;
+                match action {
+                    ["probe"] | [] => {
+                        let cls = crate::rtti::class_of(obj);
+                        log(&format!("[custsys] probe cls={cls:p} valid={}",
+                            !cls.is_null()));
+                    }
+                    ["call", method, raw_args @ ..] => {
+                        let cls = crate::rtti::class_of(obj);
+                        if cls.is_null() {
+                            log(&format!("[custsys] ptr={ptr:#018x} não é objeto RED válido"));
+                            return;
+                        }
+                        // axl-puppet-state-apply (2026-08-03, /goal): suporte a "player" como arg —
+                        // passa o handle real do player capturado (Arg::Handle, mesmo padrão de
+                        // `give`/console.rs), pra chamar métodos como `HasCharacterCustomizationComponent
+                        // (entity: ref<Entity>)` que precisam de um handle de verdade, não um enum/int.
+                        let args: Vec<crate::rtti::Arg> = raw_args.iter().map(|a| {
+                            if *a == "player" && !player.is_null() {
+                                crate::rtti::Arg::Handle(player, crate::console::refcnt())
+                            } else {
+                                parse_cmd_arg(a)
+                            }
+                        }).collect();
+                        match crate::rtti::resolve_in_class(cls, method) {
+                            Some(rf) => match crate::rtti::call_func(&rf, obj, &args) {
+                                Some(r) => {
+                                    let f = |i: usize| f32::from_bits(u32::from_le_bytes([r[i], r[i+1], r[i+2], r[i+3]]));
+                                    log(&format!("[custsys] {method}({}) -> i32 {} / u32 {:#x} / f32 {}",
+                                        raw_args.join(" "),
+                                        i32::from_le_bytes([r[0], r[1], r[2], r[3]]),
+                                        u32::from_le_bytes([r[0], r[1], r[2], r[3]]),
+                                        f(0)));
+                                    // axl-47/66 (2026-08-18): decodifica também como possível
+                                    // DynArray<T> sret {entries(ptr)@0x00, cap(u32)@0x08, size(u32)@0x0C}
+                                    // — layout já batalha-testado em todo o resto do projeto (rtti.rs).
+                                    // GetHeadOptions()/etc. devolvem array<T>, não escalar; útil pra ler
+                                    // ArraySize sem precisar de comando novo dedicado.
+                                    let entries = u64::from_le_bytes([r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]]);
+                                    let cap = u32::from_le_bytes([r[8],r[9],r[10],r[11]]);
+                                    let size = u32::from_le_bytes([r[12],r[13],r[14],r[15]]);
+                                    log(&format!("[custsys] {method}(...) como DynArray sret: entries={entries:#018x} cap={cap} size={size}"));
+                                }
+                                None => log(&format!("[custsys] {method}({}) → void/falha", raw_args.join(" "))),
+                            },
+                            None => log(&format!("[custsys] método '{method}' não achado na classe")),
+                        }
+                    }
+                    _ => log("[custsys] uso: custsys probe | custsys call <method> [args]"),
+                }
+            }
             return;
         }
         // TweakXL SetFlat runtime: getflat <nome> (read-only, dumpa o FlatValue vivo);
@@ -2910,6 +7987,224 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // de uma arma) de um record vivo, read-only. Ver tweakdb_rt::probe_array_flat.
         ["getarr", name] => {
             unsafe { crate::tweakdb_rt::probe_array_flat(name) };
+            return;
+        }
+        // `axl-resource-patch-apply` (2026-07-24): postloadprobe constrói uma instância REAL de
+        // EntityTemplate/AppearanceResource/CMesh/MorphTargetMesh (rtti::new_object) e lê o slot
+        // PostLoad (+0x30) da vtable própria do objeto — resolve os 4 endereços sem RE estática.
+        // Read-only após construir (não chama PostLoad). Rodar no MENU (sem save aberto).
+        ["postloadprobe"] => {
+            unsafe { crate::selftest::probe_postload_addresses() };
+            return;
+        }
+        // Codeware `#58` (`ISerializable.ProcessPostLoad`/`RefreshResource`): `postloadprobe`
+        // acima só LÊ o endereço do slot PostLoad (+0x30), nunca chama. Este comando vai além:
+        // constrói uma instância fresca/descartável (mesmo `new_object`, mesma classe já usada
+        // com segurança por `postloadprobe` há sessões) e CHAMA `ProcessPostLoad` de verdade
+        // (o mesmo código-path exposto ao redscript via `BwmsProcessPostLoad`), dumpando bytes
+        // antes/depois pra confirmar mutação real, não só "não crashou". Ex.: `postloadcall CMesh`.
+        ["postloadcall", cls] => {
+            unsafe { crate::selftest::postload_call_probe(cls) };
+            return;
+        }
+        // RED4ext.SDK #81-85 (`PENDENCIAS-UNIFICADAS.md`): cluster de mapeamento nome-nativo↔
+        // nome-script do IRTTISystem (vtbl 0x100/0x108/0x110/0x118/0x120). Read-only exceto o
+        // passo 4 (RegisterScriptName sobre a classe forjada "TweakXL", nunca vanilla).
+        ["scriptnameprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_script_name_mapping(&reg) };
+            } else {
+                log("[rttiname] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #57/#58/#60/#61/#62/#63/#64: cluster de introspecção RTTI em massa
+        // (GetNativeTypes/GetGlobalFunctions/GetClassFunctions/GetEnums/GetBitfields/GetClasses/
+        // GetDerivedClasses). Só CONTA — read-only.
+        ["rttimassprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_mass_enumeration(&reg) };
+            } else {
+                log("[rttimass] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #68 (UnregisterType): cria+desregistra um enum de TESTE descartável,
+        // autocontido — não toca em nada vanilla nem forjado por outro código.
+        ["unregtypeprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_unregister_type(&reg) };
+            } else {
+                log("[rttiunreg] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #68 — versão COMPLETA (2026-08-11, disassembly ARM64 achou a causa raiz:
+        // UnregisterType nativo só limpa `typesByAsyncId`@+0x40, nunca `types`@+0x10, a estrutura
+        // que GetClass/GetEnum checam PRIMEIRO). `unregtypeprobe2` roda o mesmo teste autocontido
+        // mas via `unregister_type_complete` (nativo + fastpath manual), num enum de teste
+        // SEPARADO (`BwmsUnregisterTestEnum2`) pra não colidir com `unregtypeprobe`.
+        ["unregtypeprobe2"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_unregister_type_complete(&reg) };
+            } else {
+                log("[rttiunregfix] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #70 (UnregisterFunction): registra+desregistra uma global de TESTE
+        // descartável, mesmo padrão autocontido de unregtypeprobe.
+        ["unregfnprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_unregister_function(&reg) };
+            } else {
+                log("[rttiunregfn] Registry indisponível");
+            }
+            return;
+        }
+        // `CBitfield` (12 métodos, PENDENCIAS-UNIFICADAS.md): lista os bits nomeados de um
+        // bitfield já resolvido (vanilla ou forjado via bitfieldprobe).
+        ["bitfielddump", name] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_bitfield_dump(&reg, name) };
+            } else {
+                log("[bitfielddump] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #79 (CreateScriptedBitfield): via oficial, irmã de CreateScriptedEnum.
+        ["bitfieldprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_create_scripted_bitfield(&reg) };
+            } else {
+                log("[rttibitfield] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #73/#74 (AddRegisterCallback/AddPostRegisterCallback): registra callback
+        // void() nosso via Callback<void(*)()> construído à mão. `regcallbackstatus` consulta
+        // depois se disparou (pode não disparar nunca — fase de registro do RTTI já passou faz
+        // tempo quando um plugin carrega tão tarde quanto o BWMS; ver nota em rtti.rs).
+        ["regcallbackprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_register_callbacks(&reg) };
+            } else {
+                log("[rttiregcb] Registry indisponível");
+            }
+            return;
+        }
+        ["regcallbackstatus"] => {
+            crate::rtti::probe_register_callback_status();
+            return;
+        }
+        // Codeware item #50 (Reflection.GetClasses/GetEnums/GetBitfields — universo filtrado por
+        // categoria, composição de get_native_types+type_kind, já provados).
+        ["reflenum", kind] => {
+            unsafe { crate::rtti::probe_count_and_list_by_kind(reg, kind, 10) };
+            return;
+        }
+        ["reflenum", kind, n] => {
+            let n: usize = n.parse().unwrap_or(10).min(100);
+            unsafe { crate::rtti::probe_count_and_list_by_kind(reg, kind, n) };
+            return;
+        }
+        // Codeware item #50 (Reflection.GetDerivedClasses — via get_derived_classes já provado,
+        // evita a anomalia de GetClasses/#63).
+        ["reflderived", base] => {
+            unsafe { crate::rtti::probe_reflect_derived(reg, base) };
+            return;
+        }
+        // CET item #44 (DumpVTablesTask, RASCUNHO — ver vtabledump.rs): fatia BOUNDED do
+        // universo RTTI, construindo instâncias reais e lendo o ponteiro de vtable. Gated
+        // internamente atrás de dev_mode(). `count` sempre limitado (nunca o universo inteiro
+        // numa chamada só) — ver doc-comment do módulo pro porquê.
+        ["vtabledump", start, count] => {
+            let start: usize = start.parse().unwrap_or(0);
+            let count: usize = count.parse().unwrap_or(50).min(500);
+            unsafe { crate::vtabledump::probe_vtabledump(reg, start, count) };
+            return;
+        }
+        // Codeware `#176` (2026-08-19 tarde/noite): constrói 1 instância NOMEADA (mesmo perfil
+        // de risco de `newobj`, endurecido com filtro isAbstract) e dumpa os slots do vtable
+        // dela como vmaddr estático, flagando os 2 candidatos já catalogados
+        // (0x1049b1c64/0x1049bded0). Ver vtabledump.rs::probe_vtslots.
+        ["vtslots", class_name, count] => {
+            let count: usize = count.parse().unwrap_or(48).min(200);
+            unsafe { crate::vtabledump::probe_vtslots(reg, class_name, count) };
+            return;
+        }
+        // RED4ext.SDK #63 (GetClasses anomalia, cont.134): testa GetClasses/GetDerivedClasses
+        // com âncoras MENORES (classe folha) pra ver se a anomalia (universo inteiro em vez de
+        // filtrar por ancestralidade) é específica de IScriptable ou geral.
+        ["getclassesanomprobe"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_getclasses_anomaly(&reg) };
+            } else {
+                log("[rttiganom] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #63 (2026-08-11): compara os PONTEIROS (endereços) dos slots 0x40
+        // (GetNativeTypes) vs 0x70 (GetClasses) — testa a hipótese de ICF (Identical Code
+        // Folding) do compilador colapsando os 2 métodos na MESMA função, o que explicaria a
+        // anomalia sem culpa da nossa marshalling. Read-only, nunca chama através do ponteiro.
+        ["getclassesvtid"] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_getclasses_vtable_identity(&reg) };
+            } else {
+                log("[rttiganom2] Registry indisponível");
+            }
+            return;
+        }
+        // RED4ext.SDK #63 (2026-08-11, sessão de disassembly ARM64 real via rttislot+Capstone):
+        // disassembly manual do corpo inteiro de GetClasses/GetDerivedClasses/GetNativeTypes
+        // achou a causa raiz — BWMS lê `buf[8..12]` (capacity do DynArray) em vez de `buf[12..16]`
+        // (size real). Pra GetClasses (que pré-reserva capacity pro universo INTEIRO antes do
+        // filtro de ancestralidade rodar), isso faz o "count" reportado ser sempre o universo,
+        // mascarando o filtro real (que a RE confirma existir e funcionar via
+        // `IsKindOf@0x10219ac60`). `getclassessize <nome_classe_ancora>` chama os 3 métodos e
+        // loga capacity E size lado a lado pra confirmar antes de aplicar o fix.
+        ["getclassessize", anchor] => {
+            if let Some(reg) = unsafe { crate::rtti::Registry::obtain() } {
+                unsafe { crate::rtti::probe_getclasses_capacity_vs_size(&reg, anchor) };
+            } else {
+                log("[rttisize] Registry indisponível");
+            }
+            return;
+        }
+        // `rttislot <hex_off>` — irmão GENÉRICO de `crttivtbl` (que só cobre 4 offsets fixos):
+        // lê o ponteiro CRU do slot `off` da vtable do IRTTISystem (nunca chama através dele) +
+        // computa o vmaddr ESTÁTICO (mesma fórmula de `crttivtbl`). Usado pra alimentar `vtdump`
+        // em qualquer offset novo sem precisar de um comando dedicado por item — ex. investigação
+        // de disassembly do #63 (`GetClasses`@0x70)/#68 (`UnregisterType`@0x98).
+        ["rttislot", off_hex] => {
+            let off = usize::from_str_radix(off_hex.trim_start_matches("0x"), 16).unwrap_or(usize::MAX);
+            if off == usize::MAX {
+                return log("[rttislot] uso: rttislot <hex_off> (ex.: rttislot 98)");
+            }
+            unsafe {
+                match crate::rtti::Registry::obtain() {
+                    None => log("[rttislot] Registry::obtain() falhou"),
+                    Some(reg) => {
+                        let fp = reg.vtbl_slot(off) as usize;
+                        if fp == 0 {
+                            return log(&format!("[rttislot] +{off:#x} ilegível/null"));
+                        }
+                        let base = crate::game_base();
+                        let vmaddr = if fp > base { fp - base + 0x1_0000_0000 } else { fp };
+                        log(&format!("[rttislot] +{off:#x} rt={fp:#x} vmaddr={vmaddr:#010x}"));
+                    }
+                }
+            }
+            return;
+        }
+        // `axl-resource-patch-apply` (2026-07-25): instala hooks observe-only em CMesh::PostLoad
+        // (0x100e16b28) + MorphTargetMesh::PostLoad (0x100e467bc). Log primeiros 8 calls de cada
+        // tipo com this + campos +0x08..+0x38. Objetivo: RE de layout do CResource (onde fica o
+        // resource-path hash) + confirmar que os vmaddrs são realmente PostLoad. Após instalar,
+        // esperar meshes carregarem em gameplay (rodar "reslinkdump" pra comparar hashes).
+        ["postload-hook"] => {
+            unsafe { crate::selftest::install_postload_hooks() };
             return;
         }
         ["setflat", name, val] => {
@@ -2932,6 +8227,28 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // Elementos = nomes TweakDBID (ou 0xhex cru). Gated .bwms-flatwrite.
         ["mkarr", field, donor, list] => {
             unsafe { crate::tweakdb_rt::mkarr_cmd(field, donor, list) };
+            return;
+        }
+        // TweakXL #30 (`!remove-all`): rmall <field> — limpa o array INTEIRO (não recebe valor,
+        // distinto de `!remove`). Gated ~/.bwms-flatwrite (mesma trava de `mkarr`/`mkflat`).
+        ["rmall", field] => {
+            let on = std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::Path::new(&h).join(".bwms-flatwrite").exists())
+                .unwrap_or(false);
+            if !on {
+                log("[rmall] BLOQUEADO: crie ~/.bwms-flatwrite p/ habilitar");
+                return;
+            }
+            let id = crate::tweakdb_rt::tweak_db_id(field);
+            let ok = match unsafe { crate::tweakdb_rt::singleton() } {
+                Some(t) => unsafe { crate::tweakdb_rt::array_remove_all_by_id(t, id) },
+                None => {
+                    log("[rmall] singleton indisponível");
+                    return;
+                }
+            };
+            log(&format!("[rmall] '{field}' -> {ok}"));
             return;
         }
         // `tweakxl-batch-commit`: batchset <f1>=<hex1> <f2>=<hex2> ... — aplica N sets escalares
@@ -3250,6 +8567,17 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             }
             return;
         }
+        // Codeware `#120` (captura DINÂMICA de LR em InkSystem::Get()): traz a janela do jogo pra
+        // FRENTE via `[NSApp activateIgnoringOtherApps:YES]` (mesma receita/permissão de
+        // `presskey`/`mousedelta` — DENTRO do processo do jogo, não externo). Lição já documentada
+        // (2026-08-11, `cw-45-getinventorypuppet`): `presskey` sem foco de janela é NO-OP silencioso
+        // (o `CGEventPost` GLOBAL só é postado quando `game_is_frontmost()==true`) — chamar ISTO
+        // antes de qualquer `presskey` nesta investigação evita repetir esse bug.
+        ["focusgame"] => {
+            unsafe { overlay::force_game_frontmost() };
+            log("[focusgame] force_game_frontmost() chamado");
+            return;
+        }
         // `cet-lut-pixel-proof`: seta o preset de LUT por comando (sem depender de F2/clique
         // ImGui) — `lut 0` (off) / `lut 3` (P&B) / etc. Mesmo write atômico do clique na aba "LUT".
         ["lut", n] => {
@@ -3264,11 +8592,45 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         // assim que o menu é alcançado — não sobrevive até depois do registro do callback de
         // teste). Só existe com `--features autoproceed` (dev); build público não importa
         // CGEventPost/CreateKeyboardEvent. `presskey 49` = SPACE.
+        //
+        // NÃO MIGRADO pro canal do heartbeat (2026-08-14, decisão desta rodada — ao contrário
+        // de `inkgetbaseline`/`inkgetpost`/`checkresbaseline`/`checkrespost`, que SÃO leitura
+        // pura e já rodam também na thread do heartbeat, ver `lib.rs` ~526/~548): `cg_press`
+        // (mesmo sendo "thread-safe" no sentido de não tocar RTTI/VM do jogo, ver comentário em
+        // `overlay.rs`) INJETA um evento de input REAL — mutação com efeito genuíno no jogo
+        // vivo, categoria de risco diferente de um drain de ring-buffer. Rodar via heartbeat
+        // (a) perderia o gate `PHASE_REACHED_5 && !exec_nested()` deste canal — o jogo poderia
+        // não estar pronto pra receber input com segurança ainda; (b) chamaria
+        // `CGEventSourceCreate`/`CGEventPost` (e `focusgame`/`force_game_frontmost` chamaria
+        // `NSApplication.activateIgnoringOtherApps:`) de uma thread Rust própria cuja relação com
+        // a main-thread AppKit do processo nunca foi verificada — AppKit não garante
+        // thread-safety fora da main thread, risco novo nunca testado neste projeto. Mesma
+        // categoria de cautela já aplicada ao `checkreshook` (patch de código executável também
+        // ficou de fora da migração). `presskey`/`focusgame`/`mousedelta`/`mouseclick` continuam
+        // só no canal do executor (game thread).
         #[cfg(feature = "autoproceed")]
         ["presskey", kc] => {
             let keycode = kc.parse::<u16>().unwrap_or(49);
             unsafe { overlay::cg_press(keycode) };
             log(&format!("[presskey] disparado keyDown+keyUp sintético, keycode={keycode}"));
+            return;
+        }
+        // `keydown`/`keyup` — metades ISOLADAS de `presskey` (ver `overlay::cg_key_event`),
+        // pra permitir HOLD sustentado (ex. andar pra frente) controlado por um processo
+        // EXTERNO (bridge de IA por visão) via 2 comandos + sleep do lado de FORA, sem bloquear
+        // a thread do jogo. `automacao-mundo` (2026-08-17).
+        #[cfg(feature = "autoproceed")]
+        ["keydown", kc] => {
+            let keycode = kc.parse::<u16>().unwrap_or(49);
+            unsafe { overlay::cg_key_event(keycode, true) };
+            log(&format!("[keydown] disparado, keycode={keycode}"));
+            return;
+        }
+        #[cfg(feature = "autoproceed")]
+        ["keyup", kc] => {
+            let keycode = kc.parse::<u16>().unwrap_or(49);
+            unsafe { overlay::cg_key_event(keycode, false) };
+            log(&format!("[keyup] disparado, keycode={keycode}"));
             return;
         }
         // `cw-real-mod-e2e`/`axl-link-visual-proof` (2026-07-19): navegação de menu por MOUSE via
@@ -3290,6 +8652,56 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             log("[mouseclick] disparado mouseDown+mouseUp");
             return;
         }
+        // `CallbackLifetime.Session` (2026-08-11): dispara "Session/End" manualmente (mesmo
+        // GameSessionEvent real que o despawn de player já usa em lib.rs) — testa o sweep sem
+        // precisar navegar até o menu de verdade. Diagnóstico dev-only, seguro (mesma função já
+        // provada 2x em produção: despawn + clean-exit).
+        ["firesessionend"] => {
+            let n = if let Some(arg) = unsafe { register::make_gamesessionevent_arg(false, true) } {
+                unsafe { register::fire_event_args("Session/End", &[arg]) }
+            } else {
+                0
+            };
+            log(&format!("[firesessionend] Session/End disparado manualmente -> {n} callback(s)"));
+            return;
+        }
+        // CET `FunctionOverride` (não-Lua, `fnoverride.rs`, 2026-08-11): registra Before+After
+        // no método de teste `PlayerPuppet.OnFnOverrideTestTarget` (declarado no .reds de teste
+        // temporário). Rodar `callon <ptr> OnFnOverrideTestTarget` antes e depois pra comparar.
+        ["fnoverridetest"] => {
+            let ok = unsafe {
+                crate::fnoverride::register(
+                    reg,
+                    "PlayerPuppet",
+                    "OnFnOverrideTestTarget",
+                    crate::fnoverride::Phase::Before,
+                    fnoverride_test_before,
+                ) && crate::fnoverride::register(
+                    reg,
+                    "PlayerPuppet",
+                    "OnFnOverrideTestTarget",
+                    crate::fnoverride::Phase::After,
+                    fnoverride_test_after,
+                )
+            };
+            log(&format!("[fnoverridetest] registro Before+After -> {ok}"));
+            return;
+        }
+        // Adiciona um Replace por cima do Before/After já registrado — só o ÚLTIMO Replace
+        // registrado roda (regra V1 documentada em fnoverride.rs), escreve 999 no aOut.
+        ["fnoverridereplace"] => {
+            let ok = unsafe {
+                crate::fnoverride::register(
+                    reg,
+                    "PlayerPuppet",
+                    "OnFnOverrideTestTarget",
+                    crate::fnoverride::Phase::Replace,
+                    fnoverride_test_replace,
+                )
+            };
+            log(&format!("[fnoverridereplace] registro Replace -> {ok}"));
+            return;
+        }
         // smoke-test do Pilar 2 (CNamePool::Get): resolve um hash CName -> nome via pool
         // NATIVO. `cname 0x23427ae352f89652` deve dar "GetStatValue"; `cname 0` -> "None".
         ["cname", h] => {
@@ -3302,6 +8714,23 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             log(&format!("[cname] {hash:#018x} -> '{name}'"));
             return;
         }
+        // RED4ext.SDK #43 (`CompareSemVerPrerelease`): prova ao vivo do C-ABI v14 exposto em
+        // BwmsApi (mesma via que um plugin de 3os chamaria) + do Require() real dos 3 enablers.
+        // `semvercmp 1.2.3-rc1 1.2.3` deve dar cmp=-1 (release > pre-release, o bug original).
+        ["semvercmp", lhs, rhs] => {
+            let cmp = unsafe { (crate::api::BWMS_API.compare_semver_prerelease)(
+                std::ffi::CString::new(*lhs).unwrap_or_default().as_ptr(),
+                std::ffi::CString::new(*rhs).unwrap_or_default().as_ptr(),
+            ) };
+            let sat = unsafe { (crate::api::BWMS_API.semver_satisfies)(
+                std::ffi::CString::new(*rhs).unwrap_or_default().as_ptr(),
+                std::ffi::CString::new(*lhs).unwrap_or_default().as_ptr(),
+            ) };
+            log(&format!(
+                "[semvercmp] compare_semver_prerelease('{lhs}','{rhs}')={cmp} | semver_satisfies(required='{rhs}',actual='{lhs}')={sat}"
+            ));
+            return;
+        }
         ["newobj", class] => {
             log(&format!("[newobj] tentando construir '{class}' ..."));
             let p = unsafe { crate::rtti::new_object(reg, class) };
@@ -3311,6 +8740,24 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 un_rebase(p),
                 if p.is_null() { "NULL (resolve/size falhou, sem crash)" } else { "OK (nao crashou)" }
             ));
+            return;
+        }
+        // cw-reflection-class-api proof: Reflection.GetClass + probe de props sem file gate
+        ["refltest"] => {
+            unsafe {
+                let cls = crate::rtti::class_of(player);
+                log(&crate::rtti::reflection_probe_cls(cls, "refltest:player-class", player));
+            }
+            return;
+        }
+        // cw-event-target-classes proof: KeyInputEvent.GetKey/GetAction round-trip
+        ["keytest"] => {
+            unsafe { register::run_keyinput_test(&reg); }
+            return;
+        }
+        // cw-entity-builder proof: BwmsEntityAddComponent via dynarray_push_handle16
+        ["entitytest"] => {
+            unsafe { register::run_entity_builder_test(player); }
             return;
         }
         _ => {}
@@ -3332,6 +8779,16 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             ["give", name, n] => console::give(reg, player, tx, name, n.parse().unwrap_or(1)),
             ["remove", name] => console::remove(reg, player, tx, name, 1),
             ["remove", name, n] => console::remove(reg, player, tx, name, n.parse().unwrap_or(1)),
+            // `cw-world-depot` (2026-07-24): `spawnsub <tdbid-or-path> [x y z]` — atalho pragmático
+            // via `CompanionSystem.SpawnSubcharacterOnPosition` real (ver `console::spawn_subcharacter`).
+            // Não testado em boot ainda.
+            ["spawnsub", name] => console::spawn_subcharacter(reg, player, name, (0.0, 0.0, 0.0)),
+            ["spawnsub", name, x, y, z] => console::spawn_subcharacter(
+                reg,
+                player,
+                name,
+                (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0), z.parse().unwrap_or(0.0)),
+            ),
             _ => {
                 // CET-style: o console É um REPL Lua. Comando não-reconhecido roda
                 // como Lua — digitar `Game.AddMoney(7777)` direto funciona, igual CET.
@@ -3640,4 +9097,34 @@ fn read_inst() -> (*mut c_void, *mut c_void) {
         }
     }
     (p, t)
+}
+
+#[cfg(test)]
+mod null_vtable_guard_tests {
+    use super::null_vtable_is_anomalous;
+
+    // O caso que a assinatura de crash desta sessão descreve: objeto polimórfico com o ponteiro
+    // de vtable zerado. Qualquer despacho virtual nele lê `[0 + slot]` e falta no offset do slot.
+    #[test]
+    fn objeto_polimorfico_com_vtable_zerada_e_anomalia() {
+        assert!(null_vtable_is_anomalous(true, 0));
+    }
+
+    #[test]
+    fn objeto_polimorfico_com_vtable_valida_nao_e_anomalia() {
+        assert!(!null_vtable_is_anomalous(true, 0x1_0472_d218));
+    }
+
+    // A razão de a checagem NÃO poder ser um `*obj == 0` cego: num struct puro o offset 0 é dado.
+    // `Vector4 { x: 0.0, .. }` tem a primeira word zerada e é perfeitamente válido — acusá-lo
+    // encheria o log de falso-positivo em cima do caminho mais comum de construção de struct.
+    #[test]
+    fn struct_puro_com_primeira_word_zerada_nao_e_anomalia() {
+        assert!(!null_vtable_is_anomalous(false, 0));
+    }
+
+    #[test]
+    fn struct_puro_com_primeira_word_nao_zerada_tambem_nao_e_anomalia() {
+        assert!(!null_vtable_is_anomalous(false, 0x3f80_0000));
+    }
 }

@@ -22,6 +22,13 @@ native func BwmsConfigSet(key: String, value: String) -> Bool;
 public abstract class BWMSCheatHandler {
   public func BWMSOnToggle(pp: ref<PlayerPuppet>, game: GameInstance) -> Void {}
   public func BWMSOnQuery(pp: ref<PlayerPuppet>, game: GameInstance) -> Bool { return false; }
+  // 2026-08-05 (achado de auditoria): kind=2 (setas ±) só funcionava pros 16 cheats internos
+  // (id+switch fixo em BWMSDoAction) — um mod de 3o só conseguia registrar toggle/ação (kind
+  // 0/1). Widget mais rico pro contrato: BWMSOnArrow dispara a cada clique de seta (forward=
+  // direita/soma), BWMSArrowValue devolve o texto exibido (ex. "Nv 5", "+10"). Default no-op —
+  // zero quebra pra handler existente que só implementa Toggle/Query.
+  public func BWMSOnArrow(pp: ref<PlayerPuppet>, game: GameInstance, forward: Bool) -> Void {}
+  public func BWMSArrowValue(pp: ref<PlayerPuppet>, game: GameInstance) -> String { return ""; }
 }
 
 @addField(SettingsSelectorControllerBool) let m_bwmsGame: GameInstance;
@@ -31,6 +38,13 @@ public abstract class BWMSCheatHandler {
 @addField(SettingsSelectorControllerInt) let m_bwmsMin: Int32;
 @addField(SettingsSelectorControllerInt) let m_bwmsMax: Int32;
 @addField(SettingsSelectorControllerInt) let m_bwmsStep: Int32;
+// 2026-08-06: kind=4 (slider Int, valor exato) — completa o framework BWMSSetupInt/BWMSPaintInt
+// (já existia, nunca tinha sido ligado a um cheat real nem ao dispatcher `BWMSCheat`). Rastreia o
+// valor ANTES do ajuste pra computar o delta certo no commit (GiveItem/RemoveItem trabalham por
+// delta, não por valor absoluto).
+@addField(SettingsSelectorControllerInt) let m_bwmsIntCheat: Int32;
+@addField(SettingsSelectorControllerInt) let m_bwmsIntGame: GameInstance;
+@addField(SettingsSelectorControllerInt) let m_bwmsIntOld: Int32;
 @addField(SettingsSelectorControllerFloat) let m_bwmsMinF: Float;
 @addField(SettingsSelectorControllerFloat) let m_bwmsMaxF: Float;
 @addField(SettingsSelectorControllerFloat) let m_bwmsStepF: Float;
@@ -40,6 +54,8 @@ public abstract class BWMSCheatHandler {
 @addField(SettingsSelectorControllerListString) let m_bwmsActGame: GameInstance;
 @addField(SettingsSelectorControllerListString) let m_bwmsNet: Int32;
 @addField(SettingsSelectorControllerListString) let m_bwmsBoot: Bool;
+// kind=2 (setas ±) pra handler de 3o — ver BWMSCheatHandler.BWMSOnArrow/BWMSArrowValue.
+@addField(SettingsSelectorControllerListString) let m_bwmsArrowHandler: ref<BWMSCheatHandler>;
 
 // estado de cheat persistido no proprio jogador (sobrevive a reabrir a aba; NAO vai pro save = runtime-only)
 @addField(PlayerPuppet) let m_bwmsCarry: ref<gameStatModifierData>;
@@ -116,7 +132,8 @@ private final func BWMSDef(label: String, id: Int32, opt kind: Int32) -> BWMSChe
 }
 // PONTO DE EXTENSÃO p/ 3os DE VERDADE (contrato único, sem @wrapMethod em BWMSRun/BWMSIsOn):
 // 1 ArrayPush(this.BWMSCheats(), this.BWMSDefH(label, handlerInstance)) — kind 0=toggle,
-// 1=ação tiro-único (opt, default 0). `id` fica 0 (não usado — quem manda é o handler).
+// 1=ação tiro-único, 2=setas ± (2026-08-05: BWMSOnArrow/BWMSArrowValue no handler, mesmo widget
+// que os cheats internos usam). `id` fica 0 (não usado — quem manda é o handler).
 @addMethod(SettingsMainGameController)
 public final func BWMSDefH(label: String, handler: ref<BWMSCheatHandler>, opt kind: Int32) -> BWMSCheatDef {
   let d: BWMSCheatDef;
@@ -148,6 +165,8 @@ public func BWMSCheats() -> array<BWMSCheatDef> {
   ArrayPush(c, this.BWMSDef(this.L("Summon vehicle", "Chamar veículo", "召唤载具"), 14, 1));
   ArrayPush(c, this.BWMSDef(this.L("Skip boot (next boot)", "Pular boot (próx. boot)", "跳过启动（下次启动）"), 15, 3));
   ArrayPush(c, this.BWMSDef(this.L("Full heal", "Curar (vida cheia)", "满血治疗"), 16, 1));
+  // kind=4: slider Int (valor exato, seed = quantia real via GetItemQuantity)
+  ArrayPush(c, this.BWMSDef(this.L("Eddies (exact value)", "Eddies (valor exato)", "欧元币（精确数值）"), 17, 4));
   return c;
 }
 
@@ -168,7 +187,19 @@ private final func BWMSCheat(label: String, cheatId: Int32, kind: Int32, game: G
     let cl: ref<SettingsSelectorControllerListString> =
       this.SpawnFromLocal(inkWidgetRef.Get(this.m_settingsOptionsList), n"settingsSelectorStringList")
           .GetController() as SettingsSelectorControllerListString;
-    if IsDefined(cl) { cl.BWMSSetupAction(label, cheatId, game); ArrayPush(this.m_settingsElements, cl); };
+    if IsDefined(cl) { cl.BWMSSetupAction(label, cheatId, game, handler); ArrayPush(this.m_settingsElements, cl); };
+    return;
+  };
+  if kind == 4 {
+    let pl: ref<GameObject> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject();
+    let cur: Int32 = 0;
+    if IsDefined(pl) {
+      cur = GameInstance.GetTransactionSystem(game).GetItemQuantity(pl, ItemID.FromTDBID(t"Items.money"));
+    };
+    let ci: ref<SettingsSelectorControllerInt> =
+      this.SpawnFromLocal(inkWidgetRef.Get(this.m_settingsOptionsList), n"settingsSelectorInt")
+          .GetController() as SettingsSelectorControllerInt;
+    if IsDefined(ci) { ci.BWMSSetupInt(label, 0, 999999999, 1000, cur, cheatId, game); ArrayPush(this.m_settingsElements, ci); };
     return;
   };
   let cb: ref<SettingsSelectorControllerBool> =
@@ -228,6 +259,7 @@ private final func PopulateCategorySettingsOptions(idx: Int32) -> Void {
 // cheatId: 1 GodMode 2 Carga 3 Dano 4 RAM 5 Slow 10 Invisível (kind 0 = toggle Bool)
 //        | 9 Veiculos 11 Zerar-procurado 12 Meio-dia 14 Chamar-veiculo (kind 1 = ação Bool)
 //        | 6 Eddies 7 Atrib 8 Perk 13 StreetCred (kind 2 = setas ± no ListString, BWMSDoAction)
+//        | 17 Eddies-valor-exato (kind 4 = slider Int, BWMSDoIntAction)
 @addMethod(SettingsSelectorControllerBool)
 public func BWMSPlayer() -> ref<GameObject> {
   return GameInstance.GetPlayerSystem(this.m_bwmsGame).GetLocalPlayerControlledGameObject();
@@ -365,9 +397,12 @@ private func AcceptValue(forward: Bool) -> Void {
 
 // ===== Int: slider (framework, p/ outros mods) =====
 @addMethod(SettingsSelectorControllerInt)
-public func BWMSSetupInt(label: String, mn: Int32, mx: Int32, step: Int32, cur: Int32) -> Void {
+public func BWMSSetupInt(label: String, mn: Int32, mx: Int32, step: Int32, cur: Int32, opt cheatId: Int32, opt game: GameInstance) -> Void {
   this.m_bwmsMin = mn; this.m_bwmsMax = mx; this.m_bwmsStep = step;
   this.m_newValue = cur;
+  this.m_bwmsIntCheat = cheatId;
+  this.m_bwmsIntGame = game;
+  this.m_bwmsIntOld = cur;
   inkTextRef.SetText(this.m_LabelText, label);
   this.m_sliderController = inkWidgetRef.GetControllerByType(this.m_sliderWidget, n"inkSliderController") as inkSliderController;
   if IsDefined(this.m_sliderController) {
@@ -382,11 +417,34 @@ public func BWMSPaintInt() -> Void {
   inkTextRef.SetText(this.m_ValueText, IntToString(this.m_newValue));
   if IsDefined(this.m_sliderController) { this.m_sliderController.ChangeValue(Cast<Float>(this.m_newValue)); };
 }
+// Aplica o valor do slider no COMMIT (solta a alça) — delta contra o valor antigo, porque
+// GiveItem/RemoveItem trabalham por quantidade a somar/tirar, não por valor absoluto.
+@addMethod(SettingsSelectorControllerInt)
+public func BWMSDoIntAction() -> Void {
+  if this.m_bwmsIntCheat == 0 { return; };
+  let delta: Int32 = this.m_newValue - this.m_bwmsIntOld;
+  if delta == 0 { return; };
+  let pp: ref<PlayerPuppet> =
+    GameInstance.GetPlayerSystem(this.m_bwmsIntGame).GetLocalPlayerControlledGameObject() as PlayerPuppet;
+  if !IsDefined(pp) { return; };
+  switch this.m_bwmsIntCheat {
+    case 17: // Eddies — valor exato
+      if delta > 0 {
+        GameInstance.GetTransactionSystem(this.m_bwmsIntGame).GiveItem(pp, ItemID.FromTDBID(t"Items.money"), delta);
+      } else {
+        GameInstance.GetTransactionSystem(this.m_bwmsIntGame).RemoveItem(pp, ItemID.FromTDBID(t"Items.money"), -delta);
+      };
+      break;
+  };
+  this.m_bwmsIntOld = this.m_newValue;
+}
 @wrapMethod(SettingsSelectorControllerInt)
 private func ChangeValue(forward: Bool) -> Void {
   if !IsDefined(this.m_SettingsEntry) {
     let step: Int32 = forward ? this.m_bwmsStep : -this.m_bwmsStep;
     this.m_newValue = Clamp(this.m_newValue + step, this.m_bwmsMin, this.m_bwmsMax);
+    // clique de seta = passo único, sem "soltar alça" — aplica na hora (mesmo padrão do kind=2)
+    this.BWMSDoIntAction();
     this.BWMSPaintInt();
   } else { wrappedMethod(forward); };
 }
@@ -400,7 +458,7 @@ public func Refresh() -> Void {
 }
 @wrapMethod(SettingsSelectorControllerInt)
 protected cb func OnHandleReleased() -> Bool {
-  if !IsDefined(this.m_SettingsEntry) { this.BWMSPaintInt(); return true; };
+  if !IsDefined(this.m_SettingsEntry) { this.BWMSDoIntAction(); this.BWMSPaintInt(); return true; };
   return wrappedMethod();
 }
 @wrapMethod(SettingsSelectorControllerInt)
@@ -497,10 +555,11 @@ public func BWMSApplyBoot() -> Void {
 // ===== StringList em modo AÇÃO (setas ±): seta direita soma, esquerda subtrai =====
 // (recuperado do bundle de 25/jun via decompile — a "forma de setas" da aba Cheats)
 @addMethod(SettingsSelectorControllerListString)
-public func BWMSSetupAction(label: String, actId: Int32, game: GameInstance) -> Void {
+public func BWMSSetupAction(label: String, actId: Int32, game: GameInstance, opt handler: ref<BWMSCheatHandler>) -> Void {
   this.m_bwmsAct = actId;
   this.m_bwmsActGame = game;
   this.m_bwmsNet = 0;
+  this.m_bwmsArrowHandler = handler;
   inkTextRef.SetText(this.m_LabelText, label);
   this.PopulateDots(0);
   this.BWMSPaintAction();
@@ -508,6 +567,13 @@ public func BWMSSetupAction(label: String, actId: Int32, game: GameInstance) -> 
 @addMethod(SettingsSelectorControllerListString)
 public func BWMSPaintAction() -> Void {
   let v: String = "";
+  if IsDefined(this.m_bwmsArrowHandler) {
+    let pp: ref<PlayerPuppet> =
+      GameInstance.GetPlayerSystem(this.m_bwmsActGame).GetLocalPlayerControlledGameObject() as PlayerPuppet;
+    if IsDefined(pp) { v = this.m_bwmsArrowHandler.BWMSArrowValue(pp, this.m_bwmsActGame); };
+    inkTextRef.SetText(this.m_ValueText, v);
+    return;
+  };
   if this.m_bwmsAct == 13 {
     let pp: ref<PlayerPuppet> =
       GameInstance.GetPlayerSystem(this.m_bwmsActGame).GetLocalPlayerControlledGameObject() as PlayerPuppet;
@@ -526,6 +592,11 @@ public func BWMSDoAction(forward: Bool) -> Void {
     GameInstance.GetPlayerSystem(this.m_bwmsActGame).GetLocalPlayerControlledGameObject() as PlayerPuppet;
   if !IsDefined(pp) { return; };
   let game: GameInstance = this.m_bwmsActGame;
+  if IsDefined(this.m_bwmsArrowHandler) {
+    this.m_bwmsArrowHandler.BWMSOnArrow(pp, game, forward);
+    this.BWMSPaintAction();
+    return;
+  };
   let sign: Int32 = forward ? 1 : -1;
   switch this.m_bwmsAct {
     case 6:

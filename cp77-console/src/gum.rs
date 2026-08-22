@@ -63,6 +63,45 @@ pub unsafe fn is_readable(address: *const c_void, len: usize) -> bool {
     kr == KERN_SUCCESS && outsz as usize >= n
 }
 
+/// Lê um bloco arbitrariamente maior (`buf.len()` bytes, sem o cap de 512 de `is_readable`) —
+/// pensado pra varreduras de memória (ex. `findcgameengine`) que precisam ler páginas inteiras
+/// SEM 1 syscall por qword. Devolve `false` (buffer intocado) se a página não é legível de
+/// verdade — nunca lê parcial silenciosamente.
+pub unsafe fn read_chunk(address: usize, buf: &mut [u8]) -> bool {
+    if address == 0 || buf.is_empty() {
+        return false;
+    }
+    let mut outsz: u64 = 0;
+    let kr = mach_vm_read_overwrite(mach_task_self_, address as u64, buf.len() as u64, buf.as_mut_ptr() as u64, &mut outsz);
+    kr == KERN_SUCCESS && outsz as usize >= buf.len()
+}
+
+/// Lê 8 bytes (LE) em `address` via syscall (nunca crasha em ponteiro inválido/desalinhado —
+/// mesma garantia de `is_readable`, mas devolve o VALOR em vez de só um bool). Pensado pra ler
+/// campo de struct C++ real (offset conhecido, ponteiro capturado num hook) sem risco de
+/// segfault mesmo que o objeto tenha sido liberado/realocado entre a captura e a leitura.
+pub unsafe fn read_u64(address: usize) -> Option<u64> {
+    if address == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    let mut outsz: u64 = 0;
+    let kr = mach_vm_read_overwrite(mach_task_self_, address as u64, 8, buf.as_mut_ptr() as u64, &mut outsz);
+    if kr == KERN_SUCCESS && outsz == 8 {
+        Some(u64::from_le_bytes(buf))
+    } else {
+        None
+    }
+}
+
+/// Allocate writable anonymous memory anywhere in the process (for devtools use).
+/// Returns null on failure. Memory is NOT tracked by the game's allocator.
+pub unsafe fn alloc_anywhere(bytes: usize) -> *mut u8 {
+    let mut addr: u64 = 0;
+    let kr = mach_vm_allocate(mach_task_self_, &mut addr, bytes as u64, VM_FLAGS_ANYWHERE);
+    if kr == KERN_SUCCESS && addr != 0 { addr as *mut u8 } else { std::ptr::null_mut() }
+}
+
 // salto absoluto de 64 bits (16 bytes): ldr x17,#8 ; br x17 ; .quad alvo
 // x17 (IP1) é scratch — clobber seguro na entrada da função.
 fn abs_jump(target: u64) -> [u8; 16] {

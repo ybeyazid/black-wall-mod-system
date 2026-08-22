@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 # TRACELESS: remapeia os prefixos de path do build (HOME + RAIZ do projeto) p/ que NENHUM caminho
-# real (/Users/<user>, /Volumes/.../mods-research) vaze no binário via metadata de panic/debug —
+# real (/Users/<user>, <raiz-do-repo>) vaze no binário via metadata de panic/debug —
 # inclusive das DEPS locais (bwms-hashes/bwms-core, que ficam FORA do $HOME). Dinâmico (sem hardcode
 # do path do dono). Sobrepõe qualquer CARGO_ENCODED_RUSTFLAGS do ambiente do chamador.
 ROOT="$(cd .. && pwd)"
@@ -21,6 +21,11 @@ cargo build --release "$@"
 D=target/release/libcp77_console.dylib
 codesign --remove-signature "$D" 2>/dev/null || true
 python3 fix-symtab-align.py "$D"
+# TRACELESS: o --remap-path-prefix acima só cobre debug-info/panic-paths, NÃO o LC_ID_DYLIB (o
+# linker grava o path absoluto de build ali por conta própria) — achado 2026-07-24, vazava o path
+# inteiro da máquina de dev em todo zip publicado sem o gate `strings`-based do pack-bwms.sh pegar
+# (strings -a não decodifica esse campo específico do Mach-O). Fix: forçar um ID limpo sempre.
+install_name_tool -id "libcp77_console.dylib" "$D"
 codesign -s - --force "$D"
 m=$(otool -l "$D" 2>/dev/null | awk '/cmd LC_SYMTAB/{x=1} x&&/stroff/{print ($2%8); exit}')
 echo "core: $D  (stroff mod8=$m — 0=loadable, $(nm "$D" 2>/dev/null | grep -ciE 'lua_|luaL_|lj_') símbolos lua)"

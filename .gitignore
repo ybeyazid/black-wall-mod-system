@@ -1,42 +1,15 @@
-# ── Privado: nunca publicar ──────────────────────────────────────────────
-_blackwall-backup*/
-*.dylib.working
-.blackwall_tweakdb.bin
-**/.blackwall_*
-_private/
-**/*.private
-
-# ── Tooling de dev (fluxo interno) ───────────────────────────────────────
-deploy.sh
-bwms-fastboot.sh
-
-# ── Build artifacts ──────────────────────────────────────────────────────
+# artefatos de build (cada crate é seu próprio workspace)
 target/
 **/target/
-dist/test-builds/
+Cargo.lock.orig
 
-# ── Dado derivado do jogo (copyright) ────────────────────────────────────
-**/*.kark
-**/tweakdb*.bin
-**/usedhashes.kark
+# macOS
+.DS_Store
+._*
+.AppleDouble
 
-# ── macOS ────────────────────────────────────────────────────────────────
-**/.DS_Store
-
-# ── Clones de terceiros (têm repo/licença próprios; o README diz como obter) ─
-RED4ext.SDK/
-RED4ext-macos/
-WolvenKit/
-ooz/
-redscript/
-cp2077-archive-xl/
-cp2077-tweak-xl/
-enablers/
-Kraken/
-luacheck/
-_competitor-ref/
-cp77-symbols/
-
-# ── Lixo de refactor/backup de dev (não deve ir pro público) ─────────────
-**/.moved-to-*/
-**/*.legacy-*
+# saída local do runtime
+*.dylib
+*.zip
+*.redscripts
+*.redscripts.*

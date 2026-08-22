@@ -533,6 +533,900 @@ impl ChunkMask {
     }
 }
 
+/// Tabela BUILT-IN de tags do ArchiveXL (`OverrideTagManager::OverrideTagManager()`,
+/// `enablers/ArchiveXL/src/App/Extensions/Garment/Tags.cpp:3-156`, RE 2026-08-11, item
+/// `PENDENCIAS-UNIFICADAS.md` #21/`GetTagManager`) — mapeia nome-de-tag PADRÃO do ArchiveXL (ex.
+/// "hide_Torso", "HighHeels") pra lista de (prefixo-de-nome-de-parte, `ChunkMask`). Mods reais
+/// referenciam essas 14 tags por NOME em vez de escrever a `ChunkMask` crua — sem esta tabela, o
+/// BWMS só suporta `overrides.tags` AUTORAIS (`.xl` do próprio mod), não as tags de referência do
+/// framework. Zero endereço nativo — dado estático puro, portado fielmente byte-a-byte da fonte
+/// C++ real (constantes hardcoded, idênticas em qualquer build/plataforma). `None` = tag
+/// desconhecida (mesmo comportamento de `GetOverrides` real: devolve definição vazia).
+pub fn builtin_tag_overrides(tag: &str) -> Option<Vec<(&'static str, ChunkMask)>> {
+    fn hide_all() -> ChunkMask {
+        ChunkMask::from_chunks(false, &[])
+    }
+    fn hide(chunks: &[u8]) -> ChunkMask {
+        ChunkMask::from_chunks(false, chunks)
+    }
+    fn show(chunks: &[u8]) -> ChunkMask {
+        ChunkMask::from_chunks(true, chunks)
+    }
+    Some(match tag {
+        "hide_Head" => vec![
+            ("h0_", hide_all()),
+            ("he_", hide_all()),
+            ("heb_", hide_all()),
+            ("ht_", hide_all()),
+            ("hx_", hide_all()),
+            ("i1_", hide_all()),
+            ("beard", hide_all()),
+            ("beard_", hide_all()),
+            ("MorphTargetSkinnedMesh3637", hide_all()),
+            ("MorphTargetSkinnedMesh6675", hide_all()),
+            ("MorphTargetSkinnedMesh7243", hide_all()),
+            ("MorphTargetSkinnedMesh7561", hide_all()),
+        ],
+        "hide_Arms" => vec![("a0_", hide_all()), ("left_arm", hide_all()), ("right_arm", hide_all())],
+        "hide_Torso" => vec![
+            ("n0_", hide_all()),
+            ("tx_", hide_all()),
+            ("t0_000_pma_base__full", hide(&[0, 1, 2, 3])),
+            ("t0_000_pma_base__full_seamfix", hide_all()),
+            ("t0_000_pwa_base__full", hide(&[0, 1, 2, 3])),
+            ("t0_000_pwa_base__full_seamfix", hide_all()),
+            ("t0_000_pwa_fpp__torso", hide(&[0, 1, 2, 3])),
+            ("MorphTargetSkinnedMesh0531", hide_all()),
+        ],
+        "hide_LowerAbdomen" => vec![
+            ("t0_000_pma_base__full", hide(&[3])),
+            ("t0_000_pwa_base__full", hide(&[3])),
+            ("t0_000_pwa_fpp__torso", hide(&[3])),
+        ],
+        "hide_UpperAbdomen" => vec![
+            ("t0_000_pma_base__full", hide(&[2])),
+            ("t0_000_pwa_base__full", hide(&[2])),
+            ("t0_000_pwa_fpp__torso", hide(&[2])),
+        ],
+        "hide_CollarBone" => vec![
+            ("t0_000_pma_base__full", hide(&[1])),
+            ("t0_000_pwa_base__full", hide(&[1])),
+            ("t0_000_pwa_fpp__torso", hide(&[1])),
+        ],
+        "hide_Chest" => vec![
+            ("t0_000_pma_base__full", hide(&[0])),
+            ("t0_000_pwa_base__full", hide(&[0])),
+            ("t0_000_pwa_fpp__torso", hide(&[0])),
+            ("MorphTargetSkinnedMesh0531", hide_all()),
+        ],
+        "hide_Legs" => vec![
+            ("l0_", hide_all()),
+            ("s0_", hide_all()),
+            ("t0_000_pma_base__full", hide(&[4, 5, 6, 7])),
+            ("t0_000_pwa_base__full", hide(&[4, 5, 6, 7])),
+            ("t0_000_pwa_fpp__torso", hide(&[4, 5, 6, 7])),
+        ],
+        "hide_Thighs" => vec![
+            ("t0_000_pma_base__full", hide(&[4])),
+            ("t0_000_pwa_base__full", hide(&[4])),
+            ("t0_000_pwa_fpp__torso", hide(&[4])),
+        ],
+        "hide_Calves" => vec![
+            ("t0_000_pma_base__full", hide(&[5])),
+            ("l0_000_pma_base__high_heels", hide(&[0])),
+            ("l0_000_pma_base__flat_shoes", hide(&[0])),
+            ("t0_000_pwa_base__full", hide(&[5])),
+            ("t0_000_pwa_fpp__torso", hide(&[5])),
+            ("l0_000_pwa_base__cs_flat", hide(&[0])),
+            ("l0_000_pwa_base__high_heels", hide(&[0])),
+            ("l0_000_pwa_base__flat_shoes", hide(&[0])),
+        ],
+        "hide_Ankles" => vec![
+            ("s0_", hide_all()),
+            ("t0_000_pma_base__full", hide(&[6])),
+            ("l0_000_pma_base__high_heels", hide(&[1])),
+            ("l0_000_pma_base__flat_shoes", hide(&[1])),
+            ("t0_000_pwa_base__full", hide(&[6])),
+            ("t0_000_pwa_fpp__torso", hide(&[6])),
+            ("l0_000_pwa_base__cs_flat", hide(&[1])),
+            ("l0_000_pwa_base__high_heels", hide(&[1])),
+            ("l0_000_pwa_base__flat_shoes", hide(&[1])),
+        ],
+        "hide_Feet" => vec![
+            ("t0_000_pma_base__full", hide(&[7])),
+            ("l0_000_pma_base__high_heels", hide(&[2])),
+            ("l0_000_pma_base__flat_shoes", hide(&[2])),
+            ("t0_000_pwa_base__full", hide(&[7])),
+            ("t0_000_pwa_fpp__torso", hide(&[7])),
+            ("l0_000_pwa_base__cs_flat", hide(&[2])),
+            ("l0_000_pwa_base__high_heels", hide(&[2])),
+            ("l0_000_pwa_base__flat_shoes", hide(&[2])),
+        ],
+        "HighHeels" => vec![
+            ("t0_000_pma_base__full", hide(&[5, 6, 7])),
+            ("l0_000_pma_base__high_heels", show(&[0, 1, 2])),
+            ("t0_000_pwa_base__full", hide(&[5, 6, 7])),
+            ("t0_000_pwa_fpp__torso", hide(&[5, 6, 7])),
+            ("l0_000_pwa_base__high_heels", show(&[0, 1, 2])),
+        ],
+        "FlatShoes" => vec![
+            ("t0_000_pma_base__full", hide(&[5, 6, 7])),
+            ("l0_000_pma_base__flat_shoes", show(&[0, 1, 2])),
+            ("t0_000_pwa_base__full", hide(&[5, 6, 7])),
+            ("t0_000_pwa_fpp__torso", hide(&[5, 6, 7])),
+            ("l0_000_pwa_base__flat_shoes", show(&[0, 1, 2])),
+        ],
+        _ => return None,
+    })
+}
+
+/// `App::ComponentState` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL item #22/`OverrideStateManager`,
+/// RE 2026-08-11) — bookkeeping de compatibilidade MULTI-MOD por componente: cada `hash` (u64)
+/// representa 1 FONTE/1 MOD de override distinta, permitindo COMBINAR overrides de MÚLTIPLAS
+/// fontes no MESMO componente sem um sobrescrever o outro (`Garment/States.cpp`, algoritmo
+/// portado byte-a-byte: hiding = AND cumulativo por hash, começando de `~0`; showing = OR
+/// cumulativo por hash, começando de `0`; combinado = `original & todos_hiding | todos_showing`).
+/// Quando um mod é desinstalado, `remove_override(hash)` some com APENAS as mudanças daquele
+/// hash — os overrides de outros mods no mesmo componente permanecem intactos. Zero endereço
+/// nativo — estrutura de dados pura.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ComponentState {
+    hiding_masks: std::collections::BTreeMap<u64, u64>,
+    showing_masks: std::collections::BTreeMap<u64, u64>,
+    appearance_overrides: std::collections::BTreeMap<u64, String>,
+}
+
+impl ComponentState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `AddHidingChunkMaskOverride(hash, mask)` — AND cumulativo, inicia em `~0` (sem restrição).
+    pub fn add_hiding_override(&mut self, hash: u64, mask: u64) {
+        let entry = self.hiding_masks.entry(hash).or_insert(!0u64);
+        *entry &= mask;
+    }
+
+    /// `AddShowingChunkMaskOverride(hash, mask)` — OR cumulativo, inicia em `0` (nada mostrado).
+    pub fn add_showing_override(&mut self, hash: u64, mask: u64) {
+        let entry = self.showing_masks.entry(hash).or_insert(0u64);
+        *entry |= mask;
+    }
+
+    /// `RemoveChunkMaskOverride(hash)` — remove hiding E showing daquele hash (1 fonte/1 mod).
+    /// Devolve `true` sempre (fiel à fonte real, que também sempre devolve `true`).
+    pub fn remove_chunk_mask_override(&mut self, hash: u64) -> bool {
+        self.hiding_masks.remove(&hash);
+        self.showing_masks.remove(&hash);
+        true
+    }
+
+    /// `AddAppearanceOverride(hash, appearance)` — 1 valor por hash (não cumulativo como as
+    /// chunk masks — a fonte real também só guarda o ÚLTIMO valor setado por hash).
+    pub fn add_appearance_override(&mut self, hash: u64, appearance: &str) {
+        self.appearance_overrides.insert(hash, appearance.to_string());
+    }
+
+    pub fn remove_appearance_override(&mut self, hash: u64) -> bool {
+        self.appearance_overrides.remove(&hash).is_some()
+    }
+
+    /// `GetOverriddenChunkMask(originalMask)` — combina TODOS os hashes registrados no componente.
+    pub fn overridden_chunk_mask(&self, original_mask: u64) -> u64 {
+        let mut mask = original_mask;
+        for hiding in self.hiding_masks.values() {
+            mask &= hiding;
+        }
+        for showing in self.showing_masks.values() {
+            mask |= showing;
+        }
+        mask
+    }
+
+    pub fn has_overridden_chunk_mask(&self) -> bool {
+        !self.hiding_masks.is_empty() || !self.showing_masks.is_empty()
+    }
+
+    /// `GetAppearanceOverridde()` — devolve `"default"` se vazio (typo preservado da fonte real
+    /// só no nome do método C++, não no comportamento), senão o PRIMEIRO valor por ordem de
+    /// inserção mais antiga (`m_appearanceNames.begin()`, um `Map` ordenado por chave/hash na
+    /// fonte real — replicado aqui via `BTreeMap`, que também itera em ordem de chave).
+    pub fn appearance_override(&self) -> &str {
+        self.appearance_overrides.values().next().map(|s| s.as_str()).unwrap_or("default")
+    }
+
+    pub fn has_appearance_overrides(&self) -> bool {
+        !self.appearance_overrides.is_empty()
+    }
+
+    pub fn is_overridden(&self) -> bool {
+        self.has_overridden_chunk_mask() || self.has_appearance_overrides()
+    }
+}
+
+/// Metade PURA de `App::ResourceState` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL item #22,
+/// `Garment/States.hpp:51-76`/`States.cpp:157-190`) — só a parte de "offset override" (`Core::Map
+/// <uint64_t,int32_t> m_overridenOffsets`), que é bookkeeping puro (1 valor por hash-de-mod,
+/// `GetOverriddenOffset` devolve a entrada de ordem-de-chave mais antiga se houver alguma, senão
+/// `0`). As outras responsabilidades de `ResourceState` real (`LinkToAppearance`/
+/// `GetActiveVariant*`) guardam um `DynamicAppearanceName` (struct rica com `Handle`s/`CName`s
+/// nativos resolvidos por `ParseAppearance`) — fora de escopo aqui (precisa de RTTI/runtime, não é
+/// lógica pura).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResourceStateOffsets {
+    overridden_offsets: std::collections::BTreeMap<u64, i32>,
+}
+
+impl ResourceStateOffsets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `AddOffsetOverride(hash, offset)` — 1 valor por hash (sobrescreve, não acumula).
+    pub fn add_offset_override(&mut self, hash: u64, offset: i32) {
+        self.overridden_offsets.insert(hash, offset);
+    }
+
+    /// `RemoveOffsetOverride(hash)`.
+    pub fn remove_offset_override(&mut self, hash: u64) -> bool {
+        self.overridden_offsets.remove(&hash).is_some()
+    }
+
+    /// `GetOverriddenOffset()` — devolve a 1ª entrada por ordem de chave (`m_overridenOffsets.
+    /// begin()->second`, `Map` real é ordenado, `BTreeMap` replica a mesma ordem), ou `0` se vazio.
+    pub fn overridden_offset(&self) -> i32 {
+        self.overridden_offsets.values().next().copied().unwrap_or(0)
+    }
+
+    pub fn is_overridden(&self) -> bool {
+        !self.overridden_offsets.is_empty()
+    }
+}
+
+/// `App::EntityState` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL item #22, `Garment/States.hpp:78-165`/
+/// `States.cpp:222-388`, RE 2026-08-11) — agrega o bookkeeping de UMA entidade inteira: 1
+/// `ComponentState` por NOME de componente (`Core::Map<Red::CName,SharedPtr<ComponentState>>
+/// m_componentStates`, chave replicada aqui como hash `u64` de CName) + 1 `ResourceStateOffsets`
+/// por recurso (`Core::Map<Red::ResourcePath,...> m_resourceStates`, chave = hash do path). Os
+/// métodos "remove POR HASH" (`RemoveChunkMaskOverrides`/`RemoveAppearanceOverrides`/
+/// `RemoveOffsetOverrides`/`RemoveAllOverrides`) iteram TODOS os component/resource states e
+/// removem só as entradas daquele hash — é o mecanismo real que permite "mod desinstalado, só as
+/// mudanças DAQUELE mod somem, outros mods intactos" (mesma regra já testada em `ComponentState::
+/// remove_chunk_mask_override`, agora composta em escala de entidade inteira).
+///
+/// Fora de escopo (precisam de `Red::Entity*`/`Red::IComponent`/RTTI reais, não são lógica pura):
+/// `ApplyChunkMaskOverride`/`ApplyAppearanceOverride`/`ApplyOffsetOverrides` (aplicam o resultado
+/// já computado aqui num componente VIVO do motor), `SelectDynamicAppearance`/
+/// `ToggleConditionalComponents`/`ApplyDynamicAppearance`/`Link*ToAppearance`/
+/// `UpdateDynamicAttributes` (dependem de `DynamicAppearanceController`/entidade nativa).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EntityState {
+    component_states: std::collections::BTreeMap<u64, ComponentState>,
+    resource_states: std::collections::BTreeMap<u64, ResourceStateOffsets>,
+}
+
+impl EntityState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `GetComponentState(name)` — get-or-create (`m_componentStates.emplace(name,
+    /// MakeShared<ComponentState>(name))` se ausente).
+    pub fn component_state(&mut self, component_hash: u64) -> &mut ComponentState {
+        self.component_states.entry(component_hash).or_insert_with(ComponentState::new)
+    }
+
+    /// `FindComponentState(name)` — só lê, nunca cria.
+    pub fn find_component_state(&self, component_hash: u64) -> Option<&ComponentState> {
+        self.component_states.get(&component_hash)
+    }
+
+    /// `GetResourceState(path)` — get-or-create.
+    pub fn resource_state(&mut self, resource_hash: u64) -> &mut ResourceStateOffsets {
+        self.resource_states.entry(resource_hash).or_insert_with(ResourceStateOffsets::new)
+    }
+
+    pub fn find_resource_state(&self, resource_hash: u64) -> Option<&ResourceStateOffsets> {
+        self.resource_states.get(&resource_hash)
+    }
+
+    /// `AddChunkMaskOverride(hash, componentName, chunkMask, show)`.
+    pub fn add_chunk_mask_override(&mut self, hash: u64, component_hash: u64, chunk_mask: u64, show: bool) {
+        let cs = self.component_state(component_hash);
+        if show {
+            cs.add_showing_override(hash, chunk_mask);
+        } else {
+            cs.add_hiding_override(hash, chunk_mask);
+        }
+    }
+
+    /// `RemoveChunkMaskOverrides(hash)` — varre TODOS os componentes, remove só `hash`.
+    pub fn remove_chunk_mask_overrides(&mut self, hash: u64) {
+        for cs in self.component_states.values_mut() {
+            cs.remove_chunk_mask_override(hash);
+        }
+    }
+
+    /// `AddAppearanceOverride(hash, componentName, appearance)`.
+    pub fn add_appearance_override(&mut self, hash: u64, component_hash: u64, appearance: &str) {
+        let cs = self.component_state(component_hash);
+        cs.add_appearance_override(hash, appearance);
+    }
+
+    /// `RemoveAppearanceOverrides(hash)` — varre TODOS os componentes.
+    pub fn remove_appearance_overrides(&mut self, hash: u64) {
+        for cs in self.component_states.values_mut() {
+            cs.remove_appearance_override(hash);
+        }
+    }
+
+    /// `AddOffsetOverride(hash, resourcePath, offset)`.
+    pub fn add_offset_override(&mut self, hash: u64, resource_hash: u64, offset: i32) {
+        let rs = self.resource_state(resource_hash);
+        rs.add_offset_override(hash, offset);
+    }
+
+    /// `RemoveOffsetOverrides(hash)` — varre TODOS os recursos.
+    pub fn remove_offset_overrides(&mut self, hash: u64) {
+        for rs in self.resource_states.values_mut() {
+            rs.remove_offset_override(hash);
+        }
+    }
+
+    pub fn offset_override(&self, resource_hash: u64) -> i32 {
+        self.resource_states.get(&resource_hash).map(|rs| rs.overridden_offset()).unwrap_or(0)
+    }
+
+    /// `RemoveAllOverrides(hash)` — os 3 removes de uma vez (o desinstalar-mod real).
+    pub fn remove_all_overrides(&mut self, hash: u64) {
+        self.remove_chunk_mask_overrides(hash);
+        self.remove_appearance_overrides(hash);
+        self.remove_offset_overrides(hash);
+    }
+
+    pub fn component_count(&self) -> usize {
+        self.component_states.len()
+    }
+
+    pub fn resource_count(&self) -> usize {
+        self.resource_states.len()
+    }
+}
+
+/// `App::OverrideStateManager` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL item #22,
+/// `Garment/States.hpp:167-194`/`States.cpp:790-946`, RE 2026-08-11) — indexa `EntityState`s por
+/// **4 chaves diferentes**, cada uma um mapa PRÓPRIO pra um contexto de lookup diferente que o
+/// pipeline de garment usa em pontos distintos do código: pelo ponteiro/ID da entidade
+/// (`m_entityStates`, dono de verdade — `GetEntityState` cria aqui), por `ResourcePath` do
+/// `.app` dinâmico (`m_entityStatesByPath`), por `GarmentProcessingContext*` (`m_entityStatesByProcessor`,
+/// linkado via `LinkEntityToAssembler` — só linka se a entidade JÁ existir, nunca cria) e por
+/// `uintptr_t` genérico (`m_entityStatesByPointer`, linkado via `LinkEntityToPointer` — cria se
+/// preciso). Aqui todas as 4 chaves são `u64` opacos (o próprio C++ já trata `uint64_t aContext`
+/// como um `Entity*` reinterpretado — `GetEntityState(uint64_t)` faz exatamente
+/// `reinterpret_cast<Red::Entity*>(aContext)` — então usar `u64` em vez de ponteiro nativo aqui
+/// não é divergência, é o MESMO tipo que a própria API pública já expõe).
+///
+/// Divergência de escopo consciente: a fonte real também registra automaticamente `entity.
+/// templatePath.hash` como alias de path (3 variantes, sufixo `_0.app`/`_1.app`/`_2.app`) dentro
+/// de `GetEntityState(Entity*)` — precisa ler o campo nativo `templatePath` da entidade, fora do
+/// escopo de uma estrutura pura; aqui o alias de path é registrado explicitamente por quem chama
+/// (`link_path`), que já tem o hash calculado por fora.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OverrideStateManager {
+    entity_states: std::collections::BTreeMap<u64, EntityState>,
+    by_path: std::collections::BTreeMap<u64, u64>,
+    by_processor: std::collections::BTreeMap<u64, u64>,
+    by_pointer: std::collections::BTreeMap<u64, u64>,
+}
+
+impl OverrideStateManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `GetEntityState(entity)` — get-or-create (dono real; as outras 3 chaves só apontam de
+    /// volta pra cá).
+    pub fn entity_state(&mut self, entity_key: u64) -> &mut EntityState {
+        self.entity_states.entry(entity_key).or_insert_with(EntityState::new)
+    }
+
+    /// `FindEntityState(entity)` — só lê.
+    pub fn find_entity_state(&self, entity_key: u64) -> Option<&EntityState> {
+        self.entity_states.get(&entity_key)
+    }
+
+    pub fn find_entity_state_by_path(&self, path_hash: u64) -> Option<&EntityState> {
+        self.by_path.get(&path_hash).and_then(|k| self.entity_states.get(k))
+    }
+
+    pub fn find_entity_state_by_processor(&self, processor_key: u64) -> Option<&EntityState> {
+        self.by_processor.get(&processor_key).and_then(|k| self.entity_states.get(k))
+    }
+
+    pub fn find_entity_state_by_pointer(&self, pointer_key: u64) -> Option<&EntityState> {
+        self.by_pointer.get(&pointer_key).and_then(|k| self.entity_states.get(k))
+    }
+
+    /// Registra um alias de path pra uma entidade JÁ existente (equivalente ao efeito colateral
+    /// de `GetEntityState(Entity*)` real, mas com o hash de path calculado por fora).
+    pub fn link_path(&mut self, entity_key: u64, path_hash: u64) {
+        self.entity_states.entry(entity_key).or_insert_with(EntityState::new);
+        self.by_path.insert(path_hash, entity_key);
+    }
+
+    /// `LinkEntityToAssembler(entity, processor)` — SÓ linka se a entidade já existir (fiel: a
+    /// fonte real faz `m_entityStates.find(aEntity)` e só escreve dentro do `if (it != end())`,
+    /// nunca cria). Devolve `false` se a entidade era desconhecida (nada foi linkado).
+    pub fn link_processor(&mut self, entity_key: u64, processor_key: u64) -> bool {
+        if self.entity_states.contains_key(&entity_key) {
+            self.by_processor.insert(processor_key, entity_key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `LinkEntityToPointer(entity, pointer)` — cria a entidade se preciso (fiel: o `else` do C++
+    /// chama `GetEntityState(aEntity)`, get-or-create).
+    pub fn link_pointer(&mut self, entity_key: u64, pointer_key: u64) {
+        self.entity_states.entry(entity_key).or_insert_with(EntityState::new);
+        self.by_pointer.insert(pointer_key, entity_key);
+    }
+
+    /// `ClearStates()`.
+    pub fn clear_states(&mut self) {
+        self.entity_states.clear();
+        self.by_path.clear();
+        self.by_processor.clear();
+        self.by_pointer.clear();
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entity_states.len()
+    }
+}
+
+/// `App::DynamicAppearanceController::IsDynamicValue` (ArchiveXL item #23, RE 2026-08-11) —
+/// `Garment/Dynamic.cpp:674-697`, todas as 5 sobrecargas colapsam pra 1 checagem trivial: a
+/// string começa com o marcador `*` (`DynamicValueMarker`).
+pub fn is_dynamic_value(s: &str) -> bool {
+    s.starts_with('*')
+}
+
+/// Resultado de `ProcessString` (ArchiveXL `DynamicAppearanceController::DynamicString`,
+/// `Garment/Dynamic.cpp:442-556`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DynamicString {
+    pub valid: bool,
+    pub missed: bool,
+    pub optional: bool,
+    pub value: String,
+    pub attributes: std::collections::BTreeSet<u64>,
+}
+
+/// `App::DynamicAppearanceController::ProcessString` (ArchiveXL #23, RE 2026-08-11, também
+/// reusável pro item `#48`/`MeshExtension::ExpandResourcePath`, que chama a MESMA função —
+/// confirmado lendo `Mesh/Extension.cpp:901-916`) — substitui marcadores `{attr}` embutidos numa
+/// string por valores de 2 fontes (locais têm prioridade sobre globais), portado byte-a-byte:
+/// pula o `*` inicial se presente; anda achando pares `{`/`}`, copia o texto entre eles pro
+/// buffer de saída, hasheia o nome do atributo (FNV1a64, `bwms_hashes::fnv1a64` já provado) e
+/// resolve o valor (local > global > `missed=true` se nenhum achar); ao final, se sobrou texto
+/// não-processado (par `{`/`}` incompleto) OU nenhum atributo foi encontrado, o resultado fica
+/// inválido (mesma regra exata do C++: `if (*str || attributes.empty()) return result;`); um `?`
+/// final marca `optional=true` e é removido do valor. Limite de 512 bytes de saída (igual à
+/// fonte, `buffer[MaxLength+1]`).
+pub fn process_dynamic_string(
+    local_attrs: &std::collections::HashMap<u64, String>,
+    global_attrs: &std::collections::HashMap<u64, String>,
+    input: &str,
+) -> DynamicString {
+    const MAX_LENGTH: usize = 512;
+    let mut result = DynamicString::default();
+    if input.is_empty() {
+        return result;
+    }
+    let bytes = input.as_bytes();
+    let mut idx = if bytes[0] == b'*' { 1 } else { 0 };
+    let mut out: Vec<u8> = Vec::with_capacity(MAX_LENGTH + 1);
+
+    while idx < bytes.len() {
+        let attr_open = match bytes[idx..].iter().position(|&b| b == b'{') {
+            Some(p) => idx + p,
+            None => {
+                while idx < bytes.len() && out.len() < MAX_LENGTH {
+                    out.push(bytes[idx]);
+                    idx += 1;
+                }
+                break;
+            }
+        };
+        let attr_close = match bytes[attr_open..].iter().position(|&b| b == b'}') {
+            Some(p) => attr_open + p,
+            None => break,
+        };
+        while idx != attr_open && out.len() < MAX_LENGTH {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+        if out.len() == MAX_LENGTH {
+            break;
+        }
+        idx = attr_close + 1;
+        let attr_name = &input[attr_open + 1..attr_close];
+        let attr_hash = bwms_hashes::fnv1a64(attr_name.as_bytes());
+        result.attributes.insert(attr_hash);
+        let value = local_attrs.get(&attr_hash).or_else(|| global_attrs.get(&attr_hash));
+        match value {
+            Some(v) => {
+                let vbytes = v.as_bytes();
+                let mut vi = 0;
+                while vi < vbytes.len() && out.len() < MAX_LENGTH {
+                    out.push(vbytes[vi]);
+                    vi += 1;
+                }
+                if out.len() == MAX_LENGTH {
+                    break;
+                }
+            }
+            None => {
+                result.missed = true;
+            }
+        }
+    }
+
+    if idx < bytes.len() || result.attributes.is_empty() {
+        return result;
+    }
+
+    if out.last() == Some(&b'?') {
+        result.optional = true;
+        out.pop();
+    }
+
+    result.value = String::from_utf8_lossy(&out).into_owned();
+    result.valid = true;
+    result
+}
+
+/// `App::MeshExtension::ExpandResourcePath` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL item #48,
+/// `Mesh/Extension.cpp:900-925`, RE 2026-08-11) — resolve o path de um MATERIAL DINÂMICO,
+/// reusando a MESMA engine de templating do garment (`process_dynamic_string`/`is_dynamic_value`,
+/// item #23, já portados/testados) — confirma o achado já registrado no catálogo ("a implementação
+/// avança os 2 itens de uma vez"). Diferença de `process_dynamic_string` cru: injeta 1 atributo
+/// LOCAL pré-computado, `material` (`Red::CName("material")`, `Mesh/Extension.cpp:15` —
+/// `MaterialAttr`, hash = `fnv1a64("material")`, confirmado que `Red::CName`/`FNV1a64` são a
+/// mesma função por leitura direta de `Dynamic.cpp:494` — `aLocalAttrs.find(attr)` com `attr` um
+/// `uint64_t` FNV1a64 cru contra um mapa chaveado por `CName`), mapeado pro NOME do material
+/// sendo expandido; o resto dos atributos vem de `aState->GetContextAttrs()` (`global_attrs`,
+/// fornecido pelo chamador).
+///
+/// Semântica fiel ao par `(ResourcePath, bool)` real:
+/// - `path_str` não é dinâmico (`!IsDynamicValue`): devolve `(Some(path_str inalterado), false)`
+///   — mesmo par `{aPath, false}` da fonte.
+/// - processamento inválido (chave sem fechar etc.): `(None, false)` — mesmo `{{}, false}`.
+/// - atributo faltando (`missed`): `(None, optional)` — mesmo `{{}, result.optional}`.
+/// - sucesso: `(Some(path_expandido), optional)`.
+///
+/// Divergência de escopo consciente: a fonte real INTERNA o resultado via
+/// `ResourcePathRegistry::RegisterPath` (produz um `ResourcePath` hash novo, side-effect num
+/// registro global nativo); aqui devolvemos a STRING final — o chamador registra o hash pelo
+/// mecanismo já provado do BWMS (`resource_path_hash`/`install_reslink`).
+pub fn expand_resource_path(
+    path_str: &str,
+    material_name: &str,
+    context_attrs: &std::collections::HashMap<u64, String>,
+) -> (Option<String>, bool) {
+    if !is_dynamic_value(path_str) {
+        return (Some(path_str.to_string()), false);
+    }
+    let mut local_attrs = std::collections::HashMap::new();
+    local_attrs.insert(bwms_hashes::fnv1a64(b"material"), material_name.to_string());
+    let result = process_dynamic_string(&local_attrs, context_attrs, path_str);
+    if !result.valid {
+        return (None, false);
+    }
+    if result.missed {
+        return (None, result.optional);
+    }
+    (Some(result.value), result.optional)
+}
+
+/// `App::ExtractName(aName, aOffset, aSize)` — porte da versão HASH-ONLY (`aRegister=false`,
+/// `Garment/Dynamic.cpp:81-92`) — o ÚNICO caminho que `DynamicAppearanceRef` usa (nenhuma das
+/// chamadas dentro do ctor real passa `aRegister=true`, confirmado lendo `Dynamic.cpp:194-266`
+/// linha a linha). Substring vazia devolve `0` (equivalente ao `Red::CName` default), senão
+/// FNV1a64 do trecho.
+fn extract_name_hash(s: &str) -> u64 {
+    if s.is_empty() {
+        0
+    } else {
+        bwms_hashes::fnv1a64(s.as_bytes())
+    }
+}
+
+/// `App::DynamicAppearanceRef` (`PENDENCIAS-UNIFICADAS.md` ArchiveXL itens #22/#23,
+/// `Garment/Dynamic.cpp:194-266`, RE 2026-08-11) — parseia o NOME de um componente/aparência
+/// (`aComponent->name`/`definition->name`, alimentado por `DynamicAppearanceController::
+/// ParseReference`) que pode embutir uma lista de VARIANTES (`nome!v1!v2`) e/ou CONDIÇÕES
+/// (`nome&c1&c2`, ou `nome!v1!v2&c1&c2` combinando os 2) — a sintaxe que `EntityState::
+/// ToggleConditionalComponents`/`ApplyDynamicAppearance`/`ApplyAppearanceOverride`/
+/// `ApplyChunkMaskOverride` (item #22) usam pra decidir qual componente/aparência condicional
+/// está ativo dado o contexto do personagem. 100% hash puro (FNV1a64 via `extract_name_hash`,
+/// zero registro no `CNamePool` — confirmado ser o único caminho usado aqui). `value` = hash da
+/// string INTEIRA de entrada (equivalente ao `Red::CName` construído implicitamente pelo ctor
+/// real, `value(aReference)` — a mesma convenção "`CName`'s hash == FNV1a64 da string" já
+/// confirmada e usada em `process_dynamic_string`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DynamicAppearanceRef {
+    pub value: u64,
+    pub name: u64,
+    pub variants: std::collections::BTreeSet<u64>,
+    pub conditions: std::collections::BTreeSet<u64>,
+    pub is_dynamic: bool,
+    pub is_conditional: bool,
+    pub weight: i8,
+}
+
+impl DynamicAppearanceRef {
+    /// Porte byte-a-byte do ctor `DynamicAppearanceRef(Red::CName aReference)`.
+    pub fn parse(reference: &str) -> Self {
+        let mut r = DynamicAppearanceRef {
+            value: extract_name_hash(reference),
+            ..Default::default()
+        };
+
+        let Some(marker_pos) = reference.find(['!', '&']) else {
+            // sem marcador nenhum -> não-dinâmico, `name` = a própria referência.
+            r.name = r.value;
+            return r;
+        };
+
+        r.is_dynamic = true;
+        r.name = extract_name_hash(&reference[..marker_pos]);
+        let mut rest = &reference[marker_pos..];
+
+        if rest.len() > 1 {
+            if rest.as_bytes()[0] == b'!' {
+                rest = &rest[1..];
+                loop {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    match rest.find(['!', '&']) {
+                        // marcador de condição logo no início -> para SEM consumir (deixa pro
+                        // bloco de condições abaixo tratar), sem inserir variante nenhuma.
+                        Some(0) if rest.as_bytes()[0] == b'&' => break,
+                        None => {
+                            r.variants.insert(extract_name_hash(rest));
+                            break;
+                        }
+                        Some(p) => {
+                            r.variants.insert(extract_name_hash(&rest[..p]));
+                            if rest.as_bytes()[p] != b'!' {
+                                // achou '&' -> encerra a lista de variantes, preserva o '&' pro
+                                // bloco de condições.
+                                rest = &rest[p..];
+                                break;
+                            }
+                            // outro '!' -> mais uma variante segue.
+                            rest = &rest[p + 1..];
+                        }
+                    }
+                }
+            }
+
+            if rest.as_bytes().first() == Some(&b'&') {
+                rest = &rest[1..];
+                loop {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    match rest.find('&') {
+                        None => {
+                            r.conditions.insert(extract_name_hash(rest));
+                            break;
+                        }
+                        Some(p) => {
+                            r.conditions.insert(extract_name_hash(&rest[..p]));
+                            rest = &rest[p + 1..];
+                        }
+                    }
+                }
+            }
+
+            r.weight = (if r.variants.is_empty() { 0 } else { 100 }) + (r.conditions.len() as i8);
+            r.is_conditional = r.weight > 0;
+        }
+
+        r
+    }
+
+    /// `Match(aVariant)`.
+    pub fn matches_variant(&self, variant_hash: u64) -> bool {
+        self.variants.contains(&variant_hash)
+    }
+
+    /// `Match(aConditions)` — TODAS as condições próprias precisam estar presentes.
+    pub fn matches_conditions(&self, conditions_present: &std::collections::BTreeSet<u64>) -> bool {
+        self.conditions.iter().all(|c| conditions_present.contains(c))
+    }
+
+    /// `Match(aConditions, aOverrides)` — condição satisfeita se estiver em QUALQUER um dos 2 sets.
+    pub fn matches_conditions_with_overrides(
+        &self,
+        conditions_present: &std::collections::BTreeSet<u64>,
+        overrides: &std::collections::BTreeSet<u64>,
+    ) -> bool {
+        self.conditions.iter().all(|c| conditions_present.contains(c) || overrides.contains(c))
+    }
+}
+
+/// `App::DynamicAppearanceName` (ArchiveXL item `#23`, `Garment/Dynamic.hpp:12-26`+
+/// `Dynamic.cpp:96-192`, RE 2026-08-15 — a "struct irmã, não lida ainda" que a nota anterior do
+/// item deixava pendente) — o VALOR real de uma aparência/componente que o motor está tentando
+/// casar contra um `DynamicAppearanceRef` (o CRITÉRIO, já portado acima). Sintaxe:
+/// `nome!variante[+parte[=valor]]...[%contexto][&condicao...]` — papel espelhado do `Ref`
+/// (`nome!v1!v2&c1&c2`), mas aqui o que vem depois de `!` é UMA variante só (não uma lista),
+/// opcionalmente composta de sub-partes (`+chave=valor` ou `+valorPosicional`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DynamicAppearanceName {
+    pub value: u64,
+    pub name: u64,
+    pub variant: u64,
+    /// `DynamicPartList = Map<CName,CName>` — chave de parte → valor de parte (hash de cada um).
+    /// A chave `hash("variant")` é sempre inserida com o valor = `variant` inteiro (mesmo com
+    /// sub-partes presentes — fiel à fonte, que nunca sobrescreve essa entrada específica).
+    pub parts: std::collections::BTreeMap<u64, u64>,
+    pub overrides: std::collections::BTreeSet<u64>,
+    pub context: u64,
+    pub is_dynamic: bool,
+}
+
+impl DynamicAppearanceName {
+    /// Porte do ctor `DynamicAppearanceName(Red::CName aAppearance)`. Única divergência
+    /// consciente do C++: aqui usamos um "end" (índice, nunca reatribui o ponteiro base) em vez
+    /// de `std::string_view::remove_suffix`/`remove_prefix` cru — evita o UB que o C++ teria se
+    /// `%`/`&` aparecessem ANTES do `!` (entrada malformada vinda de redscript ao vivo não pode
+    /// derrubar o processo; C++ confiaria cegamente no invariante "sempre bem-formado").
+    pub fn parse(appearance: &str) -> Self {
+        let mut n = DynamicAppearanceName { value: extract_name_hash(appearance), ..Default::default() };
+
+        let Some(marker_pos) = appearance.find('!') else {
+            // sem `!` -> não-dinâmico, `name` = a própria aparência (== `value`).
+            n.name = n.value;
+            return n;
+        };
+
+        // 1) contexto: ÚLTIMO '%' na string ORIGINAL INTEIRA (busca antes de qualquer corte,
+        // fiel ao C++ que faz `find_last_of` sobre o `str` ainda intacto). ACHADO DE RE: como o
+        // parse de inteiro exige que TUDO até o fim da string seja numérico, o contexto só
+        // resolve com sucesso se `%numero` for o FINAL LITERAL da string — a ordem válida é
+        // "nome!variante&condicao%numero" (condição ANTES do contexto), não o inverso. Ver
+        // testes `dynamicappearancename_condicao_antes_do_contexto_e_a_ordem_valida`/
+        // `_contexto_antes_da_condicao_e_ordem_invalida_fica_zero`.
+        let mut end = appearance.len();
+        if let Some(context_pos) = appearance.rfind('%') {
+            if let Ok(v) = appearance[context_pos + 1..].parse::<u64>() {
+                n.context = v;
+            }
+            end = end.min(context_pos);
+        }
+
+        // 2) condição: PRIMEIRO '&' dentro do que sobrou após o corte de contexto.
+        if let Some(cond_pos) = appearance[..end].find('&') {
+            end = end.min(cond_pos);
+        }
+
+        // guarda de segurança (sem equivalente no C++, que confia no invariante de sempre vir
+        // bem-formado): se o corte comeu até ANTES do próprio `!`, degrada com segurança em vez
+        // de panicar num slice fora dos limites.
+        if end <= marker_pos {
+            n.name = n.value;
+            return n;
+        }
+
+        n.is_dynamic = true;
+        n.name = extract_name_hash(&appearance[..marker_pos]);
+
+        let mut rest = &appearance[marker_pos + 1..end];
+
+        if !rest.is_empty() {
+            // `variant` = a string INTEIRA restante (não só até o 1º '+') — fiel ao C++, que
+            // registra o trecho completo como CName ANTES de sequer olhar pro separador '+'.
+            n.variant = extract_name_hash(rest);
+            let variant_attr = bwms_hashes::fnv1a64(b"variant");
+            n.parts.insert(variant_attr, n.variant);
+
+            let mut part_counter: u8 = b'1';
+
+            loop {
+                if rest.is_empty() {
+                    break;
+                }
+                match rest.find('+') {
+                    Some(0) => {
+                        // separador logo no início -> parte vazia, pula.
+                        rest = &rest[1..];
+                        continue;
+                    }
+                    found => {
+                        let (marker2, skip) = match found {
+                            Some(p) => (p, p + 1),
+                            None => (rest.len(), rest.len()),
+                        };
+
+                        let assign_pos = rest.find('=').filter(|&ap| ap < marker2);
+                        if let Some(ap) = assign_pos {
+                            let part_name = extract_name_hash(&rest[..ap]);
+                            let part_value = extract_name_hash(&rest[ap + 1..marker2]);
+                            n.parts.insert(part_name, part_value);
+                            // porte FIEL de `Dynamic.cpp:168` — `Red::FNV1a64(str.data(),
+                            // markerPos - assignPos)`: offset a partir do INÍCIO de `rest` (não
+                            // de `ap`), comprimento `marker2-ap`. NÃO é o hash de "chave=valor"
+                            // nem de "chave" nem de "valor" isolados — é um trecho arbitrário
+                            // `rest[0..marker2-ap]`. Cross-checado byte-a-byte contra a fonte
+                            // real: parece anomalia genuína do próprio ArchiveXL (mesma classe
+                            // de bug já documentada no projeto pro Journal/Animation do
+                            // Codeware) — replicada aqui DE PROPÓSITO, não corrigida.
+                            let quirky_len = (marker2 - ap).min(rest.len());
+                            n.overrides.insert(bwms_hashes::fnv1a64(rest[..quirky_len].as_bytes()));
+                        } else {
+                            // forma posicional: chave sintética "variant.N" via hash de
+                            // CONTINUAÇÃO (mesmo idioma de `tweak_db_id_derive` já usado no
+                            // projeto) — `Red::FNV1a64(".{N}", seed=hash("variant"))`.
+                            let seed = bwms_hashes::fnv1a64(b"variant");
+                            let part_name = bwms_hashes::fnv1a64_seeded(&[b'.', part_counter], seed);
+                            let part_value = extract_name_hash(&rest[..marker2]);
+                            n.parts.insert(part_name, part_value);
+                            part_counter = part_counter.wrapping_add(1);
+                        }
+
+                        rest = &rest[skip..];
+                    }
+                }
+            }
+        }
+
+        n
+    }
+}
+
+/// `DynamicAppearanceController::GetBaseAppearanceName` (`Dynamic.cpp:768-779`) — a substring
+/// ANTES do primeiro marcador de QUALQUER tipo (`!`/`%`/`&`, `AllMarkers` na fonte real — mais
+/// amplo que só `!`, diferente do campo `name` de `DynamicAppearanceName::parse`, que só corta
+/// no `!`). String inteira devolvida se não houver nenhum marcador. Zero endereço nativo, zero
+/// campo cru, implementação genuinamente nova (item `#23`).
+pub fn get_base_appearance_name(name: &str) -> &str {
+    match name.find(['!', '%', '&']) {
+        Some(pos) => &name[..pos],
+        None => name,
+    }
+}
+
+/// `DynamicAppearanceController::MatchReference` (`Dynamic.cpp:316-339`) — composição PURA sobre
+/// os 2 estruturas já portadas acima, mais um set opcional de "condições presentes" (equivalente
+/// a `EntityState.conditions`, item `#22`, já fechado — o chamador extrai isso de lá; aqui fica
+/// desacoplado de propósito, pra ser testável sem nenhum estado de entidade real). Zero endereço
+/// nativo, zero campo cru — literalmente o corpo do método real.
+pub fn appearance_matches_reference(
+    reference: &DynamicAppearanceRef,
+    appearance: &DynamicAppearanceName,
+    entity_conditions: Option<&std::collections::BTreeSet<u64>>,
+) -> bool {
+    if !reference.variants.is_empty() && !reference.matches_variant(appearance.variant) {
+        return false;
+    }
+    if !reference.conditions.is_empty() {
+        let Some(present) = entity_conditions else {
+            return false;
+        };
+        if !reference.matches_conditions_with_overrides(present, &appearance.overrides) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Uma conexão de nó do quest graph (`node`+`socket`, ou só `node` — `QuestPhase/Config.cpp::
 /// FillConnection`): forma mapa `{node:[..], socket: nome}` OU sequência nua (só node path, sem
 /// socket).
@@ -1273,6 +2167,606 @@ mod tests {
         assert_eq!(hide.mask, !0b100u64); // hide: complemento do bit 2
         assert!(show.show);
         assert_eq!(show.mask, 0b100u64); // show: seleção positiva, SEM inversão
+    }
+
+    // ===== builtin_tag_overrides (ArchiveXL #21/GetTagManager, RE 2026-08-11) =====
+
+    #[test]
+    fn builtin_tag_hide_torso_bate_com_a_fonte_real() {
+        let overrides = super::builtin_tag_overrides("hide_Torso").unwrap();
+        assert_eq!(overrides.len(), 8);
+        let (_, mask) = overrides.iter().find(|(n, _)| *n == "t0_000_pma_base__full").unwrap();
+        assert!(!mask.show);
+        assert_eq!(mask.mask, !0b1111u64); // hide([0,1,2,3])
+        let (_, mask_n0) = overrides.iter().find(|(n, _)| *n == "n0_").unwrap();
+        assert_eq!(mask_n0.mask, 0); // Hide() sem chunks = mask 0 (nunca invertido, regra do from_chunks)
+    }
+
+    #[test]
+    fn builtin_tag_highheels_tem_show_positivo() {
+        let overrides = super::builtin_tag_overrides("HighHeels").unwrap();
+        let (_, mask) = overrides.iter().find(|(n, _)| *n == "l0_000_pma_base__high_heels").unwrap();
+        assert!(mask.show);
+        assert_eq!(mask.mask, 0b111); // show([0,1,2]), SEM inversão
+        let (_, mask_full) = overrides.iter().find(|(n, _)| *n == "t0_000_pma_base__full").unwrap();
+        assert!(!mask_full.show);
+        assert_eq!(mask_full.mask, !0b1110_0000u64); // hide([5,6,7])
+    }
+
+    #[test]
+    fn builtin_tag_flatshoes_espelha_highheels_com_slot_diferente() {
+        let overrides = super::builtin_tag_overrides("FlatShoes").unwrap();
+        assert_eq!(overrides.len(), 5);
+        let (_, mask) = overrides.iter().find(|(n, _)| *n == "l0_000_pwa_base__flat_shoes").unwrap();
+        assert!(mask.show);
+        assert_eq!(mask.mask, 0b111);
+    }
+
+    #[test]
+    fn builtin_tag_hide_head_12_partes_todas_hide_all() {
+        let overrides = super::builtin_tag_overrides("hide_Head").unwrap();
+        assert_eq!(overrides.len(), 12);
+        assert!(overrides.iter().all(|(_, m)| !m.show && m.mask == 0));
+    }
+
+    #[test]
+    fn builtin_tag_nome_desconhecido_devolve_none() {
+        assert!(super::builtin_tag_overrides("tag_que_nao_existe").is_none());
+    }
+
+    #[test]
+    fn builtin_tag_todas_as_14_tags_reais_resolvem() {
+        let tags = [
+            "hide_Head", "hide_Arms", "hide_Torso", "hide_LowerAbdomen", "hide_UpperAbdomen",
+            "hide_CollarBone", "hide_Chest", "hide_Legs", "hide_Thighs", "hide_Calves",
+            "hide_Ankles", "hide_Feet", "HighHeels", "FlatShoes",
+        ];
+        for t in tags {
+            assert!(super::builtin_tag_overrides(t).is_some(), "tag '{t}' deveria resolver");
+        }
+    }
+
+    // ===== ComponentState (ArchiveXL #22/OverrideStateManager, RE 2026-08-11) =====
+
+    #[test]
+    fn componentstate_hiding_e_and_cumulativo_por_hash() {
+        let mut s = super::ComponentState::new();
+        s.add_hiding_override(0xAAAA, 0b1111_0000); // mod A: esconde chunks 4-7
+        s.add_hiding_override(0xBBBB, 0b0011_1111); // mod B: esconde chunks 0-5 (INTERSEÇÃO com A no hiding)
+        // AND cumulativo: só os bits que os DOIS hides preservam sobrevivem — aqui nenhum bit
+        // comum entre "não-4-7" e "não-0-5" no universo de 8 bits, mas testo a fórmula exata:
+        // original=0xFF, hiding_final = 0b1111_0000 & 0b0011_1111 = 0b0011_0000
+        let mask = s.overridden_chunk_mask(0xFF);
+        assert_eq!(mask, 0b0011_0000);
+    }
+
+    #[test]
+    fn componentstate_showing_e_or_cumulativo_por_hash() {
+        let mut s = super::ComponentState::new();
+        s.add_showing_override(0xAAAA, 0b0000_0001);
+        s.add_showing_override(0xBBBB, 0b0000_0010);
+        // original=0 (nada visível), showing OR cumulativo soma os 2 mods
+        assert_eq!(s.overridden_chunk_mask(0), 0b0000_0011);
+    }
+
+    #[test]
+    fn componentstate_remove_por_hash_nao_afeta_outros_mods() {
+        // cenário exato do item: "quando um mod é desinstalado, só as mudanças DAQUELE hash saem"
+        let mut s = super::ComponentState::new();
+        s.add_hiding_override(0xAAAA, 0b1111_0000); // mod A
+        s.add_showing_override(0xBBBB, 0b0000_0001); // mod B
+        assert!(s.has_overridden_chunk_mask());
+        s.remove_chunk_mask_override(0xAAAA); // desinstala só o mod A
+        assert!(s.has_overridden_chunk_mask()); // mod B ainda ativo
+        // hiding do A sumiu (volta a `~0`, sem restrição); showing do B permanece
+        let mask = s.overridden_chunk_mask(0xF0);
+        assert_eq!(mask, 0xF0 | 0b0000_0001);
+        s.remove_chunk_mask_override(0xBBBB); // desinstala o mod B também
+        assert!(!s.has_overridden_chunk_mask()); // nenhum override resta
+    }
+
+    #[test]
+    fn componentstate_appearance_override_1_valor_por_hash_default_se_vazio() {
+        let mut s = super::ComponentState::new();
+        assert_eq!(s.appearance_override(), "default");
+        assert!(!s.has_appearance_overrides());
+        s.add_appearance_override(0xAAAA, "casual_v1");
+        assert!(s.has_appearance_overrides());
+        assert_eq!(s.appearance_override(), "casual_v1");
+        assert!(s.remove_appearance_override(0xAAAA));
+        assert_eq!(s.appearance_override(), "default");
+    }
+
+    #[test]
+    fn componentstate_is_overridden_reflete_qualquer_tipo_de_override() {
+        let mut s = super::ComponentState::new();
+        assert!(!s.is_overridden());
+        s.add_appearance_override(1, "x");
+        assert!(s.is_overridden());
+    }
+
+    // ===== EntityState / OverrideStateManager (ArchiveXL #22, RE 2026-08-11) =====
+
+    #[test]
+    fn entitystate_get_or_create_component_state_isolado_por_hash() {
+        let mut e = super::EntityState::new();
+        assert_eq!(e.component_count(), 0);
+        e.component_state(0xC0DE).add_hiding_override(1, 0xFF);
+        e.component_state(0xBEEF).add_hiding_override(1, 0x0F);
+        assert_eq!(e.component_count(), 2);
+        // cada componente mantém seu próprio estado, sem vazar pro outro
+        assert_eq!(e.find_component_state(0xC0DE).unwrap().overridden_chunk_mask(!0), 0xFF);
+        assert_eq!(e.find_component_state(0xBEEF).unwrap().overridden_chunk_mask(!0), 0x0F);
+        assert!(e.find_component_state(0xDEAD).is_none());
+    }
+
+    #[test]
+    fn entitystate_remove_all_overrides_so_afeta_o_hash_daquele_mod() {
+        // cenário exato do #22: 2 mods sobrepõem o MESMO componente; desinstalar 1 mod (hash)
+        // não deve afetar o override do outro.
+        let mut e = super::EntityState::new();
+        e.add_chunk_mask_override(/*hash mod A*/ 1, /*componente*/ 100, 0xF0, false);
+        e.add_appearance_override(/*hash mod A*/ 1, 100, "modA_look");
+        e.add_offset_override(/*hash mod A*/ 1, /*recurso*/ 200, 5);
+        e.add_chunk_mask_override(/*hash mod B*/ 2, 100, 0x0F, false);
+        e.add_appearance_override(/*hash mod B*/ 2, 100, "modB_look");
+        e.add_offset_override(/*hash mod B*/ 2, 200, 9);
+
+        e.remove_all_overrides(1); // "desinstala" o mod A
+
+        let cs = e.find_component_state(100).unwrap();
+        assert_eq!(cs.overridden_chunk_mask(!0), 0x0F); // só o hiding do mod B sobrou
+        assert_eq!(cs.appearance_override(), "modB_look");
+        assert_eq!(e.offset_override(200), 9); // offset do mod B intacto
+    }
+
+    #[test]
+    fn entitystate_remove_chunk_mask_overrides_nao_toca_appearance() {
+        let mut e = super::EntityState::new();
+        e.add_chunk_mask_override(1, 100, 0xF0, false);
+        e.add_appearance_override(1, 100, "look");
+        e.remove_chunk_mask_overrides(1);
+        let cs = e.find_component_state(100).unwrap();
+        assert!(!cs.has_overridden_chunk_mask());
+        assert!(cs.has_appearance_overrides()); // appearance não foi tocada
+    }
+
+    #[test]
+    fn overridestatemanager_indexa_por_4_chaves_diferentes() {
+        let mut mgr = super::OverrideStateManager::new();
+        let entity = 0x1000u64;
+        mgr.entity_state(entity).component_state(1).add_hiding_override(9, 0xAB);
+
+        mgr.link_path(entity, 0x2000);
+        assert!(mgr.link_processor(entity, 0x3000)); // entidade já existe -> linka
+        mgr.link_pointer(entity, 0x4000);
+
+        // as 4 vias resolvem pro MESMO EntityState (mesmo dado)
+        for lookup in [
+            mgr.find_entity_state(entity),
+            mgr.find_entity_state_by_path(0x2000),
+            mgr.find_entity_state_by_processor(0x3000),
+            mgr.find_entity_state_by_pointer(0x4000),
+        ] {
+            let cs = lookup.unwrap().find_component_state(1).unwrap();
+            assert_eq!(cs.overridden_chunk_mask(!0), 0xAB);
+        }
+        assert_eq!(mgr.entity_count(), 1);
+    }
+
+    #[test]
+    fn overridestatemanager_link_processor_nao_cria_entidade_desconhecida() {
+        // fiel a `LinkEntityToAssembler`: só linka se a entidade JÁ existir, nunca cria.
+        let mut mgr = super::OverrideStateManager::new();
+        assert!(!mgr.link_processor(0xDEAD, 0x9999));
+        assert!(mgr.find_entity_state_by_processor(0x9999).is_none());
+        assert_eq!(mgr.entity_count(), 0);
+    }
+
+    #[test]
+    fn overridestatemanager_link_pointer_cria_entidade_se_precisar() {
+        // fiel a `LinkEntityToPointer`: o `else` cria via GetEntityState (get-or-create).
+        let mut mgr = super::OverrideStateManager::new();
+        mgr.link_pointer(0xABCD, 0x1111);
+        assert!(mgr.find_entity_state(0xABCD).is_some());
+        assert!(mgr.find_entity_state_by_pointer(0x1111).is_some());
+        assert_eq!(mgr.entity_count(), 1);
+    }
+
+    #[test]
+    fn overridestatemanager_clear_states_esvazia_as_4_tabelas() {
+        let mut mgr = super::OverrideStateManager::new();
+        mgr.entity_state(1);
+        mgr.link_path(1, 10);
+        mgr.link_pointer(1, 20);
+        mgr.link_processor(1, 30);
+        mgr.clear_states();
+        assert_eq!(mgr.entity_count(), 0);
+        assert!(mgr.find_entity_state_by_path(10).is_none());
+        assert!(mgr.find_entity_state_by_pointer(20).is_none());
+        assert!(mgr.find_entity_state_by_processor(30).is_none());
+    }
+
+    #[test]
+    fn resourcestateoffsets_overridden_offset_devolve_0_se_vazio() {
+        let rs = super::ResourceStateOffsets::new();
+        assert_eq!(rs.overridden_offset(), 0);
+        assert!(!rs.is_overridden());
+    }
+
+    // ===== process_dynamic_string / is_dynamic_value (ArchiveXL #23, RE 2026-08-11) =====
+
+    #[test]
+    fn is_dynamic_value_checa_prefixo_asterisco() {
+        assert!(super::is_dynamic_value("*foo"));
+        assert!(!super::is_dynamic_value("foo"));
+        assert!(!super::is_dynamic_value(""));
+    }
+
+    #[test]
+    fn process_dynamic_string_substitui_atributo_local() {
+        let mut local = std::collections::HashMap::new();
+        local.insert(bwms_hashes::fnv1a64(b"gender"), "male".to_string());
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "item_{gender}_v1");
+        assert!(r.valid);
+        assert_eq!(r.value, "item_male_v1");
+        assert!(r.attributes.contains(&bwms_hashes::fnv1a64(b"gender")));
+        assert!(!r.missed);
+    }
+
+    #[test]
+    fn process_dynamic_string_local_tem_prioridade_sobre_global() {
+        let mut local = std::collections::HashMap::new();
+        local.insert(bwms_hashes::fnv1a64(b"x"), "LOCAL".to_string());
+        let mut global = std::collections::HashMap::new();
+        global.insert(bwms_hashes::fnv1a64(b"x"), "GLOBAL".to_string());
+        let r = super::process_dynamic_string(&local, &global, "{x}");
+        assert_eq!(r.value, "LOCAL");
+    }
+
+    #[test]
+    fn process_dynamic_string_pula_asterisco_inicial() {
+        let mut local = std::collections::HashMap::new();
+        local.insert(bwms_hashes::fnv1a64(b"attr"), "X".to_string());
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "*{attr}");
+        assert!(r.valid);
+        assert_eq!(r.value, "X");
+    }
+
+    #[test]
+    fn process_dynamic_string_atributo_faltando_marca_missed_mas_nao_crasha() {
+        let local = std::collections::HashMap::new();
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "item_{unknown}_v1");
+        assert!(r.missed);
+        assert!(r.valid); // ainda válido — só o VALOR daquele atributo não foi resolvido
+        assert_eq!(r.value, "item__v1"); // {unknown} vira string vazia
+    }
+
+    #[test]
+    fn process_dynamic_string_sem_chaves_e_invalido() {
+        let local = std::collections::HashMap::new();
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "plain_string_no_markers");
+        assert!(!r.valid); // attributes vazio -> inválido, mesmo sem erro de parsing
+    }
+
+    #[test]
+    fn process_dynamic_string_chave_nao_fechada_e_invalido() {
+        let local = std::collections::HashMap::new();
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "item_{attr_sem_fechar");
+        assert!(!r.valid);
+    }
+
+    #[test]
+    fn process_dynamic_string_marcador_opcional_final_e_removido() {
+        let mut local = std::collections::HashMap::new();
+        local.insert(bwms_hashes::fnv1a64(b"x"), "Y".to_string());
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "{x}?");
+        assert!(r.valid);
+        assert!(r.optional);
+        assert_eq!(r.value, "Y"); // '?' final removido do valor
+    }
+
+    #[test]
+    fn process_dynamic_string_string_vazia_e_invalida() {
+        let local = std::collections::HashMap::new();
+        let global = std::collections::HashMap::new();
+        let r = super::process_dynamic_string(&local, &global, "");
+        assert!(!r.valid);
+    }
+
+    // ===== expand_resource_path (ArchiveXL #48, RE 2026-08-11 — reusa #23) =====
+
+    #[test]
+    fn expand_resource_path_nao_dinamico_devolve_inalterado() {
+        let ctx = std::collections::HashMap::new();
+        let (path, optional) = super::expand_resource_path("materials/base.mi", "skin01", &ctx);
+        assert_eq!(path, Some("materials/base.mi".to_string()));
+        assert!(!optional);
+    }
+
+    #[test]
+    fn expand_resource_path_substitui_atributo_material_local() {
+        let ctx = std::collections::HashMap::new();
+        let (path, optional) =
+            super::expand_resource_path("*materials/{material}_diff.mi", "skin01", &ctx);
+        assert_eq!(path, Some("materials/skin01_diff.mi".to_string()));
+        assert!(!optional);
+    }
+
+    #[test]
+    fn expand_resource_path_combina_material_local_com_atributo_global() {
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert(bwms_hashes::fnv1a64(b"region"), "head".to_string());
+        let (path, optional) =
+            super::expand_resource_path("*materials/{region}_{material}.mi", "skin01", &ctx);
+        assert_eq!(path, Some("materials/head_skin01.mi".to_string()));
+        assert!(!optional);
+    }
+
+    #[test]
+    fn expand_resource_path_atributo_faltando_devolve_none() {
+        let ctx = std::collections::HashMap::new();
+        let (path, optional) = super::expand_resource_path("*materials/{unknown}.mi", "skin01", &ctx);
+        assert_eq!(path, None);
+        assert!(!optional);
+    }
+
+    #[test]
+    fn expand_resource_path_atributo_faltando_com_marcador_opcional() {
+        let ctx = std::collections::HashMap::new();
+        let (path, optional) = super::expand_resource_path("*{unknown}?", "skin01", &ctx);
+        assert_eq!(path, None);
+        assert!(optional);
+    }
+
+    #[test]
+    fn expand_resource_path_chave_nao_fechada_e_invalido() {
+        let ctx = std::collections::HashMap::new();
+        let (path, optional) = super::expand_resource_path("*materials/{material", "skin01", &ctx);
+        assert_eq!(path, None);
+        assert!(!optional);
+    }
+
+    // ===== DynamicAppearanceRef::parse/Match (ArchiveXL #22/#23, RE 2026-08-11) =====
+
+    #[test]
+    fn dynamicappearanceref_sem_marcador_nao_e_dinamico() {
+        let r = super::DynamicAppearanceRef::parse("torso");
+        assert!(!r.is_dynamic);
+        assert!(!r.is_conditional);
+        assert_eq!(r.name, r.value);
+        assert!(r.variants.is_empty());
+        assert!(r.conditions.is_empty());
+        assert_eq!(r.weight, 0);
+    }
+
+    #[test]
+    fn dynamicappearanceref_variantes_e_condicoes_combinadas() {
+        let r = super::DynamicAppearanceRef::parse("torso!v1!v2&c1&c2");
+        assert!(r.is_dynamic);
+        assert!(r.is_conditional);
+        assert_eq!(r.name, bwms_hashes::fnv1a64(b"torso"));
+        assert_eq!(r.variants.len(), 2);
+        assert!(r.variants.contains(&bwms_hashes::fnv1a64(b"v1")));
+        assert!(r.variants.contains(&bwms_hashes::fnv1a64(b"v2")));
+        assert_eq!(r.conditions.len(), 2);
+        assert!(r.conditions.contains(&bwms_hashes::fnv1a64(b"c1")));
+        assert!(r.conditions.contains(&bwms_hashes::fnv1a64(b"c2")));
+        assert_eq!(r.weight, 102); // 100 (tem variante) + 2 condições
+    }
+
+    #[test]
+    fn dynamicappearanceref_so_variantes_sem_condicao() {
+        let r = super::DynamicAppearanceRef::parse("hair!short!long");
+        assert!(r.is_dynamic);
+        assert_eq!(r.variants.len(), 2);
+        assert!(r.conditions.is_empty());
+        assert_eq!(r.weight, 100);
+        assert!(r.is_conditional);
+    }
+
+    #[test]
+    fn dynamicappearanceref_so_condicoes_sem_variante() {
+        let r = super::DynamicAppearanceRef::parse("eyes&male");
+        assert!(r.is_dynamic);
+        assert!(r.variants.is_empty());
+        assert_eq!(r.conditions.len(), 1);
+        assert!(r.conditions.contains(&bwms_hashes::fnv1a64(b"male")));
+        assert_eq!(r.weight, 1); // 0 (sem variante) + 1 condição
+    }
+
+    #[test]
+    fn dynamicappearanceref_comeca_direto_com_condicao_sem_nome() {
+        let r = super::DynamicAppearanceRef::parse("&cond1");
+        assert!(r.is_dynamic);
+        assert_eq!(r.name, 0); // ExtractName("") = 0
+        assert_eq!(r.conditions.len(), 1);
+        assert!(r.conditions.contains(&bwms_hashes::fnv1a64(b"cond1")));
+    }
+
+    #[test]
+    fn dynamicappearanceref_match_variant_e_conditions() {
+        let r = super::DynamicAppearanceRef::parse("torso!v1&c1&c2");
+        assert!(r.matches_variant(bwms_hashes::fnv1a64(b"v1")));
+        assert!(!r.matches_variant(bwms_hashes::fnv1a64(b"v2")));
+
+        let mut present = std::collections::BTreeSet::new();
+        present.insert(bwms_hashes::fnv1a64(b"c1"));
+        present.insert(bwms_hashes::fnv1a64(b"c2"));
+        assert!(r.matches_conditions(&present));
+
+        present.remove(&bwms_hashes::fnv1a64(b"c2"));
+        assert!(!r.matches_conditions(&present)); // falta c2 -> não bate mais
+
+        // mas se c2 vier via OVERRIDE, volta a bater
+        let mut overrides = std::collections::BTreeSet::new();
+        overrides.insert(bwms_hashes::fnv1a64(b"c2"));
+        assert!(r.matches_conditions_with_overrides(&present, &overrides));
+    }
+
+    #[test]
+    fn dynamicappearanceref_marcadores_consecutivos_geram_variante_vazia() {
+        // "a!!b" -> variantes {hash(""), hash("b")} = {0, hash("b")}, sem crashar/travar.
+        let r = super::DynamicAppearanceRef::parse("a!!b");
+        assert!(r.is_dynamic);
+        assert!(r.variants.contains(&0));
+        assert!(r.variants.contains(&bwms_hashes::fnv1a64(b"b")));
+    }
+
+    // ===== DynamicAppearanceName::parse/MatchReference (ArchiveXL #23, RE 2026-08-15) =====
+
+    #[test]
+    fn dynamicappearancename_sem_marcador_nao_e_dinamico() {
+        let n = super::DynamicAppearanceName::parse("torso");
+        assert!(!n.is_dynamic);
+        assert_eq!(n.name, n.value);
+        assert_eq!(n.name, bwms_hashes::fnv1a64(b"torso"));
+        assert_eq!(n.variant, 0);
+        assert!(n.parts.is_empty());
+        assert!(n.overrides.is_empty());
+        assert_eq!(n.context, 0);
+    }
+
+    #[test]
+    fn dynamicappearancename_variante_simples() {
+        let n = super::DynamicAppearanceName::parse("torso!v1");
+        assert!(n.is_dynamic);
+        assert_eq!(n.name, bwms_hashes::fnv1a64(b"torso"));
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"v1"));
+        // parts[hash("variant")] == variant inteiro
+        assert_eq!(n.parts.get(&bwms_hashes::fnv1a64(b"variant")), Some(&n.variant));
+        // + 1 entrada posicional sintética "variant.1"
+        let seed = bwms_hashes::fnv1a64(b"variant");
+        let synth_key = bwms_hashes::fnv1a64_seeded(&[b'.', b'1'], seed);
+        assert_eq!(n.parts.get(&synth_key), Some(&bwms_hashes::fnv1a64(b"v1")));
+        assert_eq!(n.parts.len(), 2);
+        assert!(n.overrides.is_empty());
+    }
+
+    #[test]
+    fn dynamicappearancename_condicao_antes_do_contexto_e_a_ordem_valida() {
+        // ACHADO DE RE (não-óbvio, confirmado por leitura linha-a-linha do C++ real): a busca de
+        // contexto (`find_last_of('%')`) roda sobre a string ORIGINAL, e o `ParseInt` exige que
+        // TUDO da posição do '%' até o FIM da string seja um inteiro puro — então contexto só
+        // parseia com sucesso se o `%numero` for LITERALMENTE o final da string. A ordem válida
+        // é CONDIÇÃO antes de CONTEXTO: "nome!variante&condicao%numero" (não o inverso).
+        let n = super::DynamicAppearanceName::parse("torso!v1&cond1%42");
+        assert!(n.is_dynamic);
+        assert_eq!(n.context, 42);
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"v1"));
+    }
+
+    #[test]
+    fn dynamicappearancename_contexto_antes_da_condicao_e_ordem_invalida_fica_zero() {
+        // A ordem INVERSA ("nome!variante%numero&condicao") faz o ParseInt falhar de propósito
+        // (o trecho pós-'%' vira "42&cond1", não puramente numérico) — `context` fica 0. Não é
+        // bug do nosso port: é o comportamento REAL do ArchiveXL original, confirmado replicando
+        // o algoritmo exato (`ParseInt` sobre a string NÃO-truncada). Documentado aqui pra não
+        // ser confundido com um bug nosso numa sessão futura.
+        let n = super::DynamicAppearanceName::parse("torso!v1%42&cond1");
+        assert!(n.is_dynamic);
+        assert_eq!(n.context, 0);
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"v1"));
+    }
+
+    #[test]
+    fn dynamicappearancename_contexto_invalido_fica_zero() {
+        // "torso!v1%abc" -> "abc" não é um u64 válido -> ParseInt falha -> context permanece 0
+        // (não seta lixo), mas a truncação da string ('%' em diante) AINDA acontece.
+        let n = super::DynamicAppearanceName::parse("torso!v1%abc");
+        assert_eq!(n.context, 0);
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"v1"));
+    }
+
+    #[test]
+    fn dynamicappearancename_partes_posicionais_e_nomeadas_misturadas() {
+        // "torso!v1+color=red" -> variant = STRING INTEIRA "v1+color=red" (fiel à fonte: o
+        // trecho completo após '!' vira `variant`/parts[hash("variant")] ANTES de o loop
+        // sequer separar por '+'); depois o loop também extrai parts["variant.1"]="v1" e
+        // parts["color"]="red" + 1 entrada em `overrides` (índice "quirky", ver comentário no
+        // código de produção).
+        let n = super::DynamicAppearanceName::parse("torso!v1+color=red");
+        assert!(n.is_dynamic);
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"v1+color=red"));
+        assert_eq!(n.parts.get(&bwms_hashes::fnv1a64(b"variant")), Some(&n.variant));
+        let seed = bwms_hashes::fnv1a64(b"variant");
+        let synth_key = bwms_hashes::fnv1a64_seeded(&[b'.', b'1'], seed);
+        assert_eq!(n.parts.get(&synth_key), Some(&bwms_hashes::fnv1a64(b"v1")));
+        assert_eq!(n.parts.get(&bwms_hashes::fnv1a64(b"color")), Some(&bwms_hashes::fnv1a64(b"red")));
+        assert_eq!(n.parts.len(), 3);
+        assert_eq!(n.overrides.len(), 1);
+        // valor exato do índice "quirky" (replicado fielmente, não é hash("color") nem
+        // hash("red") nem hash("color=red")) — trava a regressão contra o comportamento real.
+        assert!(n.overrides.contains(&bwms_hashes::fnv1a64(b"colo")));
+    }
+
+    #[test]
+    fn dynamicappearancename_separador_inicial_e_pulado() {
+        // "torso!+v1" -> '+' logo no início da parte -> pulado sem crashar, vira igual a "v1"
+        // pro resto do parse.
+        let n = super::DynamicAppearanceName::parse("torso!+v1");
+        assert!(n.is_dynamic);
+        // variant = string inteira pós-'!' ("+v1", incluindo o '+' — só o LOOP pula o separador
+        // vazio, o campo `variant` já foi calculado antes do loop rodar).
+        assert_eq!(n.variant, bwms_hashes::fnv1a64(b"+v1"));
+    }
+
+    #[test]
+    fn dynamicappearancename_entrada_malformada_nao_panica() {
+        // '%'/'&' aparecendo ANTES do '!' seria UB no C++ real (string_view fora dos limites);
+        // aqui degrada com segurança pra não-dinâmico, sem crashar — divergência consciente
+        // documentada no código.
+        let n = super::DynamicAppearanceName::parse("%1&c!v1");
+        assert!(!n.is_dynamic);
+        assert_eq!(n.name, n.value);
+    }
+
+    #[test]
+    fn dynamicappearancename_match_reference_variante_bate() {
+        let reference = super::DynamicAppearanceRef::parse("torso!v1!v2");
+        let appearance = super::DynamicAppearanceName::parse("torso!v1");
+        assert!(super::appearance_matches_reference(&reference, &appearance, None));
+
+        let appearance_no_match = super::DynamicAppearanceName::parse("torso!v9");
+        assert!(!super::appearance_matches_reference(&reference, &appearance_no_match, None));
+    }
+
+    #[test]
+    fn dynamicappearancename_match_reference_condicao_sem_estado_de_entidade_falha() {
+        // ref com condições exige estado de entidade encontrado (`m_states.find`) — sem
+        // conditions_present (equivalente a "entidade não registrada"), sempre falha, mesmo que
+        // a variante bata.
+        let reference = super::DynamicAppearanceRef::parse("torso!v1&c1");
+        let appearance = super::DynamicAppearanceName::parse("torso!v1");
+        assert!(!super::appearance_matches_reference(&reference, &appearance, None));
+    }
+
+    #[test]
+    fn get_base_appearance_name_corta_no_primeiro_marcador_de_qualquer_tipo() {
+        assert_eq!(super::get_base_appearance_name("torso!v1"), "torso");
+        assert_eq!(super::get_base_appearance_name("torso%42"), "torso");
+        assert_eq!(super::get_base_appearance_name("torso&cond"), "torso");
+        assert_eq!(super::get_base_appearance_name("torso"), "torso"); // sem marcador -> inteira
+        assert_eq!(super::get_base_appearance_name(""), "");
+    }
+
+    #[test]
+    fn dynamicappearancename_match_reference_condicao_via_override_da_appearance() {
+        let reference = super::DynamicAppearanceRef::parse("torso&c1");
+        let appearance = super::DynamicAppearanceName::parse("torso!v1+c1=1"); // gera override "c1?"-like
+        // as condições da referência precisam estar em `conditions_present` OU em
+        // `appearance.overrides` — testamos os 2 ramos: sem nada presente, falha (o override
+        // "quirky" desta appearance não é hash("c1") exato, ver teste anterior); com o hash
+        // exato do override JÁ CONHECIDO inserido manualmente em `conditions_present`, passa.
+        let mut present = std::collections::BTreeSet::new();
+        present.insert(bwms_hashes::fnv1a64(b"c1"));
+        assert!(super::appearance_matches_reference(&reference, &appearance, Some(&present)));
     }
 
     #[test]

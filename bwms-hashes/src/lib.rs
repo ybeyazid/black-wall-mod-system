@@ -24,14 +24,59 @@ pub fn fnv1a64_seeded(bytes: &[u8], seed: u64) -> u64 {
 }
 
 /// Hash de ResourcePath do RDAR (o que o depot usa p/ resolver .archive): FNV-1a 64-bit do path
-/// NORMALIZADO (`/`→`\`, minúsculas). É o coração do resource.link/copy do ArchiveXL. PROVADO
-/// 5/5 goldens reais (testes em `bwms-core/apply_xl.rs`). Fonte única do runtime E do offline.
+/// NORMALIZADO. É o coração do resource.link/copy do ArchiveXL. PROVADO 5/5 goldens reais
+/// (testes em `bwms-core/apply_xl.rs`). Fonte única do runtime E do offline.
+///
+/// Sanitização REAL do motor (RED4ext.SDK `HashSanitized`, `PENDENCIAS-UNIFICADAS.md` item #395,
+/// achado 2026-08-07 — fix aplicado 2026-08-10): 5 regras, nesta ordem, ANTES do loop de hash:
+/// (1) descarta 1 aspas de abertura E 1 de fechamento (simples ou duplas), se presentes;
+/// (2) descarta TODAS as barras/contrabarras iniciais (não só 1);
+/// (3) colapsa barras/contrabarras repetidas em sequência pra 1 só;
+/// (4) converte toda barra `/` pra contrabarra `\` (separador canônico);
+/// (5) converte pra minúsculas.
+/// + trunca em 216 bytes máx (pós-normalização); string vazia ou 100% descartada → hash=0.
+/// As regras (2)/(3)/(4)/(5) e o truncamento afetam a mesma posição relativa umas às outras
+/// (colapso considera o resultado JÁ normalizado — uma barra seguida de contrabarra também
+/// colapsa, já que ambas viram `\` antes da checagem de repetição).
 pub fn resource_path_hash(path: &str) -> u64 {
+    let mut bytes = path.as_bytes();
+    // Regra 1: 1 aspas de abertura (simples ou dupla), se o primeiro byte for uma.
+    if matches!(bytes.first(), Some(b'"') | Some(b'\'')) {
+        bytes = &bytes[1..];
+    }
+    // Regra 1: 1 aspas de fechamento (simples ou dupla), se o último byte for uma.
+    if matches!(bytes.last(), Some(b'"') | Some(b'\'')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    // Regra 2: TODAS as barras/contrabarras iniciais.
+    while matches!(bytes.first(), Some(b'/') | Some(b'\\')) {
+        bytes = &bytes[1..];
+    }
+
+    // Regras 3+4+5 num passe só + truncamento (216 bytes, contados PÓS-normalização/colapso).
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len().min(216));
+    let mut prev_was_sep = false;
+    for &b in bytes {
+        let norm = if b == b'/' || b == b'\\' { b'\\' } else { b.to_ascii_lowercase() };
+        if norm == b'\\' {
+            if prev_was_sep {
+                continue; // Regra 3: colapsa repetição.
+            }
+            prev_was_sep = true;
+        } else {
+            prev_was_sep = false;
+        }
+        buf.push(norm);
+        if buf.len() >= 216 {
+            break;
+        }
+    }
+
+    if buf.is_empty() {
+        return 0;
+    }
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for b in path
-        .bytes()
-        .map(|c| if c == b'/' { b'\\' } else { c.to_ascii_lowercase() })
-    {
+    for b in buf {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -263,14 +308,133 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
+/// `GeneratePhaseNodeID` do ArchiveXL real (`App::QuestPhaseExtension::GeneratePhaseNodeID`,
+/// `App/Extensions/QuestPhase/Extension.cpp`) — o ID determinístico (16-bit) que o sistema de
+/// EDIÇÃO DE GRAFO de quest (`PatchPhase`/`CreatePhaseNode`) atribui a cada nó novo inserido
+/// num `questGraphDefinition`, derivado de `"<phasePath>:<parentNodeId>"` (chave textual, evita
+/// colisão entre patches de mods diferentes no MESMO grafo). Peça `#35`/`#56` do catálogo
+/// ArchiveXL — a única sub-parte 100% algoritmo puro (sem `Core::RawFunc`/endereço nativo) das 7
+/// funções do sistema de patch de grafo; as outras 6 (`PatchPhase`/`FindConnectionPoint`/
+/// `ResolveSocket`/`AddConnection`/`RemoveConnection`/`CreatePhaseNode`) só operam sobre um
+/// `Handle<questGraphDefinition>` vivo — só alcançável de dentro do hook
+/// `Raw::QuestLoader::ProcessPhaseResource` (endereço Mac ainda não resolvido, `AddressLib`-only
+/// no Windows), então ficam sem via de teste até esse endereço ser achado.
+///
+/// **Confirmado ser CRC-16/CCITT-FALSE clássico** (poly `0x1021`, init `0xFFFF`, sem reflexão,
+/// sem xorout) — a forma bit-a-bit do C++ real (`x = crc>>8 ^ *data; x ^= x>>4; crc = (crc<<8) ^
+/// (x<<12) ^ (x<<5) ^ x`) é uma implementação alternativa (tabela-livre) do MESMO algoritmo:
+/// bate exato com o valor-de-checagem padrão da indústria pra `"123456789"` (`0x29B1`), não só
+/// autoconsistência com o C++ transcrito — 2ª fonte independente confirmando a leitura do
+/// código-fonte estar correta.
+pub fn quest_phase_node_id(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        let mut x = ((crc >> 8) as u8) ^ byte;
+        x ^= x >> 4;
+        crc = (crc << 8) ^ ((x as u16) << 12) ^ ((x as u16) << 5) ^ (x as u16);
+    }
+    crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn quest_phase_node_id_crc16_ccitt_false_check_value() {
+        // Valor-de-checagem PADRÃO da indústria pro CRC-16/CCITT-FALSE — confirma que a leitura
+        // do algoritmo do C++ real (App::QuestPhaseExtension::GeneratePhaseNodeID) está certa
+        // por uma 2ª fonte independente, não só transcrição.
+        assert_eq!(quest_phase_node_id(b"123456789"), 0x29B1);
+    }
+
+    #[test]
+    fn quest_phase_node_id_vazio_e_determinismo() {
+        // Vazio = o init puro (nunca entra no loop).
+        assert_eq!(quest_phase_node_id(b""), 0xFFFF);
+        // Determinístico: mesma entrada -> mesmo ID sempre (propriedade que o sistema de patch
+        // de grafo depende pra "mesmo mod, mesmo parent" nunca colidir consigo mesmo entre boots).
+        let key = b"mymod\\phase.questphase:12";
+        assert_eq!(quest_phase_node_id(key), quest_phase_node_id(key));
+    }
+
+    #[test]
+    fn quest_phase_node_id_sensivel_a_1_byte() {
+        // Muda 1 char da chave (ex. o parentID no sufixo ":N") -> ID diferente (evita reusar
+        // acidentalmente o mesmo node-id pra parents diferentes na mesma fase).
+        let a = quest_phase_node_id(b"mymod\\phase.questphase:0");
+        let b = quest_phase_node_id(b"mymod\\phase.questphase:1");
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn fnv1a64_vetores_padrao() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    // ===== `resource_path_hash` — fix do item #395 (`PENDENCIAS-UNIFICADAS.md`, achado
+    // 2026-08-07, corrigido 2026-08-10): as 5 regras de sanitização, testadas por
+    // AUTOCONSISTÊNCIA (path "sujo" deve hashear IGUAL ao equivalente já limpo à mão — não temos
+    // golden real do motor pra um path sujo, mas a regra em si é mecânica/determinística) +
+    // regressão dos 5 goldens reais (replicados aqui, fonte: `bwms-core/apply_xl.rs`).
+    #[test]
+    fn resource_path_hash_goldens_reais_preservados() {
+        // 5/5 goldens reais do índice de `basegame_zzbwms_quadra_e3.archive` — o fix NÃO pode
+        // mudar o hash de paths já limpos (sem barra inicial/dupla/aspas, <216 chars).
+        let g = [
+            ("base\\surfaces\\materials\\default\\white.xbm", 0x3959_590b_0d88_8df1u64),
+            ("base\\vehicles\\common\\wheels\\wheel_quadra_turbo_clean_01.mlsetup", 0xc007_6ea3_a1d9_a9edu64),
+            ("base\\surfaces\\microblends\\default.xbm", 0xf78f_7031_24ea_fb22u64),
+            ("base\\surfaces\\materials\\metal\\metal_generic\\metal_generic_bare_01_300_d.xbm", 0x79c9_5673_c0d4_c73au64),
+            ("base\\resource.cooked_mlsetup", 0x3a12_b4fd_1938_d5cau64),
+        ];
+        for (p, h) in g {
+            assert_eq!(resource_path_hash(p), h, "hash de {p} mudou — fix quebrou regressão");
+        }
+    }
+
+    #[test]
+    fn resource_path_hash_strip_barra_inicial() {
+        let clean = resource_path_hash("base\\characters\\foo.mesh");
+        assert_eq!(resource_path_hash("/base\\characters\\foo.mesh"), clean);
+        assert_eq!(resource_path_hash("\\base\\characters\\foo.mesh"), clean);
+        // TODAS as iniciais, não só 1.
+        assert_eq!(resource_path_hash("///base\\characters\\foo.mesh"), clean);
+        assert_eq!(resource_path_hash("\\\\\\base\\characters\\foo.mesh"), clean);
+    }
+
+    #[test]
+    fn resource_path_hash_colapsa_barras_repetidas() {
+        let clean = resource_path_hash("base\\characters\\foo.mesh");
+        assert_eq!(resource_path_hash("base//characters\\foo.mesh"), clean);
+        assert_eq!(resource_path_hash("base\\\\characters\\foo.mesh"), clean);
+        // mistura / e \ repetidos também colapsa (ambos normalizam pra \ antes da checagem).
+        assert_eq!(resource_path_hash("base/\\characters\\foo.mesh"), clean);
+    }
+
+    #[test]
+    fn resource_path_hash_strip_aspas() {
+        let clean = resource_path_hash("base\\characters\\foo.mesh");
+        assert_eq!(resource_path_hash("\"base\\characters\\foo.mesh\""), clean);
+        assert_eq!(resource_path_hash("'base\\characters\\foo.mesh'"), clean);
+        // só 1 de cada lado é removida (a regra é "descarta 1 aspas de abertura/fechamento").
+        assert_ne!(resource_path_hash("\"\"base\\characters\\foo.mesh\"\""), clean);
+    }
+
+    #[test]
+    fn resource_path_hash_trunca_216_bytes() {
+        let long_clean = "a".repeat(216);
+        let over = format!("{}extra_que_devia_sumir", "a".repeat(216));
+        assert_eq!(resource_path_hash(&over), resource_path_hash(&long_clean));
+    }
+
+    #[test]
+    fn resource_path_hash_string_vazia_ou_toda_descartada() {
+        assert_eq!(resource_path_hash(""), 0);
+        assert_eq!(resource_path_hash("/"), 0);
+        assert_eq!(resource_path_hash("////"), 0);
+        assert_eq!(resource_path_hash("\""), 0);
     }
 
     #[test]

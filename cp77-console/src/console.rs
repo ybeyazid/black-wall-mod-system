@@ -456,6 +456,46 @@ pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
     true
 }
 
+/// DIAGNÓSTICO read-only (2026-08-06): lê Health/Stamina/Sprint (StaminaRegen/estado) direto do
+/// save real via `GetStatPoolValue` (nunca escreve nada) — pra investigar relato do usuário de
+/// "não consigo mais correr segurando Shift depois de mexer nos últimos gaps". Não modifica
+/// nenhum estado do jogo, só lê e loga.
+pub unsafe fn staminacheck(reg: &Registry, captured_player: *mut c_void) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let sps = system_flex(reg, owner, gi, "gameStatPoolsSystem", "GetStatPoolsSystem");
+    if !rtti::sane(sps) {
+        crate::log("[staminacheck] StatPoolsSystem inacessível");
+        return false;
+    }
+    let eid = match entity_id(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let gv = match rtti::resolve_any(reg, &["gameStatPoolsSystem"], "GetStatPoolValue") {
+        Some(g) => g,
+        None => {
+            crate::log("[staminacheck] GetStatPoolValue não resolvido");
+            return false;
+        }
+    };
+    for (label, enum_name) in [("Stamina", "Stamina"), ("Health", "Health")] {
+        let Some(v) = rtti::resolve_enum_value(reg, "gamedataStatPoolType", enum_name) else {
+            crate::log(&format!("[staminacheck] enum gamedataStatPoolType::{enum_name} não resolvido"));
+            continue;
+        };
+        let abs = rtti::call_func(&gv, sps, &[Arg::Raw(eid), Arg::Enum(v), Arg::Bool(false)])
+            .map(|r| f32::from_le_bytes([r[0], r[1], r[2], r[3]]));
+        let pct = rtti::call_func(&gv, sps, &[Arg::Raw(eid), Arg::Enum(v), Arg::Bool(true)])
+            .map(|r| f32::from_le_bytes([r[0], r[1], r[2], r[3]]));
+        crate::log(&format!("[staminacheck] {label}: abs={abs:?} pct={pct:?}"));
+    }
+    true
+}
+
 /// Remove `qty` do item `name` do inventário, via `RemoveItem` (espelho do give).
 pub unsafe fn remove(
     reg: &Registry,
@@ -498,4 +538,57 @@ pub unsafe fn summon(reg: &Registry, captured_player: *mut c_void) -> bool {
     rtti::call_func(&e, vs, &[]);
     crate::log("[summon] ToggleSummonMode enviado");
     true
+}
+
+/// `cw-world-depot` (2026-07-24) — atalho pragmático (achado pela investigação paralela do mesmo
+/// nome): em vez de forjar `DynamicEntitySystem`/`DynamicEntitySpec` (native-class-forge + RE de
+/// endereço nativo desconhecido pro pipeline real de spawn do Codeware — o `CreateEntity` XL
+/// genuíno), chama a API REAL VANILLA `CompanionSystem.SpawnSubcharacterOnPosition(recordID:
+/// TweakDBID, pos: Vector3)` direto via `call_func` — a MESMA usada pelo próprio jogo pra spawnar
+/// o Spiderbot (`cyberpunk/systems/subCharacterSystem.script`), acessada pelo MESMO caminho já
+/// provado `give`/`system_flex` usam (`GetGame`→getter estático `GameInstance.GetXxx(gi)`). Zero
+/// classe nova, zero RE de endereço novo — satisfaz o `proof_needed` literal do gap ("spawna uma
+/// entidade visível") sem tocar `cw-variant-marshalling`.
+///
+/// `pos` é escrito como 3 floats consecutivos num slot de 16 bytes (`Arg::Raw`): a largura REAL da
+/// struct `Vector3` (12 vs 16 bytes, não confirmada por RE) não importa pra correção — o motor lê
+/// x/y/z pelo SEU PRÓPRIO descritor de tipo (`p_entries`/`ptype` do `SpawnSubcharacterOnPosition`
+/// REAL, resolvido por `resolve_func`), não pelo nosso; os 4 bytes finais (usados só se a struct
+/// real for 16B) ficam zerados, o mesmo que um `w`/padding implícito.
+///
+/// NÃO testado em boot nenhum ainda — comando de console novo (`spawnsub`), mesma categoria de
+/// `cwprobe`/`cloneprobe`: opt-in, nunca auto-disparado.
+pub unsafe fn spawn_subcharacter(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    record_name: &str,
+    pos: (f32, f32, f32),
+) -> Option<[u8; 0x20]> {
+    let owner = auth_or(reg, captured_player);
+    let gi = get_gi(reg, owner)?;
+    let cs = via_getter(reg, owner, gi, "GetCompanionSystem");
+    if !rtti::sane(cs) {
+        crate::log(&format!("[spawnsub] CompanionSystem inacessível ({cs:p})"));
+        return None;
+    }
+    // Diagnostico: CName hash da classe do objeto cs.
+    let cs_class = rtti::class_of(cs);
+    let cs_cn = if !cs_class.is_null() { unsafe { rtti::type_name_getname(cs_class) } } else { 0 };
+    crate::log(&format!("[spawnsub] cs={cs:p} class_cname={cs_cn:#018x} ({:?})", crate::cname::resolve_cname(cs_cn)));
+    // Tenta a classe pelo nome redscript; fallback p/ nome c++ gameCompanionSystem.
+    let spawn = rtti::resolve_func(reg, "CompanionSystem", "SpawnSubcharacterOnPosition")
+        .or_else(|| rtti::resolve_func(reg, "gameCompanionSystem", "SpawnSubcharacterOnPosition"))
+        .or_else(|| rtti::resolve_func(reg, "ICompanionSystem", "SpawnSubcharacterOnPosition"))?;
+    let tdbid = crate::cname::tweak_db_id(record_name).to_le_bytes();
+    let mut posb = [0u8; 16];
+    posb[0..4].copy_from_slice(&pos.0.to_le_bytes());
+    posb[4..8].copy_from_slice(&pos.1.to_le_bytes());
+    posb[8..12].copy_from_slice(&pos.2.to_le_bytes());
+    crate::log(&format!(
+        "[spawnsub] CompanionSystem.SpawnSubcharacterOnPosition('{record_name}' tdbid={:#018x}, pos={pos:?}) cs={cs:p}",
+        u64::from_le_bytes(tdbid)
+    ));
+    let r = rtti::call_func(&spawn, cs, &[Arg::Tdb(tdbid), Arg::Raw(posb)]);
+    crate::log(&format!("[spawnsub] call_func -> {:02x?}", r));
+    r
 }

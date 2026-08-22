@@ -33,14 +33,21 @@
 // revertido pro padrão seguro (devolve null, mesmo esquema documentado desde 2026-07-13 — quebra
 // encadeamento, não crasha). Ver `register.rs::tramp_cbs_register_callback` pro relato RE completo
 // + `cp77-symbols/notes/proofs/2026-07-18-cw-callback-handler-*.log`.
+// Assinaturas de INTEROPERABILIDADE. Um mod escrito para o ecossistema de PC chama estes nomes;
+// para ele funcionar aqui, nome e forma precisam casar — isso é interface, e a implementação por
+// trás de cada uma é própria, em Rust (`register.rs::register_callbacksystem`). Agrupadas por
+// ciclo de vida (montar o registro -> consultar -> desfazer).
 public native class CallbackSystemHandler {
+    // montar o registro (encadeável)
     public native func AddTarget(target: ref<CallbackSystemTarget>) -> ref<CallbackSystemHandler>
-    public native func RemoveTarget(target: ref<CallbackSystemTarget>) -> ref<CallbackSystemHandler>
-
     public native func SetRunMode(runMode: CallbackRunMode) -> ref<CallbackSystemHandler>
     public native func SetLifetime(lifetime: CallbackLifetime) -> ref<CallbackSystemHandler>
 
+    // consultar
     public native func IsRegistered() -> Bool
+
+    // desfazer
+    public native func RemoveTarget(target: ref<CallbackSystemTarget>) -> ref<CallbackSystemHandler>
     public native func Unregister()
 
     // BWMS-ONLY — NÃO existe na fonte real do Codeware. Expõe o filtro de alvos (a lista que
@@ -77,6 +84,60 @@ public abstract native class CallbackSystemEvent {
 // confirmou classes forjadas SEM métodos são sempre seguras — o risco é específico de MÉTODOS com
 // tipo ref<classe-forjada>.
 public abstract native class CallbackSystemTarget {}
+
+// `ComponentTarget extends CallbackSystemTarget` (2026-07-24, `cw-event-target-classes`) — as 2
+// fábricas estáticas (`ID`/`Name`) usam `is_static=true` NUMA CLASSE FORJADA por nós, combinação
+// nunca testada ao vivo antes (ver nota grande em `register.rs::register_componenttarget`) — os
+// dois pilares (is_static=true em geral; new_object+make_handle sem self) já foram provados
+// separadamente, mas não juntos. NÃO marcar como provado até um boot confirmar.
+public native class ComponentTarget extends CallbackSystemTarget {
+    public static native func ID(id: CRUID) -> ref<ComponentTarget>
+    public static native func Name(name: CName) -> ref<ComponentTarget>
+}
+
+// 5 subclasses NOVAS `extends CallbackSystemTarget` (2026-07-24, rodada 2 — mesma sessão do
+// `ComponentTarget` acima, MESMO veredito de risco: `is_static=true` + `new_object`+`make_handle`
+// numa classe FORJADA por nós, combinação ainda NÃO testada ao vivo — ver nota grande em
+// `register.rs::register_componenttarget`). Fontes reais confirmadas por leitura direta em
+// `enablers/Codeware/scripts/Callback/Targets/*.reds`: todas `extends CallbackSystemTarget`
+// DIRETO (nenhuma via parent intermediário). `array<T>` (`Tags`) e `EntityID` (`ID`) seguem de
+// fora (marshalling separado, não coberto). `InputTarget` (usa `EInputKey`/`EInputAction`) fica
+// declarada mais abaixo, perto do enum `EInputAction` (ver lá).
+//
+// RODADA 3 (2026-07-24, mesma sessão): `"ResRef"` entrou no whitelist `escalar` de `rtti.rs` (lê
+// como o hash `ResourcePath`/u64, mesma representação canônica de `resource.link`) — destrava
+// `Path`/`Library`/`Template`/`Definition`, adicionados agora. `Appearance` também adicionado:
+// achado que sua assinatura real usa `CName`, não `ResRef` (tinha ficado de fora por engano de
+// escopo da rodada 2, não por dependência real).
+public native class ResourceTarget extends CallbackSystemTarget {
+    public static native func Type(resourceType: CName) -> ref<ResourceTarget>
+    public static native func Path(resourcePath: ResRef) -> ref<ResourceTarget>
+}
+
+public native class inkWidgetTarget extends CallbackSystemTarget {
+    public static native func Controller(type: CName) -> ref<inkWidgetTarget>
+    public static native func Library(library: ResRef, opt item: CName) -> ref<inkWidgetTarget>
+}
+
+public native class DynamicEntityTarget extends CallbackSystemTarget {
+    public static native func Tag(tag: CName) -> ref<DynamicEntityTarget>
+    // Codeware `#133`, 2026-08-18: fábrica PLURAL, insere TODAS as tags do array no mesmo
+    // Set<CName> que `.Tag(x)` usa (mesma semântica OR do `Matches()` real, ver register.rs
+    // `tramp_dyt_tags`). 1ª native deste projeto a receber `array<CName>` como parâmetro.
+    public static native func Tags(tags: array<CName>) -> ref<DynamicEntityTarget>
+}
+
+public native class StaticEntityTarget extends CallbackSystemTarget {
+    public static native func Tag(tag: CName) -> ref<StaticEntityTarget>
+}
+
+public native class EntityTarget extends CallbackSystemTarget {
+    public static native func Type(entityType: CName) -> ref<EntityTarget>
+    public static native func RecordID(recordID: TweakDBID) -> ref<EntityTarget>
+    public static native func Template(templatePath: ResRef) -> ref<EntityTarget>
+    public static native func Appearance(appearanceName: CName) -> ref<EntityTarget>
+    public static native func Definition(appearancePath: ResRef, opt definitionName: CName) -> ref<EntityTarget>
+}
 
 // `cw-rawinput-realname` — TENTADO e REVERTIDO (2026-07-13): `KeyInputEvent extends
 // CallbackSystemEvent` (native) CRASHOU o boot (EXC_BREAKPOINT/SIGTRAP dentro do assert-handler
@@ -137,7 +198,35 @@ public abstract native class CallbackSystemTarget {}
 // separado, documentado. `GetKey()->EInputKey` (tipo REAL pré-primado) fica dentro do teste — é o
 // teste MAIS LIMPO possível da hipótese "enum-return quebra o bind" com um enum genuinamente já
 // conhecido pelo sistema, ao contrário do `BwmsTestEnum` sintético do round anterior.
+
+// RETOMADA (2026-07-24): `GetAction()` fechado. A nota acima assumia que `EInputAction` precisava
+// ser um ENUM NATIVO (RE nova, forjar CEnum no RTTI) porque o tipo não existe em nenhum .script
+// vanilla — mas isso só é verdade se algo NATIVO fora do nosso próprio bytecode precisasse
+// consumir esse enum. Aqui não precisa: `GetAction()` só é chamado por `.reds` que NÓS compilamos
+// (o scc resolve `EInputAction` contra QUALQUER declaração de enum no MESMO bundle, nativa ou
+// não). Declarando um enum de SCRIPT PURO (sem `native`) com esse nome, `scc -compile` resolve
+// limpo — testado offline numa cópia scratch de `r6/scripts` antes de tocar o deploy real, 0 erro
+// de compilação. `tramp_kie_get_action` (register.rs) já existia e lê o valor de `KEYINPUT_STATES`
+// (fixture action=2) — só faltava a declaração do tipo aqui + o `register_method` no Rust.
+//
+// RETOMADA (2026-08-05, blind-spot audit): valores/nomes ORIGINAIS (Press/Release/Hold/
+// HoldComplete/Repeat) eram invenção nossa, nunca conferida contra a fonte real do Codeware
+// (`enablers/Codeware/scripts/Base/Imports/EInputAction.reds`) — testei GetAction() AO VIVO
+// (`bwms-blindspot-tests.reds`) e confirmou o mecanismo 100% funcional (fixture action=2 →
+// GetAction()=2, zero crash), então o único problema era semântico: mods reais de Windows que
+// checam `action == EInputAction.IACT_Press` receberiam o valor errado com os nomes antigos.
+// Corrigido pros valores REAIS (IACT_None=0/IACT_Press=1/IACT_Release=2/IACT_Axis=3) — compatível
+// byte-a-byte com o import real do Codeware, sem precisar de CreateScriptedEnum (é enum de script
+// puro, resolvido só contra o bytecode que NÓS compilamos).
+enum EInputAction {
+    IACT_None = 0,
+    IACT_Press = 1,
+    IACT_Release = 2,
+    IACT_Axis = 3,
+}
+
 public native class KeyInputEvent extends CallbackSystemEvent {
+    public native func GetAction() -> EInputAction
     public native func GetKey() -> EInputKey
     public native func IsShiftDown() -> Bool
     public native func IsControlDown() -> Bool
@@ -149,6 +238,83 @@ public native class KeyInputEvent extends CallbackSystemEvent {
 // real entregaria a um listener. Prova a mecânica (forja+registro+construção+GetKey/GetAction)
 // sem depender do wiring de teclado real (RawInput controller, gap separado, maior).
 public static native func BwmsMakeTestKeyInputEvent() -> ref<KeyInputEvent>
+
+// `InputTarget extends CallbackSystemTarget` (2026-07-24, rodada 2 do `cw-event-target-classes` —
+// ver nota grande acima de `ResourceTarget` pro veredito de risco compartilhado). Declarada aqui
+// (não junto dos outros 5 `Target`s acima) porque usa `EInputKey`/`EInputAction`, ambos já
+// declarados/primados por este ponto do arquivo. `Key`/`Axis` são as 2 fábricas estáticas reais
+// (`Callback/Targets/InputTarget.reds`); nenhum tipo `ResRef`/`array<T>` envolvido — os 2 métodos
+// ficam DENTRO de escopo (categoria já provada: enum-como-param + Float-como-param).
+public native class InputTarget extends CallbackSystemTarget {
+    public static native func Key(key: EInputKey, opt action: EInputAction) -> ref<InputTarget>
+    public static native func Axis(axis: EInputKey, opt threshold: Float) -> ref<InputTarget>
+}
+
+// `cw-event-target-classes` (2026-07-24): `AxisInputEvent extends KeyInputEvent` — fonte real
+// (Codeware `Events/AxisInputEvent.reds`), zero tipo novo (Float/Uint32 já usados em várias
+// natives deste projeto). Ver `register.rs::register_axisinputevent`.
+public native class AxisInputEvent extends KeyInputEvent {
+    public native func GetValue() -> Float
+    public native func GetMouseX() -> Uint32
+    public native func GetMouseY() -> Uint32
+}
+public static native func BwmsMakeTestAxisInputEvent() -> ref<AxisInputEvent>
+
+// `cw-event-target-classes` (2026-07-24): `VehicleLightControlEvent extends
+// EntityLifecycleEvent` — `vehicleELightType` é enum REAL vanilla (`orphans.script:401`,
+// pré-primado, mesma categoria de `EInputKey`). `IsLightType` lê o param como enum — mesmo
+// padrão já provado em `CallbackSystemHandler.SetRunMode`/`SetLifetime`.
+public native class VehicleLightControlEvent extends EntityLifecycleEvent {
+    public native func IsEnabled() -> Bool
+    public native func IsLightType(lightType: vehicleELightType) -> Bool
+}
+public static native func BwmsMakeTestVehicleLightControlEvent() -> ref<VehicleLightControlEvent>
+
+// `cw-event-target-classes` (2026-07-24, item Codeware #9): `EntityComponentEvent extends
+// EntityLifecycleEvent`. Divergência FECHADA 2026-08-11: `GetComponent` volta a devolver
+// `wref<IComponent>` (assinatura real), via `rtti::make_weak_handle` — mesma técnica que fechou
+// RED4ext.SDK #387 pra `EntityLifecycleEvent.GetEntity`.
+public native class EntityComponentEvent extends EntityLifecycleEvent {
+    public native func GetComponent() -> wref<IComponent>
+}
+public static native func BwmsMakeTestEntityComponentEvent() -> ref<EntityComponentEvent>
+
+// Codeware `#11` (`inkWidgetSpawnEvent`, candidato barato 2026-08-11, 6ª rodada de mineração):
+// `inkWidgetSpawnEvent extends CallbackSystemEvent` — fonte real (`App/Callback/Events/
+// InkWidgetSpawnEvent.hpp`) declara 3 campos (`itemInstance`/`libraryPath`/`itemName`).
+// `GetLibraryPath() -> Uint64` (hash, mesma via já usada em `ResourceEvent.GetPath` pra evitar
+// reabrir RE de marshalling `ResRef`-como-retorno) e `GetItemName() -> CName`.
+//
+// `GetItemInstance()` — CORREÇÃO DE RISCO 2026-08-18 (recheck contra o header Generated/, mesma
+// técnica que destravou `#107`/`#33`): `inkWidgetLibraryItemInstance` É um tipo RTTI GENUÍNO desta
+// build (`RED4ext.SDK/.../Generated/ink/WidgetLibraryItemInstance.hpp`, "gerado da Reflection
+// real do jogo" + confirmado por 2ª via independente em
+// `enablers/Codeware/scripts/Base/Imports/inkWidgetLibraryItemInstance.reds`, 1 dos 374 arquivos
+// auto-descobertos por scraper de reflection RTTI) — a nota antiga ("ZERO hits em redscript-src")
+// checava só o corpus decompilado do JOGO, não os headers/`.reds` do próprio framework. MAS
+// `inkWidgetLibraryItemInstance extends ISerializable` (raiz, sem `IScriptable` no meio) é a MESMA
+// categoria que crashou o bind RTTI 2x nesta sessão (`#48`/`#49`) — NUNCA declarar essa classe.
+// `GetItemInstance() -> ref<IScriptable>` (tipo widened, mesma disciplina de `#160`/`#18`) resolve
+// via side-table, sem nunca tipar/registrar `inkWidgetLibraryItemInstance`.
+public native class inkWidgetSpawnEvent extends CallbackSystemEvent {
+    public native func GetLibraryPath() -> Uint64
+    public native func GetItemName() -> CName
+    public native func GetItemInstance() -> ref<IScriptable>
+}
+public static native func BwmsMakeTestInkWidgetSpawnEvent() -> ref<inkWidgetSpawnEvent>
+
+// Codeware `#123` (`WidgetSpawningService::ToggleWidgetSpawnEvent`, investigação dedicada
+// 2026-08-19): a fonte real (`App/UI/WidgetSpawningService.hpp/.cpp`) é 1 linha —
+// `s_widgetSpawnEventEnabled = aState` — sem endereço nativo nenhum. Liga/desliga o despacho
+// REAL de "InkWidget/Spawn" a partir dos hooks já existentes de `axl-inkspawner-apply`
+// (`SpawnFromLocal`/`SpawnFromExternal`, `cp77-console/src/selftest.rs`, RE offline 2026-07-28/29,
+// nunca testados ao vivo). CODADO+COMPILA (2026-08-19), zero registro/hook novo além do já
+// existente — só religa 2 mecanismos já provados separadamente (o hook do spawn + o forge da
+// classe `inkWidgetSpawnEvent` acima, item `#11` já FECHADO). Gate opt-in por marcador
+// `~/.bwms-inkspawner-fireevent-confirm` (nunca ligado por padrão, mesma disciplina do
+// `#461`/`cw-ctrl-misc`) — a 1ª ativação ao vivo fica pra sessão futura com monitoramento de
+// crash dedicado.
+public static native func BwmsToggleWidgetSpawnEvent(state: Bool) -> Bool
 
 // `cw-controller-session` (2026-07-18): `GameSessionEvent extends CallbackSystemEvent`, mesma
 // receita robusta de `KeyInputEvent`. Despachado via "Session/Start"/"Session/End" (nomes REAIS
@@ -179,8 +345,12 @@ public native class GameSessionEvent extends CallbackSystemEvent {
 // (diferente de uma weak-ref de verdade). Seguro pra uso SÍNCRONO no mesmo dispatch (o caso de
 // uso normal); mods que guardarem o handle entre frames podem ficar com ponteiro pendurado se o
 // entity for destruído — risco documentado, não testado neste round (fora de escopo).
+// ATUALIZAÇÃO 2026-08-11 (RED4ext.SDK #387, `rtti::make_weak_handle`): `GetEntity()` agora
+// devolve `wref<Entity>` REAL (não mais o `ref<Entity>` "raw" da divergência documentada acima,
+// que ficou obsoleta) — testado ao vivo, `IsDefined()==true` confirmado. Ver
+// proofs/2026-08-11-red4ext-387-weakhandle-PROVADO.log.
 public native class EntityLifecycleEvent extends CallbackSystemEvent {
-    public native func GetEntity() -> ref<Entity>
+    public native func GetEntity() -> wref<Entity>
 }
 
 // `cw-controller-misc` (2026-07-19): `ResourceEvent extends CallbackSystemEvent`, mesma receita
@@ -198,17 +368,27 @@ public native class ResourceEvent extends CallbackSystemEvent {
     public native func GetPath() -> Uint64
 }
 
+// Superfície de INTEROPERABILIDADE do sistema de callback. São só assinaturas: nenhum corpo mora
+// aqui, e cada uma é atendida por implementação própria em Rust
+// (`register.rs::register_callbacksystem`, registry própria, marshalling próprio). Os nomes e os
+// tipos precisam casar exatamente com o que um mod escrito para o ecossistema de PC chama — é o
+// formato do plugue, não a máquina por trás dele. Agrupadas por operação (assinar / cancelar /
+// declarar / disparar), com o par instância+estático junto em cada grupo.
 public native class CallbackSystem extends IGameSystem {
+    // assinar
     public native func RegisterCallback(eventName: CName, target: ref<IScriptable>, function: CName, opt sticky: Bool) -> ref<CallbackSystemHandler>
     public native func RegisterStaticCallback(eventName: CName, target: CName, function: CName, opt sticky: Bool) -> ref<CallbackSystemHandler>
 
-    public native func UnregisterCallback(eventName: CName, target: ref<IScriptable>, opt function: CName)
-    public native func UnregisterStaticCallback(eventName: CName, target: CName, opt function: CName)
-
+    // declarar um evento próprio antes de usá-lo
     public native func RegisterEvent(eventName: CName, opt eventType: CName) -> Bool
 
+    // disparar
     public native func DispatchEvent(eventObject: ref<CallbackSystemEvent>)
     public native func DispatchEventAs(eventName: CName, eventObject: ref<CallbackSystemEvent>)
+
+    // cancelar
+    public native func UnregisterCallback(eventName: CName, target: ref<IScriptable>, opt function: CName)
+    public native func UnregisterStaticCallback(eventName: CName, target: CName, opt function: CName)
 }
 
 // `cw-event-target-classes` — TESTE ISOLADO enum-return, 2026-07-18 (sessão `handle-ctor-re`),

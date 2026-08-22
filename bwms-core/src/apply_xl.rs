@@ -104,10 +104,109 @@ pub fn build_apply_plan(xl: &XlFile) -> XlApplyPlan {
     };
     note(xl.factories.len(), "factories (gated: hook LoadFactoryAsync)");
     note(xl.patches.len(), "patches (gated: patch de props em runtime)");
-    note(xl.scopes.len(), "scopes");
-    note(xl.fixes.len(), "fixes");
     note(xl.localization.len(), "localization (gated: loader onscreen/subtitle)");
+    // scope/fix: incluídos via build_scope_table/build_fix_names_table (não unsupported)
+    let _ = (xl.scopes.len(), xl.fixes.len());
     p
+}
+
+/// Builds a scope expansion table: scope_hash → Vec<target_hash>.
+/// Replicates ArchiveXL ResourceMetaExtension::Configure() — expands transitive scopes
+/// (A → B, B → C becomes A → [C]) following the do-while loop in Extension.cpp.
+pub fn build_scope_table(xl: &XlFile) -> HashMap<u64, Vec<u64>> {
+    let mut table: HashMap<u64, Vec<u64>> = HashMap::new();
+    for sc in &xl.scopes {
+        let scope_h = resource_path_hash(&sc.resource);
+        let targets: Vec<u64> = sc.targets.iter()
+            .map(|t| resource_path_hash(t))
+            .filter(|&t| t != scope_h)
+            .collect();
+        table.insert(scope_h, targets);
+    }
+    // Expand transitive scopes — mirrors the do-while in Configure()
+    let keys: Vec<u64> = table.keys().copied().collect();
+    for scope_h in keys {
+        loop {
+            let targets: Vec<u64> = table[&scope_h].clone();
+            let mut updated = false;
+            for t in &targets {
+                if let Some(sub) = table.get(t).cloned() {
+                    let entry = table.get_mut(&scope_h).unwrap();
+                    entry.retain(|x| x != t);
+                    for st in sub {
+                        if !entry.contains(&st) { entry.push(st); }
+                    }
+                    updated = true;
+                    break;
+                }
+            }
+            if !updated { break; }
+        }
+    }
+    table
+}
+
+/// Expands a list of resource path hashes using the scope table.
+/// Replaces any scope path with its targets; non-scope paths pass through unchanged.
+pub fn expand_scope_list(paths: &[u64], scope_table: &HashMap<u64, Vec<u64>>) -> Vec<u64> {
+    let mut result = Vec::new();
+    for &h in paths {
+        match scope_table.get(&h) {
+            Some(targets) => result.extend_from_slice(targets),
+            None => result.push(h),
+        }
+    }
+    result
+}
+
+/// `ResourceMetaExtension::InScope(scopePath, targetPath) -> bool` (ArchiveXL #50) — se
+/// `target_hash` está no conjunto (JÁ com o fecho transitivo aplicado por `build_scope_table`)
+/// do escopo `scope_hash`. Composição trivial sobre a tabela já construída/testada.
+pub fn in_scope(scope_hash: u64, target_hash: u64, scope_table: &HashMap<u64, Vec<u64>>) -> bool {
+    scope_table.get(&scope_hash).is_some_and(|targets| targets.contains(&target_hash))
+}
+
+/// Fix.names table: resource_hash → Vec<(old_cname_string, new_cname_string)>.
+/// Applied to CName fields within a resource (e.g., chunkMaterials names in CMesh).
+pub fn build_fix_names_table(xl: &XlFile) -> HashMap<u64, Vec<(String, String)>> {
+    let mut table: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    for fix in &xl.fixes {
+        let h = resource_path_hash(&fix.resource);
+        table.entry(h).or_default().extend(fix.names.iter().cloned());
+    }
+    table
+}
+
+/// Fix.paths table: resource_hash → Vec<(old_path_hash, new_path_hash)>.
+/// Applied to embedded resource references within a resource (e.g., material paths in CMesh).
+pub fn build_fix_paths_table(xl: &XlFile) -> HashMap<u64, Vec<(u64, u64)>> {
+    let mut table: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    for fix in &xl.fixes {
+        let h = resource_path_hash(&fix.resource);
+        let pairs: Vec<(u64, u64)> = fix.paths.iter()
+            .map(|(old, new)| (resource_path_hash(old), resource_path_hash(new)))
+            .collect();
+        table.entry(h).or_default().extend(pairs);
+    }
+    table
+}
+
+/// Emits `bwms-resfixes.txt` content: one line per fix entry.
+/// Format: `<resource_path> | names | <old_cname> | <new_cname>`
+///         `<resource_path> | paths | <old_path> | <new_path>`
+/// The runtime can load this to apply fixes in CMesh/MorphTargetMesh PostLoad hooks.
+pub fn emit_resfixes(xl: &XlFile) -> String {
+    let mut out =
+        String::from("# bwms-resfixes (gerado de .xl). Formato: <resource> | names|paths | <old> | <new>\n");
+    for fix in &xl.fixes {
+        for (old, new) in &fix.names {
+            out.push_str(&format!("{} | names | {} | {}\n", fix.resource, old, new));
+        }
+        for (old, new) in &fix.paths {
+            out.push_str(&format!("{} | paths | {} | {}\n", fix.resource, old, new));
+        }
+    }
+    out
 }
 
 /// Emite o conteúdo de `red4ext/bwms-reslink.txt` a partir do `.xl`: uma linha
@@ -375,5 +474,91 @@ mod tests {
         let p = build_apply_plan(&xl);
         assert_eq!(p.cyclic_links, 0);
         assert_eq!(p.redirects[&resource_path_hash("a")], resource_path_hash("d"));
+    }
+
+    // ===== resource.scope: expand_scope_list =====
+
+    #[test]
+    fn scope_simples_expande_path_alvo() {
+        let xl = crate::xl::parse_xl("resource:\n  scope:\n    a.mesh: b.mesh\n").unwrap();
+        let table = build_scope_table(&xl);
+        // a.mesh → [b.mesh]
+        let expanded = expand_scope_list(&[resource_path_hash("a.mesh")], &table);
+        assert_eq!(expanded, vec![resource_path_hash("b.mesh")]);
+    }
+
+    #[test]
+    fn scope_lista_expande_multiplos_alvos() {
+        let xl = crate::xl::parse_xl("resource:\n  scope:\n    scope.mesh:\n      - x.mesh\n      - y.mesh\n").unwrap();
+        let table = build_scope_table(&xl);
+        let expanded = expand_scope_list(&[resource_path_hash("scope.mesh")], &table);
+        assert!(expanded.contains(&resource_path_hash("x.mesh")));
+        assert!(expanded.contains(&resource_path_hash("y.mesh")));
+        assert_eq!(expanded.len(), 2);
+    }
+
+    #[test]
+    fn scope_nao_scope_passa_unchanged() {
+        let xl = crate::xl::parse_xl("resource:\n  scope:\n    a.mesh: b.mesh\n").unwrap();
+        let table = build_scope_table(&xl);
+        let h = resource_path_hash("other.mesh");
+        let expanded = expand_scope_list(&[h], &table);
+        assert_eq!(expanded, vec![h]);
+    }
+
+    #[test]
+    fn scope_transitivo_resolve_dois_niveis() {
+        // A → B, B → C: expanded list of [A] = [C]
+        let xl = crate::xl::parse_xl("resource:\n  scope:\n    a.mesh: b.mesh\n    b.mesh: c.mesh\n").unwrap();
+        let table = build_scope_table(&xl);
+        let expanded = expand_scope_list(&[resource_path_hash("a.mesh")], &table);
+        // b.mesh foi expandido → c.mesh (transitivo, igual ao C++ do ArchiveXL)
+        assert!(expanded.contains(&resource_path_hash("c.mesh")));
+        assert!(!expanded.contains(&resource_path_hash("b.mesh")));
+    }
+
+    #[test]
+    fn inscope_reflete_a_tabela_ja_com_fecho_transitivo() {
+        let xl = crate::xl::parse_xl("resource:\n  scope:\n    a.mesh: b.mesh\n    b.mesh: c.mesh\n").unwrap();
+        let table = build_scope_table(&xl);
+        assert!(in_scope(resource_path_hash("a.mesh"), resource_path_hash("c.mesh"), &table)); // via fecho
+        assert!(!in_scope(resource_path_hash("a.mesh"), resource_path_hash("b.mesh"), &table)); // substituído
+        assert!(!in_scope(resource_path_hash("nao-existe.mesh"), resource_path_hash("c.mesh"), &table));
+    }
+
+    // ===== resource.fix: build_fix_names_table + build_fix_paths_table =====
+
+    #[test]
+    fn fix_names_tabela_correta() {
+        let src = "resource:\n  fix:\n    my.mesh:\n      names:\n        old_mat: new_mat\n        glass: crystal\n";
+        let xl = crate::xl::parse_xl(src).unwrap();
+        let table = build_fix_names_table(&xl);
+        let h = resource_path_hash("my.mesh");
+        assert!(table.contains_key(&h));
+        let fixes = &table[&h];
+        assert_eq!(fixes.len(), 2);
+        assert!(fixes.contains(&("old_mat".to_string(), "new_mat".to_string())));
+        assert!(fixes.contains(&("glass".to_string(), "crystal".to_string())));
+    }
+
+    #[test]
+    fn fix_paths_tabela_correta() {
+        let src = "resource:\n  fix:\n    my.mesh:\n      paths:\n        old\\mat.mi: new\\mat.mi\n";
+        let xl = crate::xl::parse_xl(src).unwrap();
+        let table = build_fix_paths_table(&xl);
+        let h = resource_path_hash("my.mesh");
+        assert!(table.contains_key(&h));
+        let (old_h, new_h) = table[&h][0];
+        assert_eq!(old_h, resource_path_hash("old\\mat.mi"));
+        assert_eq!(new_h, resource_path_hash("new\\mat.mi"));
+    }
+
+    #[test]
+    fn emit_resfixes_formato_correto() {
+        let src = "resource:\n  fix:\n    my.mesh:\n      names:\n        old_mat: new_mat\n      paths:\n        a.mi: b.mi\n";
+        let xl = crate::xl::parse_xl(src).unwrap();
+        let out = emit_resfixes(&xl);
+        assert!(out.contains("my.mesh | names | old_mat | new_mat"));
+        assert!(out.contains("my.mesh | paths | a.mi | b.mi"));
     }
 }

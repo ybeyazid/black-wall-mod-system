@@ -48,11 +48,14 @@ unsafe fn rebase(vmaddr: u64) -> *mut c_void {
 unsafe extern "C" fn plugin_inline_dummy() {}
 
 /// Mirror de `cp77_console::plugins::PluginInfo`. Buffers fixos (sem alocação cruzando o ABI).
+/// `runtime` (2026-08-09, PENDENCIAS-UNIFICADAS.md #40/#48): versão do jogo declarada como
+/// suportada — campo aditivo no fim da struct.
 #[repr(C)]
 pub struct PluginInfo {
     pub name: [u8; 64],
     pub author: [u8; 64],
     pub version: [u8; 32],
+    pub runtime: [u32; 4],
 }
 
 fn write_field(buf: &mut [u8], s: &str) {
@@ -73,6 +76,9 @@ pub unsafe extern "C" fn bwms_plugin_query(info: *mut PluginInfo) -> bool {
     write_field(&mut (*info).name, "example-plugin");
     write_field(&mut (*info).author, "BWMS 3rd-party proof");
     write_field(&mut (*info).version, "0.1.0");
+    // Deliberadamente DIFERENTE do BWMS_GAME_FILEVER real (2.31.0.0) — prova o caminho de
+    // AVISO (mismatch logado, plugin carrega igual) sem precisar de um 2º dylib de teste.
+    (*info).runtime = [2, 30, 0, 0];
     true
 }
 
@@ -110,6 +116,21 @@ pub struct BwmsApi {
     pub imgui_text: unsafe extern "C" fn(*const c_char),
     pub imgui_end: unsafe extern "C" fn(),
     pub scripts_add: unsafe extern "C" fn(*const c_char) -> bool,
+    /// v12: registra callbacks de lifecycle de estado de jogo (red4ext-gamestates-add).
+    /// state_type: 2=Running, 3=Shutdown. on_enter/update/exit são Optional.
+    pub add_game_state: unsafe extern "C" fn(
+        state_type: u32,
+        on_enter: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+        on_update: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+        on_exit: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    ) -> bool,
+    /// v13 (RED4ext.SDK `#31`, `Hooking::Detach`): handle ÚNICO deste plugin — atribuído pelo
+    /// loader (1 cópia pessoal de `BwmsApi` por plugin agora, não mais uma static compartilhada).
+    pub my_handle: u64,
+    pub inline_hook_owned: unsafe extern "C" fn(u64, *mut c_void, *mut c_void) -> *mut c_void,
+    pub inline_detach: unsafe extern "C" fn(u64, *mut c_void) -> bool,
+    pub vtable_hook_owned: unsafe extern "C" fn(u64, *mut u64, usize, *const c_void) -> *const c_void,
+    pub vtable_detach: unsafe extern "C" fn(u64, *mut u64, usize) -> bool,
 }
 
 /// Handler da nossa native nova `ExamplePluginPing() -> Bool`: sempre retorna true, e loga
@@ -198,6 +219,26 @@ unsafe extern "C" fn example_field_handler(ctx: *mut c_void, _frame: *mut c_void
             )) {
                 ((*api).log)(msg.as_ptr());
             }
+            // RED4ext.SDK `#31`: mesma prova de ownership, via vtable (slot 30, já restaurado
+            // pelo teste acima).
+            let my_handle = (*api).my_handle;
+            let fake_handle = my_handle.wrapping_add(999);
+            let before_v = *vtbl.add(30);
+            let orig_v = ((*api).vtable_hook_owned)(my_handle, vtbl, 30, dummy);
+            let after_hook_v = *vtbl.add(30);
+            let refused_v = !((*api).vtable_detach)(fake_handle, vtbl, 30);
+            let after_refused_v = *vtbl.add(30);
+            let detached_v = ((*api).vtable_detach)(my_handle, vtbl, 30);
+            let after_detach_v = *vtbl.add(30);
+            let _ = orig_v;
+            if let Ok(msg) = CString::new(format!(
+                "[example-plugin] PluginHandle (vtable): my_handle={my_handle} vtable_hook_owned(slot=30) mudou={} | detach(ALHEIO={fake_handle})->recusado={refused_v} (slot-continua-hookado={}) | detach(CERTO)->ok={detached_v} (slot-restaurado={})",
+                before_v != after_hook_v,
+                after_refused_v == after_hook_v,
+                after_detach_v == before_v,
+            )) {
+                ((*api).log)(msg.as_ptr());
+            }
         }
         // `red4ext-api-prove-hooks-extplugin` (fatia inline_hook): alvo REAL `AlignedFree`
         // (mesmo endereço já provado seguro por `red4ext-reloc-prove-ingame`), instalado+
@@ -217,6 +258,32 @@ unsafe extern "C" fn example_field_handler(ctx: *mut c_void, _frame: *mut c_void
                 !repl.is_null(),
                 before4 != after_hook4,
                 after_revert4 == before4
+            )) {
+                ((*api).log)(msg.as_ptr());
+            }
+        }
+        // RED4ext.SDK `#31` (`Hooking::Detach`, PluginHandle real, 2026-08-11): MESMO alvo
+        // AlignedFree (já restaurado pelo teste acima) — instala via `inline_hook_owned` com o
+        // handle DESTE plugin, tenta soltar com um handle ALHEIO simulado (deve RECUSAR e manter
+        // o hook intacto), depois solta com o handle CERTO (deve suceder e restaurar o byte
+        // original). Prova a peça central do gap: um plugin não consegue derrubar o hook de
+        // outro, só o dono registrado consegue.
+        if !target.is_null() {
+            let my_handle = (*api).my_handle;
+            let fake_handle = my_handle.wrapping_add(999); // simula "outro plugin"
+            let before_o = *(target as *const u32);
+            let repl_o = ((*api).inline_hook_owned)(my_handle, target, plugin_inline_dummy as *mut c_void);
+            let after_hook_o = *(target as *const u32);
+            let refused = !((*api).inline_detach)(fake_handle, target);
+            let after_refused = *(target as *const u32);
+            let detached = ((*api).inline_detach)(my_handle, target);
+            let after_detach = *(target as *const u32);
+            if let Ok(msg) = CString::new(format!(
+                "[example-plugin] PluginHandle: my_handle={my_handle} inline_hook_owned trampolim={} depois-do-hook(mudou)={} | detach(handle-ALHEIO={fake_handle})->recusado={refused} (hook-continua-intacto={}) | detach(handle-CERTO)->ok={detached} (byte-restaurado={})",
+                !repl_o.is_null(),
+                before_o != after_hook_o,
+                after_refused == after_hook_o,
+                after_detach == before_o,
             )) {
                 ((*api).log)(msg.as_ptr());
             }
@@ -307,6 +374,160 @@ extern "C" fn example_draw_callback() {
         let text = CString::new("Hello from example-plugin! (cet-imgui-thirdparty)").unwrap();
         ((*api).imgui_text)(text.as_ptr());
         ((*api).imgui_end)();
+    }
+    unsafe { late_registration_probe_once(api) };
+}
+
+/// CET item #46 (`PENDENCIAS-UNIFICADAS.md`) — janela de registro restrita ao load. Este draw
+/// callback só roda DEPOIS que `bwms_plugin_main` já retornou (1x/frame, contínuo), então
+/// chamar `register_native` daqui é EXATAMENTE o cenário de "registro tardio" que a janela
+/// deve recusar. Roda só 1x (guard atômico) pra não spammar o log a cada frame.
+static LATE_REG_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+unsafe fn late_registration_probe_once(api: *mut BwmsApi) {
+    if LATE_REG_TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let full = CString::new("ExamplePluginLateReg;Bool()").unwrap();
+    let short = CString::new("ExamplePluginLateReg").unwrap();
+    let ok = ((*api).register_native)(full.as_ptr(), short.as_ptr(), example_ping_handler);
+    if let Ok(msg) = CString::new(format!(
+        "[example-plugin] LATE register_native (de dentro do draw callback, fora do bwms_plugin_main) -> {ok} (esperado: false, janela fechada)"
+    )) {
+        ((*api).log)(msg.as_ptr());
+    }
+}
+
+/// `red4ext-gamestates-add` (v12): contadores e handlers de lifecycle registrados via add_game_state.
+static GAMESTATE_ENTERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAMESTATE_UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe extern "C" fn gs_running_on_enter(_player: *mut c_void) -> bool {
+    let n = GAMESTATE_ENTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new(format!("[example-plugin] gs_running_on_enter #{n} >>> RUNNING.OnEnter PASS <<<"))
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_running_on_update(_player: *mut c_void) -> bool {
+    let n = GAMESTATE_UPDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 180 == 0 {
+        let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+        if !api.is_null() {
+            if let Ok(msg) =
+                CString::new(format!("[example-plugin] gs_running_on_update tick #{n}"))
+            {
+                ((*api).log)(msg.as_ptr());
+            }
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_running_on_exit(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_running_on_exit >>> RUNNING.OnExit PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+/// RED4ext.SDK #32/#36/#37/#38 (2026-08-11): cobertura BaseInitialization(0)/Initialization(1).
+unsafe extern "C" fn gs_baseinit_on_enter(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_baseinit_on_enter >>> BASEINIT.OnEnter PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_baseinit_on_exit(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_baseinit_on_exit >>> BASEINIT.OnExit PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_init_on_enter(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_init_on_enter >>> INIT.OnEnter PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+/// RED4ext.SDK `#37` (2026-08-11): prova de `GameStates.OnUpdate` pra `Initialization`(1) —
+/// item novo desta rodada, testado junto com `gs_init_on_enter`/`gs_init_on_exit` já existentes.
+static GS_INIT_UPDATE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+unsafe extern "C" fn gs_init_on_update(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    let n = GS_INIT_UPDATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) = CString::new(format!(
+            "[example-plugin] gs_init_on_update >>> INIT.OnUpdate PASS tick#{n} <<<"
+        )) {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_init_on_exit(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_init_on_exit >>> INIT.OnExit PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn gs_shutdown_on_enter(_player: *mut c_void) -> bool {
+    let api = API_PTR.load(std::sync::atomic::Ordering::Relaxed);
+    if !api.is_null() {
+        if let Ok(msg) =
+            CString::new("[example-plugin] gs_shutdown_on_enter >>> SHUTDOWN.OnEnter PASS <<<")
+        {
+            ((*api).log)(msg.as_ptr());
+        }
+    }
+    true
+}
+
+/// Entry OPCIONAL (RED4ext.SDK `#45`, `EMainReason::Unload`): o core chama isto ANTES do
+/// processo morrer (dentro de `exit_replacement`, motor ainda intacto) se o símbolo existir.
+/// Prova que um plugin de 3o-autor genuíno recebe sinal de unload (nenhum recebia antes).
+#[no_mangle]
+pub unsafe extern "C" fn bwms_plugin_unload() {
+    if let Some(api) = API_PTR.load(std::sync::atomic::Ordering::Relaxed).as_ref() {
+        if let Ok(msg) = CString::new("[example-plugin] bwms_plugin_unload() CHAMADO — sinal de unload recebido") {
+            (api.log)(msg.as_ptr());
+        }
     }
 }
 
@@ -405,6 +626,46 @@ pub unsafe extern "C" fn bwms_plugin_main(api: *const BwmsApi) -> i32 {
     } else if let Ok(msg) =
         CString::new("[example-plugin] scripts_add: não achei o .reds externo (ver example-plugin-scripts/ ao lado do dylib)")
     {
+        ((*api).log)(msg.as_ptr());
+    }
+    // v12: red4ext-gamestates-add — registra callbacks de lifecycle de estado de jogo de um
+    // dylib de 3o-autor genuíno. state_type=2=Running, state_type=3=Shutdown.
+    // Os handlers logarão ">>> RUNNING.OnEnter/OnExit/SHUTDOWN.OnEnter PASS <<<" ao vivo.
+    // 2026-08-11: +state_type=0=BaseInitialization, 1=Initialization (cobertura #32/#36/#37/#38).
+    let gs_base = ((*api).add_game_state)(
+        0,
+        Some(gs_baseinit_on_enter),
+        None,
+        Some(gs_baseinit_on_exit),
+    );
+    if let Ok(msg) = CString::new(format!("[example-plugin] add_game_state(BaseInit=0) -> {gs_base}")) {
+        ((*api).log)(msg.as_ptr());
+    }
+    let gs_init = ((*api).add_game_state)(
+        1,
+        Some(gs_init_on_enter),
+        Some(gs_init_on_update),
+        Some(gs_init_on_exit),
+    );
+    if let Ok(msg) = CString::new(format!("[example-plugin] add_game_state(Init=1) -> {gs_init}")) {
+        ((*api).log)(msg.as_ptr());
+    }
+    let gs_run = ((*api).add_game_state)(
+        2,
+        Some(gs_running_on_enter),
+        Some(gs_running_on_update),
+        Some(gs_running_on_exit),
+    );
+    if let Ok(msg) = CString::new(format!("[example-plugin] add_game_state(Running=2) -> {gs_run}")) {
+        ((*api).log)(msg.as_ptr());
+    }
+    let gs_shut = ((*api).add_game_state)(
+        3,
+        Some(gs_shutdown_on_enter),
+        None,
+        None,
+    );
+    if let Ok(msg) = CString::new(format!("[example-plugin] add_game_state(Shutdown=3) -> {gs_shut}")) {
         ((*api).log)(msg.as_ptr());
     }
     0

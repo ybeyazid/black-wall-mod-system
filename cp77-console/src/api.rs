@@ -153,6 +153,215 @@ pub struct BwmsApi {
     /// verificado num scratch-copy seguro antes de mexer no deploy real). Devolve `true` se
     /// escreveu (ou já estava) no manifesto; `false` só em erro de I/O real.
     pub scripts_add: unsafe extern "C" fn(path: *const c_char) -> bool,
+    // --- v12 (abi_version 12): `GameStates.Add` pragmático (red4ext-gamestates-add) ---
+    /// Registra callbacks de ciclo de vida de estado de jogo (parity com RED4ext `GameStates.Add`).
+    /// `state_type`: 0=BaseInitialization 1=Initialization 2=Running 3=Shutdown (EGameStateType).
+    /// Callbacks recebem null pra CGameApplication (pragmático — passamos null em vez do ponteiro
+    /// real que o RED4ext real receberia). **Cobertura completa dos 4 estados (fechado 2026-08-11,
+    /// PENDENCIAS-UNIFICADAS.md `#4`/`#32`/`#36`/`#37`/`#38`)**, todos disparando na ordem real
+    /// `BaseInit→Init→Running→Shutdown`, mapeados nos eventos já detectados:
+    ///   BaseInit.OnEnter/OnExit → disparam 1x, cedo no boot (logo após `boot_phase()`, o 1º ponto
+    ///                             idempotente onde plugins já tiveram chance de `add_game_state`)
+    ///   Init.OnEnter            → dispara na sequência, mesmo instante (mesmo guard)
+    ///   Init.OnUpdate           → dispara a cada ~2s de heartbeat, enquanto ainda em Initialization
+    ///   Init.OnExit             → dispara na transição de PRESENÇA do player em `cp77_tick` (mesmo
+    ///                             mecanismo confiável do Running.OnEnter, não mais o byte de fase —
+    ///                             que uma investigação anterior (cont.192) provou ser flaky nessa
+    ///                             leitura), IMEDIATAMENTE ANTES de Running.OnEnter — latch único
+    ///                             (Initialization só transiciona pra Running 1x por processo)
+    ///   Running.OnEnter  → dispara quando o player spawna (presença detectada no cp77_tick)
+    ///   Running.OnUpdate → dispara a cada ~180 ticks de gameplay (enquanto player presente)
+    ///   Running.OnExit   → dispara quando o player despawna
+    ///   Shutdown.OnEnter → dispara quando `exit()` é hookado (clean-exit)
+    /// Divergência que PERMANECE (não é risco, é gap documentado): `aApp` (ponteiro pra
+    /// `CGameApplication`) continua sempre `null` em todo callback — corrigir isso precisaria de
+    /// `CGameEngine::Get()`/#475, RE nova fora de escopo (o dado em si nunca foi necessário pra
+    /// nenhum uso real até agora, só a notificação do estado).
+    pub add_game_state: unsafe extern "C" fn(
+        state_type: u32,
+        on_enter: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+        on_update: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+        on_exit: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    ) -> bool,
+    // --- v13 (abi_version 13): PluginHandle real (RED4ext.SDK `#31`, `Hooking::Detach`) ---
+    /// Handle ÚNICO deste plugin (atribuído sequencialmente em `plugins::load_one`, 1 cópia de
+    /// `BwmsApi` por plugin — antes só existia UMA instância `static` compartilhada por todos).
+    /// Guardar este valor e passá-lo pras 2 chamadas abaixo — é o que o RED4ext real exige que
+    /// todo plugin faça com o `PluginHandle` recebido em `Main()`.
+    pub my_handle: u64,
+    /// Igual a `inline_hook`, mas REGISTRA `handle` como DONO do hook em `target` — habilita
+    /// `inline_detach` a recusar outro plugin tentando soltá-lo.
+    pub inline_hook_owned: unsafe extern "C" fn(handle: u64, target: *mut c_void, repl: *mut c_void) -> *mut c_void,
+    /// `Hooking::Detach(handle, target)`: desfaz o hook em `target` SÓ se `handle` for o dono
+    /// registrado por `inline_hook_owned` (case contrário: recusa, loga, devolve `false` — o
+    /// hook do outro plugin continua intacto). `target` sem dono rastreado (nunca hookado via
+    /// `inline_hook_owned`, ou já solto) também recusa.
+    pub inline_detach: unsafe extern "C" fn(handle: u64, target: *mut c_void) -> bool,
+    /// Igual a `vtable_hook`, mas REGISTRA `handle` como dono do slot `(vtbl, slot_idx)`.
+    pub vtable_hook_owned: unsafe extern "C" fn(handle: u64, vtbl: *mut u64, slot_idx: usize, repl: *const c_void) -> *const c_void,
+    /// `Hooking::Detach` pro caso vtable: restaura o slot original SÓ se `handle` for o dono
+    /// (o `orig` fica guardado no registro interno — o plugin não precisa lembrar dele, ao
+    /// contrário do `vtable_unhook` cru).
+    pub vtable_detach: unsafe extern "C" fn(handle: u64, vtbl: *mut u64, slot_idx: usize) -> bool,
+    // --- v14 (abi_version 14): `CompareSemVerPrerelease` (RED4ext.SDK `#43`) — precedência SemVer
+    // 2.0 COMPLETA (major.minor.patch + identificadores de pre-release), não só o triplet. Fecha
+    // o bug real onde `semver_satisfies`/`Codeware.Require` tratava `1.2.3-rc1` como IGUAL a
+    // `1.2.3` (deveria ser MENOR — regra 11.3 da spec: release > pre-release no mesmo triplet).
+    /// `CompareSemVerPrerelease(lhs, rhs) -> int32`: `<0` se `lhs<rhs`, `0` se iguais, `>0` se
+    /// `lhs>rhs`, pela precedência SemVer 2.0 completa (não só major.minor.patch). Strings
+    /// inválidas/nulas comparam como `0.0.0` sem pre-release (nunca crasha).
+    pub compare_semver_prerelease: unsafe extern "C" fn(lhs: *const c_char, rhs: *const c_char) -> i32,
+}
+
+impl Clone for BwmsApi {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for BwmsApi {}
+
+/// Próximo handle a atribuir (sequencial, começa em 1 — `0` fica reservado como "sem dono"
+/// nos registros de ownership abaixo, nunca um handle real).
+static NEXT_PLUGIN_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Chamado 1x por plugin em `plugins::load_one`, antes de montar a cópia pessoal da API.
+pub(crate) fn next_plugin_handle() -> u64 {
+    NEXT_PLUGIN_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Dono registrado de cada hook INLINE (`target addr -> handle`). Um novo `inline_hook_owned`
+/// no MESMO target sobrescreve o dono (mesma semântica LIFO já provada em `gum::Interceptor` —
+/// o registro só precisa saber quem é o dono ATUAL/topo pra decidir um `Detach`).
+static INLINE_HOOK_OWNERS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+/// Dono registrado de cada slot de vtable hookado (`(vtbl addr, slot_idx) -> (handle, orig)`).
+static VTABLE_HOOK_OWNERS: std::sync::Mutex<Vec<(usize, usize, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn register_inline_owner(target: usize, handle: u64) {
+    if let Ok(mut v) = INLINE_HOOK_OWNERS.lock() {
+        v.retain(|(t, _)| *t != target);
+        v.push((target, handle));
+    }
+}
+
+fn take_inline_owner(target: usize) -> Option<u64> {
+    if let Ok(mut v) = INLINE_HOOK_OWNERS.lock() {
+        if let Some(pos) = v.iter().position(|(t, _)| *t == target) {
+            return Some(v.remove(pos).1);
+        }
+    }
+    None
+}
+
+fn register_vtable_owner(vtbl: usize, slot: usize, handle: u64, orig: usize) {
+    if let Ok(mut v) = VTABLE_HOOK_OWNERS.lock() {
+        v.retain(|(vp, s, _, _)| !(*vp == vtbl && *s == slot));
+        v.push((vtbl, slot, handle, orig));
+    }
+}
+
+fn take_vtable_owner(vtbl: usize, slot: usize) -> Option<(u64, usize)> {
+    if let Ok(mut v) = VTABLE_HOOK_OWNERS.lock() {
+        if let Some(pos) = v.iter().position(|(vp, s, _, _)| *vp == vtbl && *s == slot) {
+            let (_, _, h, o) = v.remove(pos);
+            return Some((h, o));
+        }
+    }
+    None
+}
+
+/// Registry de callbacks de estado de jogo (add_game_state / red4ext-gamestates-add).
+struct GameStateEntry {
+    state_type: u32,
+    on_enter: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    on_update: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    on_exit: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+}
+
+static GAME_STATES: std::sync::Mutex<Vec<GameStateEntry>> = std::sync::Mutex::new(Vec::new());
+
+// ===== Janela de registro restrita ao load do plugin (CET item #46, `PENDENCIAS-UNIFICADAS.md`)
+// — CET remove `registerForEvent`/`registerHotkey`/`registerInput` do ambiente Lua logo após
+// `init.lua` terminar: um mod só pode se registrar durante sua PRÓPRIA inicialização, nunca
+// depois. Mesma robustez pro BWMS: `plugins::load_one` abre a janela só durante a chamada
+// SÍNCRONA de `bwms_plugin_main`, fecha assim que ela retorna — as 5 funções de REGISTRO
+// (register_native/register_native_argful/register_method/add_game_state/
+// register_draw_callback) recusam fora dessa janela. NÃO se aplica a hooks/reflection/TweakDB
+// (chamáveis a qualquer momento por design — só "registrar uma capacidade nomeada nova" é
+// restrito, o mesmo escopo exato do CET real).
+static REGISTRATION_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn registration_window_open() -> bool {
+    REGISTRATION_OPEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// RAII: `plugins::load_one` chama `open_registration_window()` antes de `entry()` e deixa o
+/// guard cair no escopo — fecha a janela na saída (retorno normal OU panic desenrolado por
+/// `catch_unwind`, nunca fica presa aberta). Mesmo espírito do `ExecDepthGuard` já usado no
+/// projeto (contador thread_local + `Drop`, `selfboot.rs`) — RAII em vez de par
+/// abre/fecha manual, que um `return`/panic no meio esqueceria de fechar.
+pub(crate) struct RegistrationWindowGuard;
+
+impl Drop for RegistrationWindowGuard {
+    fn drop(&mut self) {
+        REGISTRATION_OPEN.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) fn open_registration_window() -> RegistrationWindowGuard {
+    REGISTRATION_OPEN.store(true, std::sync::atomic::Ordering::Release);
+    RegistrationWindowGuard
+}
+
+/// Chama on_enter de todos os estados registrados com `state_type`.
+pub fn call_game_state_enter(state_type: u32) {
+    if let Ok(states) = GAME_STATES.lock() {
+        for s in states.iter().filter(|s| s.state_type == state_type) {
+            if let Some(f) = s.on_enter {
+                let _ = unsafe { f(std::ptr::null_mut()) };
+            }
+        }
+    }
+}
+
+/// Chama on_update de todos os estados registrados com `state_type`.
+pub fn call_game_state_update(state_type: u32) {
+    if let Ok(states) = GAME_STATES.lock() {
+        for s in states.iter().filter(|s| s.state_type == state_type) {
+            if let Some(f) = s.on_update {
+                let _ = unsafe { f(std::ptr::null_mut()) };
+            }
+        }
+    }
+}
+
+/// Chama on_exit de todos os estados registrados com `state_type`.
+pub fn call_game_state_exit(state_type: u32) {
+    if let Ok(states) = GAME_STATES.lock() {
+        for s in states.iter().filter(|s| s.state_type == state_type) {
+            if let Some(f) = s.on_exit {
+                let _ = unsafe { f(std::ptr::null_mut()) };
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn api_add_game_state(
+    state_type: u32,
+    on_enter: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    on_update: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    on_exit: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+) -> bool {
+    if !registration_window_open() {
+        crate::log("[api] add_game_state: recusado — chamado fora da janela de registro (só durante bwms_plugin_main)");
+        return false;
+    }
+    if let Ok(mut states) = GAME_STATES.lock() {
+        states.push(GameStateEntry { state_type, on_enter, on_update, on_exit });
+        crate::log(&format!("[api] add_game_state: type={state_type} on_enter={} on_update={} on_exit={}",
+            on_enter.is_some(), on_update.is_some(), on_exit.is_some()));
+        return true;
+    }
+    false
 }
 
 unsafe extern "C" fn api_log(msg: *const c_char) {
@@ -230,11 +439,88 @@ unsafe extern "C" fn api_inline_revert(target: *mut c_void) {
     crate::gum::Interceptor::obtain().revert(target);
 }
 
+unsafe extern "C" fn api_inline_hook_owned(handle: u64, target: *mut c_void, repl: *mut c_void) -> *mut c_void {
+    if target.is_null() || repl.is_null() {
+        return std::ptr::null_mut();
+    }
+    let trampoline = crate::gum::Interceptor::obtain().replace(target, repl).unwrap_or(std::ptr::null_mut());
+    if !trampoline.is_null() {
+        register_inline_owner(target as usize, handle);
+        crate::log(&format!("[api] inline_hook_owned: handle={handle} target={target:p} -> ok (dono registrado)"));
+    }
+    trampoline
+}
+
+unsafe extern "C" fn api_inline_detach(handle: u64, target: *mut c_void) -> bool {
+    if target.is_null() {
+        return false;
+    }
+    match take_inline_owner(target as usize) {
+        Some(owner) if owner == handle => {
+            crate::gum::Interceptor::obtain().revert(target);
+            crate::log(&format!("[api] inline_detach: handle={handle} target={target:p} -> OK"));
+            true
+        }
+        Some(owner) => {
+            // Devolve a posse (a checagem falhou, o hook do OUTRO dono continua intacto).
+            register_inline_owner(target as usize, owner);
+            crate::log(&format!(
+                "[api] inline_detach: RECUSADO — handle={handle} tentou soltar hook de target={target:p} pertencente a handle={owner}"
+            ));
+            false
+        }
+        None => {
+            crate::log(&format!("[api] inline_detach: target={target:p} sem dono rastreado (handle={handle}) — recusado"));
+            false
+        }
+    }
+}
+
+unsafe extern "C" fn api_vtable_hook_owned(handle: u64, vtbl: *mut u64, slot_idx: usize, repl: *const c_void) -> *const c_void {
+    match crate::gum::vtable_hook(vtbl, slot_idx, repl) {
+        Some(orig) => {
+            register_vtable_owner(vtbl as usize, slot_idx, handle, orig as usize);
+            crate::log(&format!(
+                "[api] vtable_hook_owned: handle={handle} vtbl={vtbl:p} slot={slot_idx} -> ok (dono registrado)"
+            ));
+            orig
+        }
+        None => std::ptr::null(),
+    }
+}
+
+unsafe extern "C" fn api_vtable_detach(handle: u64, vtbl: *mut u64, slot_idx: usize) -> bool {
+    match take_vtable_owner(vtbl as usize, slot_idx) {
+        Some((owner, orig)) if owner == handle => {
+            crate::gum::vtable_unhook(vtbl, slot_idx, orig as *const c_void);
+            crate::log(&format!("[api] vtable_detach: handle={handle} vtbl={vtbl:p} slot={slot_idx} -> OK"));
+            true
+        }
+        Some((owner, orig)) => {
+            register_vtable_owner(vtbl as usize, slot_idx, owner, orig);
+            crate::log(&format!(
+                "[api] vtable_detach: RECUSADO — handle={handle} tentou soltar slot {slot_idx} de vtbl={vtbl:p} pertencente a handle={owner}"
+            ));
+            false
+        }
+        None => {
+            crate::log(&format!(
+                "[api] vtable_detach: vtbl={vtbl:p} slot={slot_idx} sem dono rastreado (handle={handle}) — recusado"
+            ));
+            false
+        }
+    }
+}
+
 unsafe extern "C" fn api_register_native(
     full: *const c_char,
     short: *const c_char,
     handler: crate::register::NativeHandler,
 ) -> bool {
+    if !registration_window_open() {
+        crate::log("[api] register_native: recusado — chamado fora da janela de registro (só durante bwms_plugin_main)");
+        return false;
+    }
     if full.is_null() || short.is_null() {
         return false;
     }
@@ -271,6 +557,10 @@ unsafe extern "C" fn api_register_method(
     short: *const c_char,
     handler: crate::register::NativeHandler,
 ) -> bool {
+    if !registration_window_open() {
+        crate::log("[api] register_method: recusado — chamado fora da janela de registro (só durante bwms_plugin_main)");
+        return false;
+    }
     if class.is_null() || full.is_null() || short.is_null() {
         return false;
     }
@@ -306,6 +596,10 @@ unsafe extern "C" fn api_register_native_argful(
     param_types: *const *const c_char,
     n_params: usize,
 ) -> bool {
+    if !registration_window_open() {
+        crate::log("[api] register_native_argful: recusado — chamado fora da janela de registro (só durante bwms_plugin_main)");
+        return false;
+    }
     if full.is_null() || short.is_null() {
         return false;
     }
@@ -530,6 +824,78 @@ pub(crate) fn parse_semver_triplet(s: &str) -> (u32, u32, u32) {
     (major, minor, patch)
 }
 
+/// Identificador de pre-release SemVer 2.0 (ex.: em `1.2.3-rc.1`, os identificadores são `rc` e
+/// `1`). Numérico vs alfanumérico importa pra precedência (regra 11.4.3 da spec): identificador
+/// puramente numérico compara por VALOR; senão compara como string ASCII; numérico sempre tem
+/// precedência MENOR que alfanumérico quando comparados entre si.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreIdent {
+    Num(u64),
+    Alpha(String),
+}
+
+impl PreIdent {
+    fn parse(s: &str) -> Self {
+        match s.parse::<u64>() {
+            Ok(n) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => PreIdent::Num(n),
+            _ => PreIdent::Alpha(s.to_string()),
+        }
+    }
+}
+
+impl Ord for PreIdent {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (PreIdent::Num(a), PreIdent::Num(b)) => a.cmp(b),
+            (PreIdent::Alpha(a), PreIdent::Alpha(b)) => a.cmp(b),
+            (PreIdent::Num(_), PreIdent::Alpha(_)) => Ordering::Less,
+            (PreIdent::Alpha(_), PreIdent::Num(_)) => Ordering::Greater,
+        }
+    }
+}
+impl PartialOrd for PreIdent {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Parseia só a lista de identificadores de pre-release (a parte entre `-` e `+`, dot-separated).
+/// `""` (release, sem pre-release) devolve vetor vazio — usado pra decidir a regra 11.3 da spec
+/// (uma versão SEM pre-release tem precedência MAIOR que a mesma versão COM pre-release).
+fn parse_semver_prerelease(s: &str) -> Vec<PreIdent> {
+    let core = s.trim().trim_start_matches(['v', 'V']);
+    let after_dash = match core.split_once('-') {
+        Some((_, rest)) => rest,
+        None => return Vec::new(),
+    };
+    // o pre-release termina no primeiro '+' (metadado de build, sem peso de precedência).
+    let pre = after_dash.split('+').next().unwrap_or("");
+    if pre.is_empty() {
+        return Vec::new();
+    }
+    pre.split('.').map(PreIdent::parse).collect()
+}
+
+/// Compara duas strings de versão pela precedência COMPLETA do SemVer 2.0 (spec item 11):
+/// major.minor.patch primeiro; se empatado, versão sem pre-release > versão com pre-release;
+/// se ambas têm pre-release, compara identificador por identificador (numérico por valor,
+/// alfanumérico por ASCII, numérico sempre < alfanumérico), e se todos os identificadores em
+/// comum empatarem, quem tem MAIS identificadores tem precedência maior.
+pub(crate) fn semver_precedence(a: &str, b: &str) -> std::cmp::Ordering {
+    let triplet_cmp = parse_semver_triplet(a).cmp(&parse_semver_triplet(b));
+    if triplet_cmp != std::cmp::Ordering::Equal {
+        return triplet_cmp;
+    }
+    let (pre_a, pre_b) = (parse_semver_prerelease(a), parse_semver_prerelease(b));
+    match (pre_a.is_empty(), pre_b.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater, // release > pre-release
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => pre_a.cmp(&pre_b), // Vec<PreIdent>::cmp já compara elemento-a-elemento + tamanho
+    }
+}
+
 unsafe extern "C" fn api_semver_satisfies(required: *const c_char, actual: *const c_char) -> bool {
     if required.is_null() || actual.is_null() {
         return false;
@@ -538,7 +904,20 @@ unsafe extern "C" fn api_semver_satisfies(required: *const c_char, actual: *cons
         (Ok(r), Ok(a)) => (r, a),
         _ => return false,
     };
-    parse_semver_triplet(act) >= parse_semver_triplet(req)
+    semver_precedence(act, req) != std::cmp::Ordering::Less
+}
+
+/// `RED4ext.SDK` `#43` (`CompareSemVerPrerelease`) — precedência SemVer 2.0 COMPLETA como
+/// `int32` (convenção `strcmp`: `<0`/`0`/`>0`). String nula/inválida em qualquer lado vira
+/// `"0.0.0"` sem pre-release (nunca crasha, nunca panica).
+unsafe extern "C" fn api_compare_semver_prerelease(lhs: *const c_char, rhs: *const c_char) -> i32 {
+    let l = if lhs.is_null() { "0.0.0" } else { CStr::from_ptr(lhs).to_str().unwrap_or("0.0.0") };
+    let r = if rhs.is_null() { "0.0.0" } else { CStr::from_ptr(rhs).to_str().unwrap_or("0.0.0") };
+    match semver_precedence(l, r) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 /// Callbacks de draw registrados por plugins (`cet-imgui-thirdparty`). Chamados 1x por frame,
@@ -548,6 +927,10 @@ unsafe extern "C" fn api_semver_satisfies(required: *const c_char, actual: *cons
 static PLUGIN_DRAW_CALLBACKS: std::sync::Mutex<Vec<extern "C" fn()>> = std::sync::Mutex::new(Vec::new());
 
 unsafe extern "C" fn api_register_draw_callback(cb: extern "C" fn()) -> bool {
+    if !registration_window_open() {
+        crate::log("[api] register_draw_callback: recusado — chamado fora da janela de registro (só durante bwms_plugin_main)");
+        return false;
+    }
     if let Ok(mut v) = PLUGIN_DRAW_CALLBACKS.lock() {
         v.push(cb);
     }
@@ -674,6 +1057,13 @@ pub static BWMS_API: BwmsApi = BwmsApi {
     imgui_text: api_imgui_text,
     imgui_end: api_imgui_end,
     scripts_add: api_scripts_add,
+    add_game_state: api_add_game_state,
+    my_handle: 0, // prototype; `plugins::load_one` clona isto com `my_handle` real por plugin.
+    inline_hook_owned: api_inline_hook_owned,
+    inline_detach: api_inline_detach,
+    vtable_hook_owned: api_vtable_hook_owned,
+    vtable_detach: api_vtable_detach,
+    compare_semver_prerelease: api_compare_semver_prerelease,
 };
 
 #[cfg(test)]
@@ -779,6 +1169,59 @@ mod tests {
         // sem o fix, "1.0.0" >= "1.0.0-rc1" seria falso-negativo (rc1 virava 1.0.0 tb, ok aqui;
         // o ponto é o patch não sumir): 1.2.3-rc1 satisfaz require 1.2.3.
         assert!(parse_semver_triplet("1.2.3-rc1") >= parse_semver_triplet("1.2.3"));
+    }
+
+    #[test]
+    fn semver_precedence_prerelease_sequencia_oficial_semver_org() {
+        // Sequência de precedência CRESCENTE do exemplo oficial (semver.org, item 11):
+        // 1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-alpha.beta < 1.0.0-beta < 1.0.0-beta.2
+        // < 1.0.0-beta.11 < 1.0.0-rc.1 < 1.0.0
+        let seq = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for w in seq.windows(2) {
+            assert_eq!(
+                semver_precedence(w[0], w[1]),
+                std::cmp::Ordering::Less,
+                "{} deveria ser < {}",
+                w[0],
+                w[1]
+            );
+            assert_eq!(semver_precedence(w[1], w[0]), std::cmp::Ordering::Greater);
+        }
+        // release > pre-release no mesmo triplet — o bug original (#43): antes disto,
+        // "1.2.3-rc1" e "1.2.3" comparavam IGUAIS (o sufixo era descartado antes de comparar).
+        assert_eq!(semver_precedence("1.2.3-rc1", "1.2.3"), std::cmp::Ordering::Less);
+        assert_eq!(semver_precedence("1.2.3", "1.2.3-rc1"), std::cmp::Ordering::Greater);
+        // igual é igual (com e sem pre-release).
+        assert_eq!(semver_precedence("1.2.3", "1.2.3"), std::cmp::Ordering::Equal);
+        assert_eq!(semver_precedence("1.2.3-rc.1", "1.2.3-rc.1"), std::cmp::Ordering::Equal);
+        // build metadata (`+...`) nunca pesa na precedência.
+        assert_eq!(semver_precedence("1.2.3+build1", "1.2.3+build2"), std::cmp::Ordering::Equal);
+        assert_eq!(semver_precedence("1.2.3-rc.1+build1", "1.2.3-rc.1+build9"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn compare_semver_prerelease_c_abi() {
+        unsafe {
+            let a = CString::new("1.2.3-rc1").unwrap();
+            let b = CString::new("1.2.3").unwrap();
+            let eq = CString::new("1.2.3").unwrap();
+            assert!((BWMS_API.compare_semver_prerelease)(a.as_ptr(), b.as_ptr()) < 0);
+            assert!((BWMS_API.compare_semver_prerelease)(b.as_ptr(), a.as_ptr()) > 0);
+            assert_eq!((BWMS_API.compare_semver_prerelease)(b.as_ptr(), eq.as_ptr()), 0);
+            // nulo em qualquer lado = trata como "0.0.0", nunca crasha.
+            assert!((BWMS_API.compare_semver_prerelease)(std::ptr::null(), b.as_ptr()) < 0);
+            assert!((BWMS_API.compare_semver_prerelease)(b.as_ptr(), std::ptr::null()) > 0);
+            assert_eq!((BWMS_API.compare_semver_prerelease)(std::ptr::null(), std::ptr::null()), 0);
+        }
     }
 
     // log_level não tem valor de retorno pra checar, mas prova que não crasha (inclui msg null).

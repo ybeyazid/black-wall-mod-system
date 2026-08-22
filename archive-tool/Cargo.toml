@@ -24,9 +24,11 @@ bwms-hashes = { path = "../bwms-hashes" }
 [features]
 # `kraken`: compila e linka o decodificador Kraken nativo (ooz, em ../ooz,
 # adaptado p/ arm64) via build.rs, destravando extração comprimida e leitura de
-# listas .kark. É default — o build precisa de `clang++` e da fonte do ooz.
-# Para um build puro-std (só datamap + extração crua), use --no-default-features.
-default = ["kraken"]
+# listas .kark. OPT-IN (2026-08-01: default removido — zero código de terceiro
+# no build padrão, sempre). `cargo build --release` sozinho é 100% puro-std, zero
+# toque em `ooz`/clang. Para extração comprimida, `cargo build --release --features kraken`
+# (precisa de `clang++` e da fonte do ooz em ../ooz).
+default = []
 kraken = []
 
 [profile.release]

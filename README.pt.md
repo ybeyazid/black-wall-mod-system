@@ -7,7 +7,7 @@
 100% Rust + redscript. Sem máquina virtual, sem Wine, sem streaming do Windows — os
 mods rodam diretamente dentro do build nativo macOS do jogo.
 
-> **Status: BETA 0.1.3** — cedo, mas real. Este README é honesto sobre o que
+> **Status: BETA 0.1.4** — cedo, mas real. Este README é honesto sobre o que
 > funciona hoje versus o que está no roadmap. Apenas single-player.
 
 ---
@@ -15,7 +15,7 @@ mods rodam diretamente dentro do build nativo macOS do jogo.
 ## O que faz
 
 O BWMS é um runtime nativo e um conjunto de ferramentas de dados para o build Apple Silicon
-do jogo. A partir da 0.1.3:
+do jogo. A partir da 0.1.4:
 
 - **Console in-game + overlay ImGui** — um console de desenvolvedor renderizado sobre o
   jogo via um overlay ImGui baseado em Metal. É um **console de comandos nativo, não
@@ -153,10 +153,18 @@ bwms-core/               Biblioteca compartilhada (núcleo classify / theme / ap
 bwms/                    Ferramenta de linha de comando unificada
 archive-tool/            Ler / extrair containers .archive
 tweakdb-tool/            Ler / editar tweakdb.bin
+bwms-hashes/             Fonte única de hashing (crate-folha)
+bwms-catalog/            Catálogo de cobertura + checagem de símbolo nativo
+bwms-scoreboard/         Parser do placar de cobertura
+bwms-helper/             Ajudante sem privilégio usado pelo instalador
+bwms-proceed/            Ajudante de boot / input do harness de teste
 input-loader/            Mesclar definições de keybind / input
 mac-mod-manager/         Instalar / listar / remover mods
 r6/scripts/blackwall-mods/   fontes redscript (compilados no momento da instalação)
-example-rust-plugin/     Plugin nativo de exemplo
+                         — mesmo conjunto que o pacote publicado leva
+example-plugin/          Plugin nativo de exemplo (C ABI), pra autores de mod
+                         (chamava-se `example-rust-plugin/` até a 0.1.3)
+docs/                    API pro modder, fontes de mods, changelog público
 INSTALAR.command         Instalador para usuário final (ponto de entrada)
 bwms-install.sh          Script instalador (terminal / scriptável)
 ```

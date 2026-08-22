@@ -141,6 +141,47 @@ pub(crate) fn boot_hang_watchdog() {
     BINK_RELEASED.store(true, Ordering::Relaxed);
 }
 
+/// Global do PRÓPRIO watchdog do motor (CDPR, não-nosso): `red::VTable<void,CName,Vector3>::...`
+/// (nome real do binário é opaco — descoberto por RE de instrução, não por símbolo). Vive numa
+/// thread dedicada "WatchdogThread": acumula tempo (`this+0x50`) a cada ciclo de sleep e, se
+/// `acumulado > GLOBAL[0x634]*1000`ms, dispara um assert fatal próprio (`BRK #1`, static vmaddr
+/// `0x103da6128`/`0x103da5c50` — mesma assinatura documentada em `cp77-gog-memory-placement-wall`
+/// como "crash do WatchdogThread sob Low Power Mode"). `GLOBAL[0x634]` é o budget ATUAL em
+/// segundos; `GLOBAL[0x638]`/`GLOBAL[0x63c]` são os limites min/max (confirmados ao vivo via
+/// `peekq`: min=1, max=86400 — 24h). Sob macOS Low Power Mode o CPU/GPU throttlado faz o
+/// GameThread demorar demais entre "petadas" do watchdog, o acumulado passa do budget (visto na
+/// prática: default=120s) e o motor se mata sozinho — não é bug do BWMS, mas afeta qualquer boot
+/// pesado (o nosso inclusive) rodando sob LPM.
+///
+/// Fix: sobrescrever `GLOBAL[0x634]` DIRETO (sem passar pela função setter real — bypassa o
+/// clamp dela de propósito, mas o valor escolhido já cai dentro do próprio range [min,max] que o
+/// motor considera válido) com um budget bem maior, TODO TICK (não só 1x no boot) — outro código
+/// do motor pode chamar a setter real e resetar o valor em qualquer fase de transição; escrever
+/// de novo a cada tick garante que a NOSSA escrita sempre vence. É um único `store` de 4 bytes
+/// (`u32`) num endereço `__DATA` já confirmado gravável, mesma categoria de risco/custo de
+/// `force_session_advance` acima. Roda SEMPRE (não gated por dev/skip-intro) — é robustez pro
+/// usuário final, não uma ferramenta de diagnóstico.
+const ENGINE_WATCHDOG_BUDGET_VMADDR: u64 = 0x1_090d_c634;
+/// 3600s = 1h de budget (bem dentro do [1, 86400] observado) — generoso o bastante pra qualquer
+/// boot/tick pesado sob CPU/GPU throttled, sem desligar o watchdog por completo (`max` observado).
+const ENGINE_WATCHDOG_BUDGET_SECS: u32 = 3600;
+
+pub(crate) fn neutralize_engine_watchdog() {
+    unsafe {
+        let p = crate::rebase(ENGINE_WATCHDOG_BUDGET_VMADDR) as *mut u32;
+        if !crate::gum::is_readable(p as *const c_void, 4) {
+            return; // endereço ilegível (build/layout inesperado) -> não escreve às cegas
+        }
+        let before = p.read_volatile();
+        if before != ENGINE_WATCHDOG_BUDGET_SECS {
+            p.write_volatile(ENGINE_WATCHDOG_BUDGET_SECS);
+            crate::log(&format!(
+                "[wdog-neutralize] budget do watchdog do motor {before}s -> {ENGINE_WATCHDOG_BUDGET_SECS}s (proteção contra Low Power Mode)"
+            ));
+        }
+    }
+}
+
 /// O splash de boot deve aparecer agora? (skip-intro ligado + ainda não chegou no menu).
 pub fn boot_splash_active() -> bool {
     BOOT_SPLASH_ON.load(Ordering::Relaxed)
@@ -148,6 +189,14 @@ pub fn boot_splash_active() -> bool {
 /// `BwmsAcFired` chama isto — alimenta o marco "autocontinue disparou" de `boot_progress()`.
 pub(crate) fn note_autocontinue_fired() {
     AUTOCONTINUE_FIRED.store(true, Ordering::Relaxed);
+}
+/// Codeware `#129`/`PlayerSpawnedHook` (2026-08-15): leitura do mesmo flag acima — usado pra
+/// derivar `IsRestored()` na composição de `BwmsFireSessionReadyGameEvent` (`register.rs`). Se o
+/// autocontinue já disparou nesta sessão de processo, o boot corrente É um save carregado
+/// (`restored=true`); só ficaria `false` num boot genuinamente sem autocontinue (ex. `~/.bwms-
+/// autocontinue` desligado + usuário escolhe "Novo Jogo" no menu — cenário não-automatizável).
+pub(crate) fn autocontinue_was_fired() -> bool {
+    AUTOCONTINUE_FIRED.load(Ordering::Relaxed)
 }
 
 /// Chamar 1x, o mais cedo possível no `on_load` (antes de `selfboot_if_needed`/qualquer hook) —
@@ -294,7 +343,93 @@ pub(crate) fn boot_splash_off() {
 static ORIG_EXEC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static CLS_TX: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static CLS_PL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+// PERF (2026-08-16, achado via lldb num boot travado): `capture()` cai no caminho caro
+// (`gum::is_readable` = syscall `mach_vm_read_overwrite`, depois `rtti::class_of`) toda vez
+// que `ctx` NÃO é o player/tx já conhecido — durante streaming pesado de mundo, a esmagadora
+// maioria dos `ctx` são objetos distintos legítimos (não player/tx), então isso rodava a
+// syscall em quase TODA chamada de exec_replacement (hot-path extremo). Rate-limitado: só
+// tenta a via cara 1 em cada `CAPTURE_MISS_STRIDE` misses — ainda detecta player/tx dentro de
+// poucas dezenas de chamadas (rápido o bastante pra qualquer uso real), mas corta o volume de
+// syscalls por essa mesma proporção durante fases de alto volume de ctx desconhecido.
+static CAPTURE_MISS_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CAPTURE_MISS_STRIDE: u64 = 64;
 static CALLS: AtomicU64 = AtomicU64::new(0);
+
+// ===== [execpace] — instrumentação da rodada 31 (2026-08-17), investigando o achado de infra
+// da rodada 30: a cadeia de `@wrapMethod(PlayerPuppet) OnGameAttached` (108 arquivos `.reds`
+// distintos empilhados pelo compilador redscript, acumulados desde 2026-06) pode estar longa o
+// suficiente pra nunca devolver controle ao `cp77_tick` normal dentro da janela de boot testada
+// — hipótese levantada mas nunca medida. Em vez de tocar a cadeia em si (risco alto, usada por
+// TODO smoke test do projeto), mede-se o RITMO de `exec_replacement` (via `CALLS`, já existente,
+// incrementado em toda chamada de script não-suprimida/não-roteada) throttled a 1 log/segundo,
+// chamado de dentro de `cp77_tick` (que já dispara a cada [`TICK_EVERY`] chamadas do executor —
+// inclusive DURANTE a rajada de wraps, já que cada `Print`/chamada de método dentro de um wrap É
+// uma chamada de script que passa pelo executor). Puramente observacional: 1 `OnceLock::get_or_init`
+// + 1 CAS por chamada de `cp77_tick`, sem nenhuma mudança de comportamento. Isolado de
+// `BOOT_START` de propósito (esse só arma com skip-intro ligado; este timer é sempre ativo).
+static EXECPACE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static EXECPACE_LAST_SEC: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Getter público pro contador de chamadas do executor (`CALLS`) — sem expor o `static` privado.
+pub fn exec_calls() -> u64 {
+    CALLS.load(Ordering::Relaxed)
+}
+
+/// Loga o ritmo de `exec_replacement` (`[execpace] t=Ns calls=N`), throttled a 1x/segundo real.
+/// Chamar de dentro de `cp77_tick` (barato — early-return se o segundo não mudou desde a
+/// última chamada). Ver comentário do bloco acima pro contexto completo da investigação.
+pub fn log_exec_pace() {
+    let t0 = EXECPACE_T0.get_or_init(std::time::Instant::now);
+    let secs = t0.elapsed().as_secs();
+    let prev = EXECPACE_LAST_SEC.swap(secs, Ordering::Relaxed);
+    if prev != secs {
+        crate::log(&format!("[execpace] t={secs}s calls={}", exec_calls()));
+    }
+}
+
+// ===== [fntrace] — instrumentação da rodada 32 (2026-08-16/17), continuação direta da bisecção
+// do achado `[execpace]` (rodada 31): sabemos que o log VIVO para 155+s logo após
+// `codeware-inklayerwrapper-smoke.reds` terminar, com o processo consumindo 852-863% CPU
+// sustentado — mas `[execpace]` só diz O RITMO (quantas chamadas/segundo), nunca QUAL função
+// está sendo chamada. `[fntrace]` fecha essa lacuna: loga o CNAME resolvido (`func+0x10`, mesmo
+// offset já usado por `RUST_OV_CNAME`/`watched_before`/`hooks::trace_menu_click`) toda vez que
+// ele MUDA em relação à última chamada logada — não a cada chamada (evitaria flood/custo alto
+// numa rajada de 100k+ calls/s) — dando um traço COMPACTO de transição de função. Se o processo
+// trava numa função REDSCRIPT específica (loop/recursão), a ÚLTIMA linha `[fntrace]` antes do
+// silêncio aponta pra ela com precisão cirúrgica. Se o silêncio for CÓDIGO NATIVO puro do motor
+// (sem mais chamadas de script — ex. streaming/spawn de mundo pós-`OnGameAttached`, hipótese
+// alternativa que refutaria "bug na cadeia de wraps"), a última linha simplesmente para de
+// mudar e mais nenhuma aparece, mesmo sinal mas agora com NOME em vez de só contagem.
+// Opt-in via `~/.bwms-fntrace` (mesmo idioma de `skipintro_enabled`), checado 1x e cacheado —
+// custo no hot-path desligado = 1 leitura atômica de bool, igual a `dev_mode()`.
+static FNTRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static FNTRACE_LAST_MCNAME: AtomicU64 = AtomicU64::new(0);
+
+fn fntrace_enabled() -> bool {
+    *FNTRACE_ON.get_or_init(|| {
+        std::env::var_os("BWMS_FNTRACE").is_some()
+            || std::env::var("HOME")
+                .map(|h| std::path::Path::new(&h).join(".bwms-fntrace").exists())
+                .unwrap_or(false)
+    })
+}
+
+/// Loga `[fntrace] t=Ns calls=N -> <nome resolvido>` só quando o CNAME da função chamada MUDA
+/// desde a última chamada — chamar com o `mcname` já lido em `exec_replacement` (evita reler
+/// `func+0x10` 2x). Sem custo quando desligado (1 `OnceLock` já-inicializado + early-return).
+fn log_fn_trace(mcname: u64, calls: u64) {
+    if !fntrace_enabled() {
+        return;
+    }
+    let prev = FNTRACE_LAST_MCNAME.swap(mcname, Ordering::Relaxed);
+    if prev == mcname {
+        return;
+    }
+    let t0 = EXECPACE_T0.get_or_init(std::time::Instant::now);
+    let secs = t0.elapsed().as_secs();
+    let name = crate::cname::resolve_cname(mcname);
+    crate::log(&format!("[fntrace] t={secs}s calls={calls} -> {name}"));
+}
 
 // FromTDBID capturado NATIVAMENTE (fn/ctx/ret). Antes a sonda frida escrevia isso em
 // /tmp/cp77-fromtd.txt; como o ASLR muda por sessão, ler o arquivo de outra sessão dava
@@ -406,7 +541,7 @@ extern "C" fn ctor() {
 
 /// Estamos DENTRO do processo do jogo? (imagem 0 = executável principal). Evita
 /// auto-bootar em testes/`dlopen` de validação, onde o executor rebaseia errado.
-unsafe fn in_game() -> bool {
+pub(crate) unsafe fn in_game() -> bool {
     // Procura "Cyberpunk2077" em TODAS as imagens, não só a índice 0. BUG (achado in-game
     // 2026-06-24 via diagnóstico): `_dyld_get_image_name(0)` NÃO é garantido ser o
     // executável principal no momento do ctor → in_game dava false → o self-boot NUNCA
@@ -629,24 +764,37 @@ static PHASE_LAST_LOGGED: AtomicI64 = AtomicI64::new(-128);
 /// (loading/user), MENTE 3 → o dispatcher troca pro PreGameMenu. NÃO escreve o campo (mentir só o
 /// retorno preserva o estado real p/ quem lê +0x84 direto).
 unsafe extern "C" fn phase_skip_getter(this: *mut u8) -> i32 {
+    // 2026-08-20 (madrugada, sessão 2, achado de segurança): `this` era dereferenciado (via
+    // `f(this)`, chamando o trampolim original que faz `ldrsb w0,[x0,#0x84]`) ANTES de qualquer
+    // checagem de legibilidade — só os campos de diagnóstico (0xd4..0xff) eram protegidos por
+    // `is_readable`, não a chamada real. Suspeita (não confirmada, mas defesa de baixo risco de
+    // qualquer forma): o 2º ponto de crash achado nesta sessão (durante a transição real de
+    // autocontinue/save-load, ver memória `bwms-t82s-crash-vs-887pct-hang` Atualização 11) aconteceu
+    // logo após um `[phasedbg] getter#N phase=-1` — plausível que `this` fique momentaneamente
+    // inválido/sendo realocado durante o teardown de sessão que `LoadModdedSave` dispara. Movida a
+    // checagem de legibilidade pra ANTES de qualquer leitura (inclusive a chamada ao trampolim) —
+    // hardening puro, não muda comportamento no caso comum (this válido, que é 99%+ das chamadas).
     let orig = PHASE_GET_ORIG.load(Ordering::Relaxed);
+    // UMA leitura de legibilidade (0x100 cobre o 0x85 do capture E o 0xd4..0xff do fingerprint). Sob RAM
+    // baixa cada is_readable (mach_vm_read) pega o vm_map lock e serializa atrás do pager do drive externo;
+    // 2->1 por fire corta metade desse custo no getter (lido 12+×/frame) = P2 do fix do early-stick.
+    let readable = !this.is_null() && crate::gum::is_readable(this as *const c_void, 0x100);
+    if !readable {
+        // `this` null ou não-mapeado — não dereferenciar de jeito NENHUM (nem via trampolim).
+        // Devolve 0 (mesmo sentinela já usado em vários lugares do projeto pra "sem fase ainda").
+        return 0;
+    }
     let real = if !orig.is_null() {
         let f: unsafe extern "C" fn(*mut u8) -> i32 = std::mem::transmute(orig);
         f(this)
-    } else if !this.is_null() {
-        (this.add(0x84) as *const i8).read() as i32
     } else {
-        return 0;
+        (this.add(0x84) as *const i8).read() as i32
     };
     // CAPTURA do GameSessionDesc: o getter é `ldrsb w0,[x0,#0x84]` → `this` (=x0) É o GameSessionDesc
     // (o dispatcher chama `mov x0,x20; bl getter` com x20=GameSessionDesc). Guarda o ponteiro quando a
     // fase é 1/2/3/5 (fase de sessão válida) + this+0x85 legível → destrava force_session_advance e
     // force_pregame_menu (que dependiam do dispatcher-hook, hoje OFF). Filtro pela fase evita capturar
     // um caller espúrio. Sempre re-armazena (o ponteiro é estável; a última leitura vale).
-    // UMA leitura de legibilidade (0x100 cobre o 0x85 do capture E o 0xd4..0xff do fingerprint). Sob RAM
-    // baixa cada is_readable (mach_vm_read) pega o vm_map lock e serializa atrás do pager do drive externo;
-    // 2->1 por fire corta metade desse custo no getter (lido 12+×/frame) = P2 do fix do early-stick.
-    let readable = !this.is_null() && crate::gum::is_readable(this as *const c_void, 0x100);
     if readable {
         // O getter `ldrsb [x0,#0x84]` é GENÉRICO. A EngagementScreenGameController (o SM que o lever d4=2
         // precisa) tem, no repouso da tela "APERTE ESPAÇO", d4==1 && phase==1 (rest state confirmado,
@@ -901,6 +1049,8 @@ unsafe extern "C" fn exit_replacement(status: i32) {
     // (um mod que panica aqui não pode impedir a saída limpa, que é o objetivo #1 deste hook).
     let n = std::panic::catch_unwind(|| unsafe { crate::register::fire_event("Session/End") }).unwrap_or(0);
     crate::log(&format!("[cleanexit] Session/End (onShutdown) -> {n} callback(s)"));
+    // red4ext-gamestates-add: Shutdown.OnEnter (type=3) — exit() hookado = entrando em Shutdown
+    let _ = std::panic::catch_unwind(|| crate::api::call_game_state_enter(3));
     // Via ALTERNATIVA (2026-07-18): `fire_event`/CallbackSystem exige um TARGET (ref<IScriptable>)
     // vivo — mas em quit real o mundo/player já foram desmontados antes do exit() rodar (achado
     // desta mesma sessão, ver proof onshutdown-mechanism-safe-NAOfechado). Uma FUNÇÃO GLOBAL não
@@ -922,6 +1072,9 @@ unsafe extern "C" fn exit_replacement(status: i32) {
         "[cleanexit] BwmsOnGameShutdown (onShutdown, funcao global) -> {}",
         if g.is_some() { "chamada OK" } else { "nao achada/nao chamou" }
     ));
+    // RED4ext.SDK `#45` (`EMainReason::Unload`): sinaliza plugins Rust ANTES do processo morrer
+    // (mesmo timing/motivo dos 2 disparos acima — motor ainda intacto aqui). Isolado por plugin.
+    let _ = std::panic::catch_unwind(crate::plugins::unload_all_plugins);
     // Desarma o dead-man's switch do lever (ver register.rs::tramp_fire_start_state): chegar
     // aqui prova que o processo teve um exit() de verdade (não crash/hang/kill -9), então o
     // próximo boot pode disparar o lever normalmente de novo.
@@ -1183,6 +1336,29 @@ static CLASSVAL_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// classe do bundle durante o bind — dezenas+ vezes por boot).
 static CODEWARE_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static CODEWARE_REGISTERED: AtomicBool = AtomicBool::new(false);
+// 2026-08-05 (achado de auditoria): mesmo padrão da Facade do Codeware, agora pro TweakXL
+// (`TweakXL.Require`/`Version`/`Reload`, nunca portado apesar do "11/11 IMPL" do catálogo —
+// esses métodos são a API de CONTROLE que mods chamam, não o pipeline de aplicação de flats).
+static TWEAKXL_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static TWEAKXL_REGISTERED: AtomicBool = AtomicBool::new(false);
+// Codeware `#23` (`JobQueue`, 2026-08-14) — mesma receita Facade 100%-estática de `TweakXL`/
+// `TweakDBManager` acima (`register_type_min`+`register_facade_methods`). Ver
+// `register.rs::register_jobqueue_facade` pro escopo/divergência exatos.
+static JOBQUEUE_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static JOBQUEUE_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// `TweakDBManager` (2026-08-08, item TweakXL #44 do `PENDENCIAS-UNIFICADAS.md`) — mesma técnica
+/// de forja da Facade (`register_type_min`+`register_method` no validador), classe diferente. É a
+/// API real que mods do Nexus importam pra CRUD de TweakDB (`SetFlat`/`CreateRecord`/
+/// `UpdateRecord`/`RegisterName`), nunca exposta antes — só o backend nativo existia.
+static TWEAKDBMANAGER_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static TWEAKDBMANAGER_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// `TweakDBBatch` (item TweakXL #45) — devolvida por `TweakDBManager.StartBatch()`. Precisa
+/// registrar ANTES/independente de `TweakDBManager` porque o validador pode visitar as 2 classes
+/// em qualquer ordem (cada `.reds` é seu próprio `native class`).
+static TWEAKDBBATCH_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static TWEAKDBBATCH_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ARCHIVEXL_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ARCHIVEXL_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `cw-callbacksystem-rtti` (2026-07-13) — mesma técnica da Facade, classe diferente
 /// (`CallbackSystem extends IGameSystem`). Guard próprio, mesmo padrão de `CODEWARE_REGISTERED`.
 static CALLBACKSYSTEM_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1190,10 +1366,62 @@ static CALLBACKSYSTEM_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new
 /// (Facade + CallbackSystem), guards próprios por classe.
 static SCRIPTABLESERVICE_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SCRIPTABLESERVICE_REGISTERED: AtomicBool = AtomicBool::new(false);
+static SCRIPTABLETWEAK_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static SCRIPTABLETWEAK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static CALLBACKSYSTEMTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static CALLBACKSYSTEMTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// `ComponentTarget extends CallbackSystemTarget` (2026-07-24) — fábricas STATIC (`ID`/`Name`).
+/// Veredito de investigação: mecanismo NOVO, não-testado (is_static=true + new_object/make_handle
+/// numa classe FORJADA por nós — ver nota grande em `register.rs` acima de `COMPONENTTARGET_
+/// STATES`). Guard próprio, mesmo padrão dos demais; registrar SÓ depois de `CallbackSystemTarget`
+/// (parent) já ter passado pelo validador.
+static COMPONENTTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static COMPONENTTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// 6 subclasses NOVAS `extends CallbackSystemTarget` (2026-07-24, rodada 2 — mesma sessão de
+/// `ComponentTarget` acima): `ResourceTarget`/`inkWidgetTarget`/`DynamicEntityTarget`/
+/// `StaticEntityTarget`/`EntityTarget`/`InputTarget`. MESMO veredito de risco NÃO-PROVADO
+/// (is_static=true + new_object/make_handle numa classe FORJADA por nós) — ver nota grande em
+/// `register.rs` acima de `COMPONENTTARGET_STATES`, que se aplica igualmente às 6 abaixo. Todas
+/// registram SÓ depois de `CallbackSystemTarget` (parent comum, mesmo confirmado lendo cada .reds
+/// vendorizado em `enablers/Codeware/scripts/Callback/Targets/`) já ter passado pelo validador —
+/// garantido pela ORDEM destes blocos (todos rodam DEPOIS do bloco `CallbackSystemTarget` acima,
+/// na mesma passada do validador). Métodos que exigiam `ResRef`/`array<T>`/`EntityID` ficaram de
+/// fora desta rodada (ver notas pontuais em cada `register_*`/`tramp_*` em register.rs).
+static RESOURCETARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static RESOURCETARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+static INKWIDGETTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static INKWIDGETTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+static DYNAMICENTITYTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static DYNAMICENTITYTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+static STATICENTITYTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static STATICENTITYTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ENTITYTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ENTITYTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
+static INPUTTARGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static INPUTTARGET_REGISTERED: AtomicBool = AtomicBool::new(false);
 static SCRIPTABLESERVICECONTAINER_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SCRIPTABLESERVICECONTAINER_REGISTERED: AtomicBool = AtomicBool::new(false);
+static DYNAMICENTITYSYSTEM_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static DYNAMICENTITYSYSTEM_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Codeware `#75` (`StaticEntitySystem`) — implementação NOVA 2026-08-15, módulo IRMÃO do
+/// `DynamicEntitySystem` acima, mesma hierarquia (`extends IGameSystem`), mesma receita de forja.
+static STATICENTITYSYSTEM_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static STATICENTITYSYSTEM_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Codeware `#76` (`StaticEntitySpec`) — implementação NOVA 2026-08-15 (rodada 9), companion struct
+/// do `#75` acima. `extends IScriptable` DIRETO (mesma receita de `CallbackSystemHandler`).
+static STATICENTITYSPEC_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static STATICENTITYSPEC_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Codeware `#74` (`DynamicEntitySpec`) — implementação NOVA 2026-08-19, companion struct do `#73`/
+/// `DynamicEntitySystem` (acima). Porte direto de `#76`/`StaticEntitySpec` (12 campos em vez de 6,
+/// `extends IScriptable` direto, mesma receita).
+static DYNAMICENTITYSPEC_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static DYNAMICENTITYSPEC_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// `cw-ui-widget` (2026-08-06, cont.24): `inkWidget` é VANILLA (não forjada por nós), mas AINDA
+/// ASSIM passa pelo `class_validate_probe_hook` (confirmado: o hook intercepta a validação de
+/// QUALQUER classe do bind, forjada ou não — o que faltava era um branch chamando
+/// `register_inkwidget_helper` a partir dele, igual CallbackSystem/DynamicEntitySystem têm).
+static INKWIDGET_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static INKWIDGET_REGISTERED: AtomicBool = AtomicBool::new(false);
 static CALLBACKSYSTEMHANDLER_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static CALLBACKSYSTEMHANDLER_REGISTERED: AtomicBool = AtomicBool::new(false);
 static CALLBACKSYSTEM_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1232,6 +1460,29 @@ static ENTITYLIFECYCLEEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// edge-triggered, MESMO padrão seguro de `Player/Spawned`/`Session/Start`.
 static RESOURCEEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static RESOURCEEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// `cw-event-target-classes` (2026-07-24) — `AxisInputEvent extends KeyInputEvent`,
+/// `VehicleLightControlEvent`/`EntityComponentEvent extends EntityLifecycleEvent`. MESMA receita
+/// já provada (parent nativo real + `register_type_instantiable_with_parent`).
+static AXISINPUTEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static AXISINPUTEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+static VEHICLELIGHTCONTROLEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static VEHICLELIGHTCONTROLEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+static ENTITYCOMPONENTEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ENTITYCOMPONENTEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+// Codeware `#11` (`inkWidgetSpawnEvent`, candidato 6ª rodada 2026-08-11) — mesma receita robusta
+// (parent = `CallbackSystemEvent` real, já forjado).
+static INKWIDGETSPAWNEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static INKWIDGETSPAWNEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+// ArchiveXL `#47` (`CustomizationExtension`, 2026-08-14, agente offline dedicado) — mesma receita
+// robusta (parent = `CallbackSystemEvent` real, já forjado). Ver `register.rs::register_customizationevent`.
+static CUSTOMIZATIONEVENT_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static CUSTOMIZATIONEVENT_REGISTERED: AtomicBool = AtomicBool::new(false);
+// Codeware `#25` (`EntityBuilderWrapper`, 2026-08-18 madrugada cont.20) — mesma receita robusta
+// dos eventos acima, mas parent = `IScriptable` (não `CallbackSystemEvent`), mesmo padrão já
+// usado por `CallbackSystemHandler`/`StaticEntitySpec`/`TweakDBBatch`. Ver
+// `register.rs::register_entitybuilderwrapper`.
+static ENTITYBUILDERWRAPPER_CNAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ENTITYBUILDERWRAPPER_REGISTERED: AtomicBool = AtomicBool::new(false);
 // `cw-rawinput-realname` — 2 tentativas, 2 crashes, ambas revertidas (2026-07-13). Ver
 // `blackwall-mods-dev/callbacksystem-native.reds` pro histórico completo.
 /// Separado de CODEWARE_REGISTERED (Tentativa 10): a CLASSE forja cedo (getorreg-probe) mas os
@@ -1260,6 +1511,77 @@ unsafe fn dump_engine_error_container(engine: *const u8, label: &str) {
     crate::log(&format!(
         "[classval-probe] {label}: engine={engine:p} [engine+0x150]: header@+0x14={header:#010x} (size={size} flag={flag}) bytes={bytes:02x?}"
     ));
+}
+
+/// Diagnóstico "vai passar no validador original?" — IsKindOf walk (sobe a cadeia de parent de
+/// `cls` até bater em IScriptable) + checa se a base DECLARADA no `.reds` (lida de `x1+0x20`)
+/// resolve pro MESMO ponteiro que nosso parent forjado + lê `flags@+0x70` da classe. Roda
+/// IMEDIATAMENTE após forjar+registrar uma classe, ANTES do validador original (chamado mais
+/// abaixo em `class_validate_probe_hook`) — se o boot crashar depois, este log já foi escrito e
+/// sobrevive no arquivo. Extraído em 2026-08-06 (cont.26): CallbackSystem e DynamicEntitySystem
+/// tinham cada uma sua PRÓPRIA cópia de ~55 linhas idênticas deste bloco (a 2ª surgiu em cont.23
+/// copiando a 1ª pra investigar o crash do `module`) — exatamente o tipo de redundância que
+/// sobra quando cada gap é tratado como problema isolado em vez de reusar o que já existe.
+/// `tag` = prefixo curto nas linhas de log (`"CBS"`/`"DES"`); `class_name` = nome RTTI real (só
+/// usado na linha final de `flags@+0x70`, pra manter o texto de log idêntico ao de antes).
+unsafe fn diag_class_forge_prediction(reg: &rtti::Registry, tag: &str, class_name: &str, x1: *mut u8) {
+    let cls = reg.class_by_name(class_name);
+    let igs = reg.class_by_name("IGameSystem");
+    crate::log(&format!("[classval-probe] {tag} diag: {class_name}={cls:p} IGameSystem={igs:p}"));
+    let getter: extern "C" fn() -> *mut c_void = std::mem::transmute(crate::rebase(0x1_0223_809c));
+    let expected_base = getter(); // sempre IScriptable (universal, confirmado p/ Codeware)
+    let mut cur = cls;
+    let mut found = false;
+    for depth in 0..16u32 {
+        if cur.is_null() {
+            crate::log(&format!("[classval-probe] {tag} IsKindOf walk: profundidade={depth} cur=NULL — parando"));
+            break;
+        }
+        if cur as u64 == expected_base as u64 {
+            found = true;
+            crate::log(&format!("[classval-probe] {tag} IsKindOf walk: profundidade={depth} cur={cur:p} == expected_base(IScriptable) — ACHOU"));
+            break;
+        }
+        if !crate::gum::is_readable((cur as *const u8).add(0x10) as *const c_void, 8) {
+            crate::log(&format!("[classval-probe] {tag} IsKindOf walk: profundidade={depth} cur={cur:p} [cur+0x10] ilegível — parando"));
+            break;
+        }
+        let next = core::ptr::read_unaligned((cur as *const u8).add(0x10) as *const *mut c_void);
+        crate::log(&format!("[classval-probe] {tag} IsKindOf walk: profundidade={depth} cur={cur:p} parent[+0x10]={next:p}"));
+        cur = next;
+    }
+    crate::log(&format!(
+        "[classval-probe] {tag} IsKindOf PREVISTO: {}",
+        if found { "SUCESSO" } else { "FALHA" }
+    ));
+    if !x1.is_null() && crate::gum::is_readable(x1.add(0x20) as *const c_void, 8) {
+        let decl_base_desc = core::ptr::read_unaligned(x1.add(0x20) as *const *mut u8);
+        if decl_base_desc.is_null() {
+            crate::log(&format!("[classval-probe] {tag}: sem base declarada explícita (inesperado — o .reds tem extends)"));
+        } else if crate::gum::is_readable(decl_base_desc.add(8) as *const c_void, 8) {
+            let decl_cname = core::ptr::read_unaligned(decl_base_desc.add(8) as *const u64);
+            let getter2: extern "C" fn() -> *mut c_void = std::mem::transmute(crate::rebase(0x1_0218_85a0));
+            let singleton = getter2();
+            if !singleton.is_null() && crate::gum::is_readable(singleton as *const c_void, 8) {
+                let vt = core::ptr::read_unaligned(singleton as *const *mut u8);
+                if !vt.is_null() && crate::gum::is_readable(vt.add(0x108) as *const c_void, 8) {
+                    let slot = core::ptr::read_unaligned(vt.add(0x108) as *const *mut c_void);
+                    if crate::rtti::sane(slot) {
+                        let getclass: extern "C" fn(*mut c_void, u64) -> *mut c_void = std::mem::transmute(slot);
+                        let resolved = getclass(singleton, decl_cname);
+                        crate::log(&format!(
+                            "[classval-probe] {tag} base declarada resolvida={resolved:p} vs nosso parent(IGameSystem)={igs:p} (bate={})",
+                            resolved as u64 == igs as u64
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !cls.is_null() && crate::gum::is_readable(cls as *const c_void, 0x74) {
+        let flags = core::ptr::read_unaligned((cls as *const u8).add(0x70) as *const u32);
+        crate::log(&format!("[classval-probe] {class_name} flags@+0x70 = {flags:#010x}"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1314,6 +1636,8 @@ unsafe extern "C" fn class_validate_probe_hook(
     // orquestrador. Só na classe 'Codeware' (evita spam nos outros 12). Diagnóstico puro —
     // gated dev_mode (não afeta o forge, que roda incondicional mais abaixo).
     let cw_hash = *CODEWARE_CNAME.get_or_init(|| crate::cname::cname("Codeware"));
+    let tweakxl_hash = *TWEAKXL_CNAME.get_or_init(|| crate::cname::cname("TweakXL"));
+    let archivexl_hash = *ARCHIVEXL_CNAME.get_or_init(|| crate::cname::cname("ArchiveXL"));
     if diag && name_hash == Some(cw_hash) {
         const HEAP_LO: u64 = 0x7000000000;
         const HEAP_HI: u64 = 0x8000000000;
@@ -1398,6 +1722,73 @@ unsafe extern "C" fn class_validate_probe_hook(
             dump_engine_error_container(engine, "DEPOIS do forge+register");
         }
     }
+    // 2026-08-05 (achado de auditoria): MESMO fix da Facade, classe `TweakXL` (declarada em
+    // `tweakxl-facade.reds`) — bloco ESSENCIAL, roda SEMPRE (mesma justificativa de produção
+    // do bloco do Codeware acima).
+    if name_hash == Some(tweakxl_hash) && !TWEAKXL_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'TweakXL' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let forged = crate::register::register_type_min(&reg, "TweakXL");
+            crate::log(&format!("[classval-probe] register_type_min('TweakXL') -> {forged:p}"));
+            let r = crate::register::register_tweakxl_facade(&reg);
+            crate::log(&format!("[classval-probe] register_tweakxl_facade -> {r}"));
+        } else {
+            crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
+        }
+    }
+    // 2026-08-08 (item TweakXL #44, `PENDENCIAS-UNIFICADAS.md`): MESMO fix, classe
+    // `TweakDBManager` (declarada em `tweakdbmanager.reds`) — bloco ESSENCIAL, roda SEMPRE.
+    let tweakdbmanager_hash = *TWEAKDBMANAGER_CNAME.get_or_init(|| crate::cname::cname("TweakDBManager"));
+    if name_hash == Some(tweakdbmanager_hash) && !TWEAKDBMANAGER_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'TweakDBManager' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let forged = crate::register::register_type_min(&reg, "TweakDBManager");
+            crate::log(&format!("[classval-probe] register_type_min('TweakDBManager') -> {forged:p}"));
+            let r = crate::register::register_tweakdbmanager(&reg);
+            crate::log(&format!("[classval-probe] register_tweakdbmanager -> {r}"));
+        } else {
+            crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
+        }
+    }
+    // 2026-08-08 (item TweakXL #45): `TweakDBBatch` — devolvida por `TweakDBManager.StartBatch()`.
+    // Mesma receita de `CallbackSystemHandler` (instanciável, sem extends = parent IScriptable).
+    let tweakdbbatch_hash = *TWEAKDBBATCH_CNAME.get_or_init(|| crate::cname::cname("TweakDBBatch"));
+    if name_hash == Some(tweakdbbatch_hash) && !TWEAKDBBATCH_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'TweakDBBatch' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_tweakdbbatch(&reg);
+            crate::log(&format!("[classval-probe] register_tweakdbbatch -> {r}"));
+        } else {
+            crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
+        }
+    }
+    // 2026-08-05 (achado de auditoria): MESMO fix, classe `ArchiveXL` (declarada em
+    // `archivexl-facade.reds`) — bloco ESSENCIAL, roda SEMPRE.
+    if name_hash == Some(archivexl_hash) && !ARCHIVEXL_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'ArchiveXL' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let forged = crate::register::register_type_min(&reg, "ArchiveXL");
+            crate::log(&format!("[classval-probe] register_type_min('ArchiveXL') -> {forged:p}"));
+            let r = crate::register::register_archivexl_facade(&reg);
+            crate::log(&format!("[classval-probe] register_archivexl_facade -> {r}"));
+        } else {
+            crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
+        }
+    }
+    // Codeware `#23` (`JobQueue`, 2026-08-14) — MESMO fix da Facade, classe Facade
+    // 100%-estática (declarada em `codeware-jobqueue.reds`). Bloco ESSENCIAL, roda SEMPRE.
+    let jobqueue_hash = *JOBQUEUE_CNAME.get_or_init(|| crate::cname::cname("JobQueue"));
+    if name_hash == Some(jobqueue_hash) && !JOBQUEUE_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'JobQueue' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let forged = crate::register::register_type_min(&reg, "JobQueue");
+            crate::log(&format!("[classval-probe] register_type_min('JobQueue') -> {forged:p}"));
+            let r = crate::register::register_jobqueue_facade(&reg);
+            crate::log(&format!("[classval-probe] register_jobqueue_facade -> {r}"));
+        } else {
+            crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
+        }
+    }
     // `cw-callbacksystem-rtti` (2026-07-13) — MESMO fix da Facade (parent explícito + fullName
     // bare), classe DIFERENTE (`CallbackSystem extends IGameSystem`, instanciável). Bloco
     // ESSENCIAL, roda SEMPRE (não gated por dev_mode) — mesma justificativa de produção do bloco
@@ -1427,62 +1818,9 @@ unsafe extern "C" fn class_validate_probe_hook(
             // DIAGNÓSTICO (mesma técnica da Tentativa 11, parametrizada p/ CallbackSystem/
             // IGameSystem em vez de Codeware/IScriptable) — roda IMEDIATAMENTE após o forge, pra
             // prever se o IsKindOf walk + o check de base-declarada vão passar, ANTES do validador
-            // ORIGINAL rodar (log logo abaixo, fora deste bloco).
-            let cbs_cls = reg.class_by_name("CallbackSystem");
-            let igs_cls = reg.class_by_name("IGameSystem");
-            crate::log(&format!("[classval-probe] CBS diag: CallbackSystem={cbs_cls:p} IGameSystem={igs_cls:p}"));
-            let getter: extern "C" fn() -> *mut c_void = std::mem::transmute(crate::rebase(0x1_0223_809c));
-            let expected_base = getter(); // sempre IScriptable (universal, confirmado p/ Codeware)
-            let mut cur = cbs_cls;
-            let mut found = false;
-            for depth in 0..16u32 {
-                if cur.is_null() {
-                    crate::log(&format!("[classval-probe] CBS IsKindOf walk: profundidade={depth} cur=NULL — parando"));
-                    break;
-                }
-                if cur as u64 == expected_base as u64 {
-                    found = true;
-                    crate::log(&format!("[classval-probe] CBS IsKindOf walk: profundidade={depth} cur={cur:p} == expected_base(IScriptable) — ACHOU"));
-                    break;
-                }
-                if !crate::gum::is_readable((cur as *const u8).add(0x10) as *const c_void, 8) {
-                    crate::log(&format!("[classval-probe] CBS IsKindOf walk: profundidade={depth} cur={cur:p} [cur+0x10] ilegível — parando"));
-                    break;
-                }
-                let next = core::ptr::read_unaligned((cur as *const u8).add(0x10) as *const *mut c_void);
-                crate::log(&format!("[classval-probe] CBS IsKindOf walk: profundidade={depth} cur={cur:p} parent[+0x10]={next:p}"));
-                cur = next;
-            }
-            crate::log(&format!(
-                "[classval-probe] CBS IsKindOf PREVISTO: {}",
-                if found { "SUCESSO" } else { "FALHA" }
-            ));
-            if !x1.is_null() && crate::gum::is_readable(x1.add(0x20) as *const c_void, 8) {
-                let decl_base_desc = core::ptr::read_unaligned(x1.add(0x20) as *const *mut u8);
-                if !decl_base_desc.is_null() && crate::gum::is_readable(decl_base_desc.add(8) as *const c_void, 8) {
-                    let decl_cname = core::ptr::read_unaligned(decl_base_desc.add(8) as *const u64);
-                    let getter2: extern "C" fn() -> *mut c_void = std::mem::transmute(crate::rebase(0x1_0218_85a0));
-                    let singleton2 = getter2();
-                    if !singleton2.is_null() && crate::gum::is_readable(singleton2 as *const c_void, 8) {
-                        let vt = core::ptr::read_unaligned(singleton2 as *const *mut u8);
-                        if !vt.is_null() && crate::gum::is_readable(vt.add(0x108) as *const c_void, 8) {
-                            let slot = core::ptr::read_unaligned(vt.add(0x108) as *const *mut c_void);
-                            if crate::rtti::sane(slot) {
-                                let getclass: extern "C" fn(*mut c_void, u64) -> *mut c_void = std::mem::transmute(slot);
-                                let resolved = getclass(singleton2, decl_cname);
-                                crate::log(&format!(
-                                    "[classval-probe] CBS base declarada resolvida={resolved:p} vs nosso parent(IGameSystem)={igs_cls:p} (bate={})",
-                                    resolved as u64 == igs_cls as u64
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            if !cbs_cls.is_null() && crate::gum::is_readable(cbs_cls as *const c_void, 0x74) {
-                let flags = core::ptr::read_unaligned((cbs_cls as *const u8).add(0x70) as *const u32);
-                crate::log(&format!("[classval-probe] CallbackSystem flags@+0x70 = {flags:#010x}"));
-            }
+            // ORIGINAL rodar (log logo abaixo, fora deste bloco). Ver `diag_class_forge_prediction`
+            // (2026-08-06, cont.26 — consolida esta lógica com a cópia idêntica do bloco DES).
+            diag_class_forge_prediction(&reg, "CBS", "CallbackSystem", x1);
         } else {
             crate::log("[classval-probe] Registry::obtain() falhou — RTTI não pronto aqui?");
         }
@@ -1499,6 +1837,17 @@ unsafe extern "C" fn class_validate_probe_hook(
             crate::log(&format!("[classval-probe] register_scriptableservice -> {r}"));
         }
     }
+    // `tweakxl-script-extensions`: ScriptableTweak precisa estar no RTTI antes do compilador
+    // validar as subclasses dos mods (ex.: Equipment-EX: PatchCustomItems/RegisterOutfitSlots).
+    // Mesma receita do ScriptableService: register_type_min (classe mínima abstrata).
+    let st_hash = *SCRIPTABLETWEAK_CNAME.get_or_init(|| crate::cname::cname("ScriptableTweak"));
+    if name_hash == Some(st_hash) && !SCRIPTABLETWEAK_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'ScriptableTweak' detectada no validador — forjando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_scriptabletweak(&reg);
+            crate::log(&format!("[classval-probe] register_scriptabletweak -> {r}"));
+        }
+    }
     let cst_hash = *CALLBACKSYSTEMTARGET_CNAME.get_or_init(|| crate::cname::cname("CallbackSystemTarget"));
     if name_hash == Some(cst_hash) && !CALLBACKSYSTEMTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
         crate::log("[classval-probe] classe 'CallbackSystemTarget' detectada no validador — forjando AGORA");
@@ -1507,12 +1856,143 @@ unsafe extern "C" fn class_validate_probe_hook(
             crate::log(&format!("[classval-probe] register_callbacksystemtarget -> {r}"));
         }
     }
+    // `ComponentTarget` (2026-07-24) — NÃO-PROVADO, ver nota grande em register.rs. Registrar só
+    // depois do parent 'CallbackSystemTarget' já ter forjado (ordem do próprio hook garante isso:
+    // este bloco roda DEPOIS do bloco acima na mesma passada do validador).
+    let ct_hash = *COMPONENTTARGET_CNAME.get_or_init(|| crate::cname::cname("ComponentTarget"));
+    if name_hash == Some(ct_hash) && !COMPONENTTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'ComponentTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_componenttarget(&reg);
+            crate::log(&format!("[classval-probe] register_componenttarget -> {r}"));
+        }
+    }
+    // 6 subclasses novas `extends CallbackSystemTarget` (2026-07-24, rodada 2) — ver nota grande
+    // em `RESOURCETARGET_CNAME` acima pro veredito de risco compartilhado.
+    let rt_hash = *RESOURCETARGET_CNAME.get_or_init(|| crate::cname::cname("ResourceTarget"));
+    if name_hash == Some(rt_hash) && !RESOURCETARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'ResourceTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_resourcetarget(&reg);
+            crate::log(&format!("[classval-probe] register_resourcetarget -> {r}"));
+        }
+    }
+    let iwt_hash = *INKWIDGETTARGET_CNAME.get_or_init(|| crate::cname::cname("inkWidgetTarget"));
+    if name_hash == Some(iwt_hash) && !INKWIDGETTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'inkWidgetTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_inkwidgettarget(&reg);
+            crate::log(&format!("[classval-probe] register_inkwidgettarget -> {r}"));
+        }
+    }
+    let dyt_hash = *DYNAMICENTITYTARGET_CNAME.get_or_init(|| crate::cname::cname("DynamicEntityTarget"));
+    if name_hash == Some(dyt_hash) && !DYNAMICENTITYTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'DynamicEntityTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_dynamicentitytarget(&reg);
+            crate::log(&format!("[classval-probe] register_dynamicentitytarget -> {r}"));
+        }
+    }
+    let stt_hash = *STATICENTITYTARGET_CNAME.get_or_init(|| crate::cname::cname("StaticEntityTarget"));
+    if name_hash == Some(stt_hash) && !STATICENTITYTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'StaticEntityTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_staticentitytarget(&reg);
+            crate::log(&format!("[classval-probe] register_staticentitytarget -> {r}"));
+        }
+    }
+    let et_hash = *ENTITYTARGET_CNAME.get_or_init(|| crate::cname::cname("EntityTarget"));
+    if name_hash == Some(et_hash) && !ENTITYTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'EntityTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_entitytarget(&reg);
+            crate::log(&format!("[classval-probe] register_entitytarget -> {r}"));
+        }
+    }
+    let it_hash = *INPUTTARGET_CNAME.get_or_init(|| crate::cname::cname("InputTarget"));
+    if name_hash == Some(it_hash) && !INPUTTARGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'InputTarget' detectada no validador — forjando+registrando AGORA (is_static factory, PROVADO 2026-08-05)");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_inputtarget(&reg);
+            crate::log(&format!("[classval-probe] register_inputtarget -> {r}"));
+        }
+    }
     let ssc_hash = *SCRIPTABLESERVICECONTAINER_CNAME.get_or_init(|| crate::cname::cname("ScriptableServiceContainer"));
     if name_hash == Some(ssc_hash) && !SCRIPTABLESERVICECONTAINER_REGISTERED.swap(true, Ordering::AcqRel) {
         crate::log("[classval-probe] classe 'ScriptableServiceContainer' detectada no validador — forjando+registrando AGORA");
         if let Some(reg) = crate::rtti::Registry::obtain() {
             let r = crate::register::register_scriptableservicecontainer(&reg);
             crate::log(&format!("[classval-probe] register_scriptableservicecontainer -> {r}"));
+        }
+    }
+    // cw-world-depot (2026-08-06, Fase 2): `DynamicEntitySystem extends IGameSystem` — MESMA
+    // hierarquia já provada de `CallbackSystem` (`register_callbacksystem` acima, INSTANCIÁVEL,
+    // forjada+registrada há sessões sem problema). Subconjunto de tag-bookkeeping (registry Rust-
+    // side puro, zero RE de endereço) — `CreateEntity`/`GetTags`/`GetTaggedIDs`/`GetTagged` (todos
+    // que precisariam de `array<T>` de RETORNO ou spawn real de entidade) ficam FORA desta rodada.
+    let des_hash = *DYNAMICENTITYSYSTEM_CNAME.get_or_init(|| crate::cname::cname("DynamicEntitySystem"));
+    if name_hash == Some(des_hash) && !DYNAMICENTITYSYSTEM_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'DynamicEntitySystem' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            // FECHADO (2026-08-06, cont.23): causa raiz do crash era `module Codeware.World` no
+            // .reds (bug já documentado, memória cp77-redscript-module-plus-nativefunc-crash) —
+            // não a EntityID nem o registro em si. Fix aplicado no .reds, variante de isolação
+            // provada ao vivo (rttidump/newobj/callon), promovida pra versão COMPLETA (8 métodos).
+            let r = crate::register::register_dynamicentitysystem(&reg);
+            crate::log(&format!("[classval-probe] register_dynamicentitysystem -> {r}"));
+            // DIAGNÓSTICO (mesma verificação que CBS acima, ver `diag_class_forge_prediction` —
+            // consolidado 2026-08-06 cont.26, era uma 2ª cópia quase-idêntica deste bloco).
+            diag_class_forge_prediction(&reg, "DES", "DynamicEntitySystem", x1);
+        }
+    }
+    // Codeware `#75` (`StaticEntitySystem`, 2026-08-15) — módulo IRMÃO do `DynamicEntitySystem`
+    // acima, mesma hierarquia/mesma receita (`extends IGameSystem`, INSTANCIÁVEL, já provada 2x
+    // nesta mesma classe de bloco). Subconjunto de tag-bookkeeping puro (ver `register.rs`).
+    let ses_hash = *STATICENTITYSYSTEM_CNAME.get_or_init(|| crate::cname::cname("StaticEntitySystem"));
+    if name_hash == Some(ses_hash) && !STATICENTITYSYSTEM_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'StaticEntitySystem' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_staticentitysystem(&reg);
+            crate::log(&format!("[classval-probe] register_staticentitysystem -> {r}"));
+            diag_class_forge_prediction(&reg, "SES", "StaticEntitySystem", x1);
+        }
+    }
+    // Codeware `#76` (`StaticEntitySpec`, 2026-08-15, rodada 9) — companion struct do `#75` acima,
+    // `extends IScriptable` direto (mesma receita de `CallbackSystemHandler`, já provada).
+    let sespec_hash = *STATICENTITYSPEC_CNAME.get_or_init(|| crate::cname::cname("StaticEntitySpec"));
+    if name_hash == Some(sespec_hash) && !STATICENTITYSPEC_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'StaticEntitySpec' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_staticentityspec(&reg);
+            crate::log(&format!("[classval-probe] register_staticentityspec -> {r}"));
+            diag_class_forge_prediction(&reg, "SESPEC", "StaticEntitySpec", x1);
+        }
+    }
+    // Codeware `#74` (`DynamicEntitySpec`, 2026-08-19) — companion struct do `#73`/
+    // `DynamicEntitySystem` acima, porte direto de `#76`/`StaticEntitySpec` (mesma receita
+    // `extends IScriptable`, 12 campos em vez de 6).
+    let despec_hash = *DYNAMICENTITYSPEC_CNAME.get_or_init(|| crate::cname::cname("DynamicEntitySpec"));
+    if name_hash == Some(despec_hash) && !DYNAMICENTITYSPEC_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'DynamicEntitySpec' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_dynamicentityspec(&reg);
+            crate::log(&format!("[classval-probe] register_dynamicentityspec -> {r}"));
+            diag_class_forge_prediction(&reg, "DESPEC", "DynamicEntitySpec", x1);
+        }
+    }
+    // `cw-ui-widget` (2026-08-06, cont.24): `inkWidget` é VANILLA, mas passa por AQUI igual
+    // qualquer outra classe do bind (confirmado por log em boots antigos: "Weather_Record"/
+    // "WeatherPreset_Record"/etc., classes 100% do motor, também aparecem neste hook) — cont.18
+    // errou ao concluir "nunca passa pelo nosso hook". Bloco ESSENCIAL (não gated dev_mode, mesma
+    // categoria de Codeware/CallbackSystem/DynamicEntitySystem): registra os 3 métodos ANTES do
+    // validador original rodar, pra já estarem na tabela de métodos de `inkWidget` quando o motor
+    // tentar bindar `GetParentWidget`/`CanSupportFocus`/`SetSupportFocus`.
+    let iw_hash = *INKWIDGET_CNAME.get_or_init(|| crate::cname::cname("inkWidget"));
+    if name_hash == Some(iw_hash) && !INKWIDGET_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'inkWidget' detectada no validador — registrando GetParentWidget/CanSupportFocus/SetSupportFocus AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_inkwidget_helper(&reg);
+            crate::log(&format!("[classval-probe] register_inkwidget_helper -> {r}"));
         }
     }
     let csh_hash = *CALLBACKSYSTEMHANDLER_CNAME.get_or_init(|| crate::cname::cname("CallbackSystemHandler"));
@@ -1563,6 +2043,58 @@ unsafe extern "C" fn class_validate_probe_hook(
         if let Some(reg) = crate::rtti::Registry::obtain() {
             let r = crate::register::register_resourceevent(&reg);
             crate::log(&format!("[classval-probe] register_resourceevent -> {r}"));
+        }
+    }
+    let aie_hash = *AXISINPUTEVENT_CNAME.get_or_init(|| crate::cname::cname("AxisInputEvent"));
+    if name_hash == Some(aie_hash) && !AXISINPUTEVENT_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'AxisInputEvent' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_axisinputevent(&reg);
+            crate::log(&format!("[classval-probe] register_axisinputevent -> {r}"));
+        }
+    }
+    let vlce_hash = *VEHICLELIGHTCONTROLEVENT_CNAME.get_or_init(|| crate::cname::cname("VehicleLightControlEvent"));
+    if name_hash == Some(vlce_hash) && !VEHICLELIGHTCONTROLEVENT_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'VehicleLightControlEvent' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_vehiclelightcontrolevent(&reg);
+            crate::log(&format!("[classval-probe] register_vehiclelightcontrolevent -> {r}"));
+        }
+    }
+    let ece_hash = *ENTITYCOMPONENTEVENT_CNAME.get_or_init(|| crate::cname::cname("EntityComponentEvent"));
+    if name_hash == Some(ece_hash) && !ENTITYCOMPONENTEVENT_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'EntityComponentEvent' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_entitycomponentevent(&reg);
+            crate::log(&format!("[classval-probe] register_entitycomponentevent -> {r}"));
+        }
+    }
+    let iwse_hash = *INKWIDGETSPAWNEVENT_CNAME.get_or_init(|| crate::cname::cname("inkWidgetSpawnEvent"));
+    if name_hash == Some(iwse_hash) && !INKWIDGETSPAWNEVENT_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'inkWidgetSpawnEvent' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_inkwidgetspawnevent(&reg);
+            crate::log(&format!("[classval-probe] register_inkwidgetspawnevent -> {r}"));
+        }
+    }
+    // ArchiveXL `#47` (`CustomizationExtension`, 2026-08-14) — mesmo gate por-classe já usado
+    // pros outros eventos do CallbackSystem.
+    let cze_hash = *CUSTOMIZATIONEVENT_CNAME.get_or_init(|| crate::cname::cname("CustomizationEvent"));
+    if name_hash == Some(cze_hash) && !CUSTOMIZATIONEVENT_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'CustomizationEvent' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_customizationevent(&reg);
+            crate::log(&format!("[classval-probe] register_customizationevent -> {r}"));
+        }
+    }
+    // Codeware `#25` (`EntityBuilderWrapper`, 2026-08-18 madrugada cont.20) — mesmo gate
+    // por-classe, parent=`IScriptable` (não evento do CallbackSystem).
+    let ebw_hash = *ENTITYBUILDERWRAPPER_CNAME.get_or_init(|| crate::cname::cname("EntityBuilderWrapper"));
+    if name_hash == Some(ebw_hash) && !ENTITYBUILDERWRAPPER_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::log("[classval-probe] classe 'EntityBuilderWrapper' detectada no validador — forjando+registrando AGORA");
+        if let Some(reg) = crate::rtti::Registry::obtain() {
+            let r = crate::register::register_entitybuilderwrapper(&reg);
+            crate::log(&format!("[classval-probe] register_entitybuilderwrapper -> {r}"));
         }
     }
     // Tentativa 11 (2026-07-13, sessão seguinte) — o parent-pointer fix (Tentativa 10) rodou ao
@@ -2816,6 +3348,105 @@ unsafe fn discovery_ring(func: *mut c_void) {
     }
 }
 
+// `equiponce-crash-2026-07-31`: profundidade de reentrância do `exec_replacement`, POR THREAD
+// (`redDispatcher*` são threads de verdade, não a mesma pilha — thread_local é o isolamento certo).
+// Achado do agente de RE: `cp77_tick()` dispara de DENTRO do próprio hook do executor a cada
+// `TICK_EVERY` chamadas, em QUALQUER thread, em QUALQUER profundidade de aninhamento dentro da
+// execução de script já em voo do motor — o crash do `equiponce` bateu assim (call_func síncrono
+// disparado de dentro de uma chamada do motor já em andamento em `redDispatcher7`, não do topo).
+// Profundidade==1 (valor LIDO ANTES de decrementar no drop) = esta invocação NÃO está aninhada
+// dentro de outra chamada do executor ainda aberta nesta mesma thread — ponto seguro conhecido
+// (é onde centenas de `call_func` já dispararam sem problema). >1 = estamos DENTRO de uma chamada
+// do motor ainda em voo — mesmo padrão do crash. Só gateia a fila de comandos de canal (a via que
+// de fato crashou); eventos já provados estáveis (Session/Update etc.) não são tocados.
+thread_local! {
+    static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+struct ExecDepthGuard;
+impl ExecDepthGuard {
+    fn enter() -> Self {
+        EXEC_DEPTH.with(|d| d.set(d.get() + 1));
+        ExecDepthGuard
+    }
+}
+impl Drop for ExecDepthGuard {
+    fn drop(&mut self) {
+        EXEC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+/// `true` se a invocação ATUAL do executor, nesta thread, está aninhada dentro de uma chamada do
+/// motor ainda não retornada (ou seja: não estamos no topo da pilha do executor aqui). Usado pra
+/// adiar (nunca descartar) a fila de comandos de canal por 1 tick quando inseguro.
+pub(crate) fn exec_nested() -> bool {
+    EXEC_DEPTH.with(|d| d.get() > 1)
+}
+/// Profundidade ATUAL do executor nesta thread (1 = topo, sem aninhamento).
+pub(crate) fn exec_depth() -> u32 {
+    EXEC_DEPTH.with(|d| d.get())
+}
+/// DIAGNÓSTICO (2026-08-17, achado do dia): identificar QUAL CName recursa fundo em
+/// `exec_replacement` (padrão de 4 níveis visto via `lldb bt` em múltiplas threads simultâneas,
+/// mas `lldb` não consegue ler x0/`func` em frames não-internos do unwind — instrumentação
+/// própria contorna isso). Loga só quando a profundidade cruza um limiar (evita spam nos
+/// primeiros 1-2 níveis, que são normais) — throttled por thread via contador simples pra não
+/// crashar log() sob volume (mesmo que agora seja barato, ainda é I/O).
+thread_local! {
+    static DEEPTRACE_LOGGED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `~/.bwms-deeptrace` presente = amostragem de profundidade ligada. Resolvido UMA vez
+/// (`OnceLock`, mesmo idioma de `dev_mode()`) — o caminho quente não paga syscall por chamada.
+fn deeptrace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join(".bwms-deeptrace").exists())
+            .unwrap_or(false)
+    })
+}
+unsafe fn deeptrace_maybe_log(depth: u32, func: *mut c_void) {
+    // 2026-08-21: gate PRÓPRIO (`~/.bwms-deeptrace`), não mais só `dev_mode()`. Isto é
+    // diagnóstico de UMA investigação específica (o deadlock pós-autocontinue de 2026-08-17) que
+    // já foi ENCERRADA — a causa era a cadeia de 87 `@wrapMethod`, resolvida pela consolidação em
+    // 1 dispatcher. Ligado por padrão em todo boot de dev, seguia custando ~26k escritas de log
+    // por boot (1 em 50 amostras, sem teto, sobre 1.3M+ chamadas) mais um `resolve_cname` por
+    // amostra — e volume de I/O de `log()` já foi MEDIDO como contribuinte real de fragilidade de
+    // boot (2026-08-20: o rate-limit global levou o crash de ~50% pra 0/3). Segue a regra da casa
+    // (ESSENCIAL sempre roda, DIAGNÓSTICO atrás de gate): rearmar com
+    // `touch ~/.bwms-deeptrace` quando alguém for investigar profundidade de execução de novo.
+    if depth < 4 || !crate::dev_mode() || !deeptrace_enabled() {
+        return;
+    }
+    let n = DEEPTRACE_LOGGED.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    });
+    // 2026-08-17 (achado do dia, deadlock pós-autocontinue): teto FIXO de 30 amostras/thread
+    // esgotava cedo no boot (volume real observado: 1.3M+ chamadas na janela até o travamento),
+    // nunca cobrindo o instante exato do lock órfão. Trocado pra AMOSTRAGEM PERIÓDICA sem teto
+    // total — garante cobertura até o fim do boot (incl. o momento do travamento), custo
+    // controlado pela taxa (1 em cada 50), `log()` já provado barato (fix de hoje, file-handle
+    // cacheado). Log direto (não buffer-e-flush): se o processo travar/deadlockar, o canal de
+    // comando (drenado no mesmo GameThread que trava) não consegue mais pedir um dump — só o que
+    // já foi ESCRITO no disco antes do travamento sobrevive.
+    if n % 50 != 0 {
+        return;
+    }
+    let mut mcname = 0u64;
+    if !func.is_null() && crate::gum::is_readable(func as *const c_void, 0x18) {
+        mcname = core::ptr::read_unaligned((func as *const u8).add(0x10) as *const u64);
+    }
+    let name = if mcname != 0 {
+        crate::cname::resolve_cname(mcname)
+    } else {
+        "?".to_string()
+    };
+    crate::log(&format!(
+        "[deeptrace] depth={depth} func={func:p} cname='{name}' (amostra #{n})"
+    ));
+}
+
 /// Substituição do executor (ABI: `func@x0, ctx@x1, frame@x2, aOut@x3, a4@x4 -> x0`).
 /// Espelha o callback do probe.js, mas em Rust: captura + tick periódico + chama a
 /// original. (Observe/Override entram numa fase seguinte.)
@@ -2826,6 +3457,8 @@ unsafe extern "C" fn exec_replacement(
     a_out: *mut c_void,
     a4: *mut c_void,
 ) -> *mut c_void {
+    let _depth = ExecDepthGuard::enter();
+    deeptrace_maybe_log(exec_depth(), func);
     capture(ctx);
     // F-B PARQUEADO: register_all no executor é TARDE — o executor dispara só em CHAMADAS de
     // script, DEPOIS do bind (~6s), que crasha antes (o bind é RESOLUÇÃO, não passa pelo executor).
@@ -2869,10 +3502,36 @@ unsafe extern "C" fn exec_replacement(
     }
     // captura nativa do FromTDBID (fn/ctx/ret) p/ os cheats de item — substitui a sonda
     // frida. Casa pelo endereço (FROMTD_TGT, resolvido no tick); 1 compare, barato.
+    // FIX (2026-08-07, cont.41): gate `PHASE_REACHED_5` — RE offline (agente dedicado) provou
+    // que o `ctx` capturado é passado CRU pro handler nativo (sem filtro/validação nenhuma no
+    // dispatcher), então capturar o 1º caller que bate ANTES da gameplay real (ex.: algum
+    // warm-up interno do motor, ctx "degenerado") trava o resto do boot inteiro com resultado
+    // zero. Mesmo padrão de bug/fix já usado em `tweakxl_rt::create_once_if_marked` (GOG,
+    // `CreateRecord`) — esperar `PHASE_REACHED_5` garante que só um caller de GAMEPLAY real
+    // (mais provável de ter estado interno inicializado) seja capturado.
     let tgt = FROMTD_TGT.load(Ordering::Relaxed);
-    if !tgt.is_null() && func == tgt && !ctx.is_null() && FROMTD_CTX.load(Ordering::Relaxed).is_null() {
+    if !tgt.is_null()
+        && func == tgt
+        && !ctx.is_null()
+        && FROMTD_CTX.load(Ordering::Relaxed).is_null()
+        && PHASE_REACHED_5.load(Ordering::Relaxed)
+    {
         FROMTD_RET.store(a4, Ordering::Relaxed);
         FROMTD_CTX.store(ctx, Ordering::Relaxed); // por último: leitor vê RET pronto qdo CTX != null
+        crate::log(&format!(
+            "[fromtd-diag] capturado no CALLS={} ctx={ctx:p} ret_type={a4:p}",
+            CALLS.load(Ordering::Relaxed)
+        ));
+    }
+    // CET `FunctionOverride` (não-Lua, `fnoverride.rs`, 2026-08-11): tabela por-ponteiro de
+    // Before/After/Replace pra QUALQUER `CBaseFunction*` já existente (vanilla ou de outro mod),
+    // paralela a `hooks.rs` (Lua-only, casamento por CName) mas standalone. Fast-path: 1 load
+    // atômico se ninguém registrou nada (`has_targets`), custo nulo pra quem não usa.
+    if crate::fnoverride::has_targets()
+        && crate::fnoverride::dispatch_before(func, ctx, frame, a_out, a4)
+    {
+        crate::fnoverride::dispatch_after(func, ctx, frame, a_out, a4);
+        return 1usize as *mut c_void;
     }
     // ROTEAMENTO de nativas registradas (Codeware): se `func` é uma nativa que NÓS
     // registramos no RTTI, despacha pro handler Rust e retorna — sem cair na via nativa
@@ -2886,6 +3545,13 @@ unsafe extern "C" fn exec_replacement(
     let n = CALLS.fetch_add(1, Ordering::Relaxed);
     if n % TICK_EVERY == 0 {
         crate::cp77_tick();
+    }
+    // [fntrace] (rodada 32): opt-in, ver comentário do bloco acima. Só lê func+0x10 (mesmo
+    // padrão já usado por `RUST_OV_CNAME`/`watched_before` mais acima) quando ligado.
+    if fntrace_enabled() && !func.is_null() && crate::gum::is_readable(func as *const c_void, 0x18)
+    {
+        let mcname = core::ptr::read_unaligned((func as *const u8).add(0x10) as *const u64);
+        log_fn_trace(mcname, n);
     }
     // Observe/Override (mods que hookam funções do jogo): se vigiado, roda o `before`;
     // se pediu suppress (VOID, ou override-total de retorno POD já gravado no aOut), pula
@@ -2903,6 +3569,9 @@ unsafe extern "C" fn exec_replacement(
     if mcname != 0 {
         crate::hooks::watched_after(mcname, ctx, a_out);
     }
+    if crate::fnoverride::has_targets() {
+        crate::fnoverride::dispatch_after(func, ctx, frame, a_out, a4);
+    }
     r
 }
 
@@ -2915,6 +3584,12 @@ unsafe fn capture(ctx: *mut c_void) {
     // PERF: se o ctx já é o player/tx que conhecemos, pula o `class_of` (caro) —
     // cobre o caso comum de várias chamadas seguidas no mesmo objeto.
     if ctx == crate::current_player() || ctx == crate::current_tx() {
+        return;
+    }
+    // Rate-limit da via cara (syscall): só 1 em cada CAPTURE_MISS_STRIDE misses tenta de
+    // verdade. As outras voltam sem custo — ainda detectamos player/tx em poucas dezenas de
+    // chamadas (o próprio hot-path garante isso), sem pagar syscall em TODO ctx desconhecido.
+    if CAPTURE_MISS_COUNTER.fetch_add(1, Ordering::Relaxed) % CAPTURE_MISS_STRIDE != 0 {
         return;
     }
     if !crate::gum::is_readable(ctx as *const c_void, 0x40) {

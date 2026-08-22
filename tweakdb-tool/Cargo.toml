@@ -27,9 +27,11 @@ bwms-hashes = { path = "../bwms-hashes" }
 
 [features]
 # `kraken`: compila/linka o ooz (../ooz) via build.rs para descomprimir a
-# tweakdbstr.kark (lista de nomes). Default. `--no-default-features` = puro std
-# (lê o tweakdb.bin e listas .bin já descomprimidas, mas não .kark).
-default = ["kraken"]
+# tweakdbstr.kark (lista de nomes). OPT-IN (2026-08-01: default removido — zero
+# código de terceiro no build padrão, sempre). `cargo build --release` sozinho é
+# 100% puro-std (lê tweakdb.bin e listas .bin já descomprimidas, não .kark).
+# `--features kraken` pra descomprimir .kark (precisa de clang++ + fonte do ooz).
+default = []
 kraken = []
 
 [profile.release]
