@@ -410,7 +410,10 @@ pub unsafe fn level(reg: &Registry, captured_player: *mut c_void, n: u32) -> boo
 }
 
 /// Cura a Health pro máximo via `gameStatPoolsSystem.RequestSettingStatPoolValue`.
-pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
+/// Escreve um StatPool do jogador (Health/Stamina/Memory) via
+/// `gameStatPoolsSystem::RequestSettingStatPoolValue`. Base compartilhada de `heal` e `ram`:
+/// os três pools usam a MESMA chamada, só muda o valor do enum `gamedataStatPoolType`.
+unsafe fn set_pool(reg: &Registry, captured_player: *mut c_void, pool: &str, value: f32, tag: &str) -> bool {
     let owner = auth_or(reg, captured_player);
     let gi = match get_gi(reg, owner) {
         Some(b) => b,
@@ -418,7 +421,7 @@ pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
     };
     let sps = system_flex(reg, owner, gi, "gameStatPoolsSystem", "GetStatPoolsSystem");
     if !rtti::sane(sps) {
-        crate::log("[heal] StatPoolsSystem inacessível");
+        crate::log(&format!("[{tag}] StatPoolsSystem inacessível"));
         return false;
     }
     let eid = match entity_id(reg, owner) {
@@ -428,32 +431,46 @@ pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
     let rs = match rtti::resolve_any(reg, &["gameStatPoolsSystem"], "RequestSettingStatPoolValue") {
         Some(g) => g,
         None => {
-            crate::log("[heal] RequestSettingStatPoolValue não resolvido");
+            crate::log(&format!("[{tag}] RequestSettingStatPoolValue não resolvido"));
             return false;
         }
     };
-    let hp = match rtti::resolve_enum_value(reg, "gamedataStatPoolType", "Health") {
+    let pv = match rtti::resolve_enum_value(reg, "gamedataStatPoolType", pool) {
         Some(v) => v,
         None => {
-            crate::log("[heal] enum gamedataStatPoolType::Health não resolvido");
+            crate::log(&format!("[{tag}] enum gamedataStatPoolType::{pool} não resolvido"));
             return false;
         }
     };
-    // (gameStatsObjectID eid, gamedataStatPoolType Health, Float 100, source null16, Bool, Bool)
+    // (gameStatsObjectID eid, gamedataStatPoolType pool, Float value, source null16, Bool, Bool)
     rtti::call_func(
         &rs,
         sps,
         &[
             Arg::Raw(eid),
-            Arg::Enum(hp),
-            Arg::F32(100.0),
+            Arg::Enum(pv),
+            Arg::F32(value),
             Arg::Raw([0u8; 16]),
             Arg::Bool(false),
             Arg::Bool(false),
         ],
     );
-    crate::log("[heal] Health=100 enviado");
     true
+}
+
+pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
+    let ok = set_pool(reg, captured_player, "Health", 100.0, "heal");
+    if ok {
+        crate::log("[heal] Health=100 enviado");
+    }
+    ok
+}
+
+/// RAM do cyberdeck (quickhacks). É o pool `Memory` — o mesmo mecanismo de Health/Stamina,
+/// confirmado no binário: `gamedataStatPoolType` só tem Health, Stamina e Memory.
+/// Enche até 100%; o "ilimitado" é isto reaplicado no tick (ver `RAM_INFINITE` em lib.rs).
+pub unsafe fn ram(reg: &Registry, captured_player: *mut c_void) -> bool {
+    set_pool(reg, captured_player, "Memory", 100.0, "ram")
 }
 
 /// DIAGNÓSTICO read-only (2026-08-06): lê Health/Stamina/Sprint (StaminaRegen/estado) direto do

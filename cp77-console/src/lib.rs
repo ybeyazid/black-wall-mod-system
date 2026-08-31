@@ -985,6 +985,21 @@ unsafe impl Sync for SendReg {}
 static REG: std::sync::OnceLock<SendReg> = std::sync::OnceLock::new();
 /// player/tx atuais (a sonda captura, o cp77_tick publica; o Lua lê via Game.*).
 static CURRENT_PLAYER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// RAM (pool `Memory`) infinita: reaplicada no tick enquanto ligada.
+///
+/// O jogo não expõe "custo zero" — o que existe é o POOL. Então "ilimitado" aqui é encher o pool
+/// de volta periodicamente, que é o que o jogador percebe como RAM que não acaba. Reaplicar a
+/// cada tick seria uma chamada RTTI por frame sem ganho nenhum (o pool não cai tão rápido), então
+/// vai a cada `RAM_EVERY_TICKS` — barato e imperceptível em jogo.
+static RAM_INFINITE: AtomicBool = AtomicBool::new(false);
+const RAM_EVERY_TICKS: u64 = 15;
+pub(crate) fn set_ram_infinite(on: bool) {
+    RAM_INFINITE.store(on, Ordering::Relaxed);
+}
+pub(crate) fn ram_infinite() -> bool {
+    RAM_INFINITE.load(Ordering::Relaxed)
+}
 static CURRENT_TX: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 pub(crate) fn registry() -> Option<&'static rtti::Registry> {
@@ -1332,6 +1347,14 @@ pub extern "C" fn cp77_tick() {
     // F-B: re-tenta registrar as nativas do BWMS se o selfboot pegou o RTTI cedo demais
     // (idempotente via REGISTERED). Garante BlackwallPing no RTTI p/ o bind do redscript.
     unsafe { crate::register::register_all() };
+    // RAM infinita (comando `ram on`): reenche o pool `Memory` de tempos em tempos. Fica AQUI,
+    // depois do gate de registry, porque precisa do `reg` e do player vivos.
+    if ram_infinite() && ticks() % RAM_EVERY_TICKS == 0 {
+        let p = current_player();
+        if !p.is_null() {
+            unsafe { crate::console::ram(reg, p) };
+        }
+    }
     // TweakDB runtime: dump observe-only do singleton (gated ~/.bwms-tdbdump) p/ confirmar
     // o records-map in-vivo antes de registrar record novo (PASSO 0 do clone-runtime).
     unsafe { crate::tweakdb_rt::dump_once_if_marked() };
@@ -8913,6 +8936,21 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
     let r = unsafe {
         match parts.as_slice() {
             ["money", n] => console::give(reg, player, tx, "Items.money", n.parse().unwrap_or(1)),
+            // RAM do cyberdeck. `ram` enche uma vez; `ram on|off` mantém cheia (ver RAM_INFINITE).
+            ["ram"] => {
+                let ok = console::ram(reg, player);
+                log(&format!("[console] 'ram' -> {}", if ok { "OK (Memory=100)" } else { "FAILED" }));
+                return;
+            }
+            ["ram", sw @ ("on" | "off")] => {
+                let on = *sw == "on";
+                set_ram_infinite(on);
+                if on {
+                    console::ram(reg, player);
+                }
+                log(&format!("[console] 'ram {sw}' -> unlimited RAM {}", if on { "ON" } else { "OFF" }));
+                return;
+            }
             ["give", name] => console::give(reg, player, tx, name, 1),
             ["give", name, n] => console::give(reg, player, tx, name, n.parse().unwrap_or(1)),
             ["remove", name] => console::remove(reg, player, tx, name, 1),
