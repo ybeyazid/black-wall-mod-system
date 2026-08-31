@@ -946,7 +946,7 @@ impl UiState {
         }
         let help_pushed = self.log_lines.len() - saved_log_len - 0; // linhas de help adicionadas
         let help_ok = help_pushed >= HELP_LINES.len()
-            && self.log_lines.iter().any(|l| l.contains("↑/↓ navegam o histórico"));
+            && self.log_lines.iter().any(|l| l.contains("↑/↓ browse the history"));
 
         let hist_ok = up1 == "give Items.wsp_smg 1"   // ↑ pega o MAIS RECENTE (último digitado)
             && up2 == "godmode"
@@ -1278,15 +1278,15 @@ unsafe fn init_renderer(dev: &metal::DeviceRef, pixfmt: u64) -> Option<Renderer>
 /// Texto do comando `help` — só os comandos PRÁTICOS de cheat (o que o hint do campo já anuncia),
 /// não a lista inteira de comandos internos de dev/RE (esses ficam em CODEBASE.md, não na UI).
 const HELP_LINES: [&str; 9] = [
-    "comandos: money N | give Items.X [N] | remove Items.X [N] | godmode [off] | heal | level N",
-    "          summon (chama veículo) | attrs/perks/relic N (pontos) | hasgod (consulta)",
-    "atalhos: ↑/↓ navegam o histórico de comandos já digitados nesta sessão.",
-    "'Items.X' = TweakDBID do item (ex: Items.money, Items.PreventionEliteBundle_Cyberware).",
+    "commands: money N | give Items.X [N] | remove Items.X [N] | godmode [off] | heal | level N",
+    "          summon (calls a vehicle) | attrs/perks/relic N (points) | hasgod (query)",
+    "keys: ↑/↓ browse the history of commands typed this session.",
+    "'Items.X' = the item's TweakDBID (e.g. Items.money, Items.PreventionEliteBundle_Cyberware).",
     "",
-    "exemplos:",
-    "  money 5000            → dá 5000 eddies",
-    "  give Items.wsp_smg 1   → dá 1 unidade do item",
-    "  godmode                → liga o modo deus (godmode off desliga)",
+    "examples:",
+    "  money 5000             → gives 5000 eddies",
+    "  give Items.wsp_smg 1   → gives 1 unit of the item",
+    "  godmode                → turns god mode on (godmode off turns it back off)",
 ];
 
 const THEMES: [(&str, &str); 4] = [
@@ -1651,7 +1651,7 @@ fn build_badge(ui: &imgui::Ui, ticks: u64) {
 
 /// Constrói a UI: abas Console (terminal) / Items (busca+pin) / Game cheats.
 fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
-    ui.window("BWMS  //  CP2077 console  ( ` alterna )")
+    ui.window("BWMS  //  CP2077 console  ( ` toggles )")
         .size([660.0, 460.0], imgui::Condition::FirstUseEver)
         // longe do topo: em janela, a barra de título do macOS rouba o clique perto da borda.
         .position([60.0, 150.0], imgui::Condition::FirstUseEver)
@@ -1669,7 +1669,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                     ui.tooltip_text(tag);
                 }
             }
-            ui.text_disabled(format!("tema: {} - {}", THEMES[st.theme].0, THEMES[st.theme].1));
+            ui.text_disabled(format!("theme: {} - {}", THEMES[st.theme].0, THEMES[st.theme].1));
             ui.separator();
             if let Some(_tb) = ui.tab_bar("##tabs") {
                 // ---- CONSOLE: terminal puro (saída em cima, comando embaixo) ----
@@ -1725,7 +1725,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                 if let Some(_t) = ui.tab_item("Items") {
                     ui.set_next_item_width(330.0);
                     ui.input_text("##search", &mut st.search_buf)
-                        .hint("filtrar (ex: erebus, katana, money)")
+                        .hint("filter (e.g. erebus, katana, money)")
                         .build();
                     ui.same_line();
                     ui.set_next_item_width(80.0);
@@ -1742,7 +1742,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         let mut shown = 0u32;
                         for row in catalog().iter() {
                             if shown >= 250 {
-                                ui.text_disabled("... refine a busca");
+                                ui.text_disabled("... refine the search");
                                 break;
                             }
                             let [id, label, ty, _sheet] = *row;
@@ -1778,9 +1778,9 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                 }
                 // ---- FAVORITOS: itens pinados na aba Items. Os CHEATS foram removidos daqui
                 // (não duplicar) — vivem em Settings > Cheats (redscript/config). ----
-                if let Some(_t) = ui.tab_item("Favoritos") {
+                if let Some(_t) = ui.tab_item("Favorites") {
                     if !st.favorites.is_empty() {
-                        ui.text("Favoritos (pinados na aba Items):");
+                        ui.text("Favorites (pinned from the Items tab):");
                         let mut remove = None;
                         for (i, (id, label)) in st.favorites.iter().enumerate() {
                             if ui.button(&format!("Give##f{i}")) {
@@ -1798,26 +1798,26 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                             st.fav_dirty = true;
                         }
                     } else {
-                        ui.text_disabled("Sem favoritos. Pinhe itens na aba Items (botao +) pra aparecerem aqui.");
+                        ui.text_disabled("No favorites yet. Pin items from the Items tab (+ button) to see them here.");
                     }
                     ui.separator();
-                    ui.text_disabled("Cheats (Godmode/Money/Perks/Level...) ficam em Settings > Cheats, sem duplicar.");
+                    ui.text_disabled("Cheats (Godmode/Money/Perks/Level...) live in Settings > Cheats — not duplicated here.");
                 }
                 // ---- MODS: lista de mods BWMS instalados com toggle ativo/inativo ----
                 if let Some(_t) = ui.tab_item("Mods") {
                     let mut badge_on = BADGE_ENABLED.load(Ordering::Relaxed);
-                    if ui.checkbox("Exibir badge (canto superior direito)", &mut badge_on) {
+                    if ui.checkbox("Show badge (top-right corner)", &mut badge_on) {
                         BADGE_ENABLED.store(badge_on, Ordering::Relaxed);
                     }
                     ui.separator();
                     let (n_active, n_inactive, n_problems) = crate::mod_scan::summary();
                     let total = n_active + n_inactive;
                     if total == 0 {
-                        if ui.button("Escanear") {
+                        if ui.button("Scan") {
                             crate::mod_scan::refresh_async();
                         }
                         ui.same_line();
-                        ui.text_disabled("Nenhum mod em BWMS/mods/ (ainda)");
+                        ui.text_disabled("No mods in BWMS/mods/ (yet)");
                     } else {
                         // Linha de resumo
                         ui.text(format!("{n_active} ativo{} · {n_inactive} inativo{} · {n_problems} problema{}",
@@ -1826,7 +1826,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                             if n_problems == 1 { "" } else { "s" },
                         ));
                         ui.same_line();
-                        if ui.button("Atualizar") {
+                        if ui.button("Refresh") {
                             crate::mod_scan::refresh_async();
                         }
                         if crate::mod_scan::NEEDS_RESTART.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1867,16 +1867,16 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                 // ---- K-LOG: captura de teclas (input/atalhos), fora do console ----
                 if let Some(_t) = ui.tab_item("K-LOG") {
                     let mut cap = KEY_CAPTURE.load(Ordering::Relaxed);
-                    if ui.checkbox("capturar teclas (keyCode/char)", &mut cap) {
+                    if ui.checkbox("capture keys (keyCode/char)", &mut cap) {
                         KEY_CAPTURE.store(cap, Ordering::Relaxed);
                     }
                     ui.same_line();
-                    if ui.button("limpar") {
+                    if ui.button("clear") {
                         if let Ok(mut k) = KEY_LOG.lock() {
                             k.clear();
                         }
                     }
-                    ui.text_disabled("teclas capturadas com o overlay FECHADO (debug de input/atalho)");
+                    ui.text_disabled("keys captured while the overlay is CLOSED (input/hotkey debug)");
                     ui.separator();
                     ui.child_window("##klog").size([0.0, 0.0]).build(|| {
                         if let Ok(k) = KEY_LOG.lock() {
@@ -1900,7 +1900,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         }
                     }
                     ui.separator();
-                    ui.text("Efeitos (liga/desliga sobre a grade):");
+                    ui.text("Effects (toggle on top of the grade):");
                     let mut fx = EFFECTS.load(Ordering::Relaxed);
                     for (b, name) in FX_NAMES.iter().enumerate() {
                         let bit = 1u32 << b;
@@ -1914,8 +1914,8 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         }
                     }
                     ui.separator();
-                    ui.text_disabled("Grade (cor) + efeitos AO VIVO no frame; cada um liga/desliga.");
-                    ui.text_disabled("Em breve (precisa do upgrade do passe): Bloom, Aberracao cromatica, Barril.");
+                    ui.text_disabled("Grade (color) + effects LIVE on the frame; each one toggles on/off.");
+                    ui.text_disabled("Coming soon (needs the render-pass upgrade): Bloom, Chromatic aberration, Barrel.");
                 }
             }
         });

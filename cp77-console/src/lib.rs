@@ -3729,9 +3729,9 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                     lua::run_event("onInit");
                 }
                 MODS_LOADED.fetch_add(1, Ordering::Relaxed);
-                log(&format!("[console] mod carregado: {}", path.trim()));
+                log(&format!("[console] mod loaded: {}", path.trim()));
             }
-            Err(e) => log(&format!("[console] loadmod erro: {e}")),
+            Err(e) => log(&format!("[console] loadmod error: {e}")),
         }
         return;
     }
@@ -8898,7 +8898,7 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         let r = unsafe { console::give(reg, player, tx, &name, n) };
         match r {
             Some(res) if res[0] != 0 => log(&format!("[console] CET '{cmd}' -> give {name} x{n} OK")),
-            _ => log(&format!("[console] CET '{cmd}' -> give {name} x{n} FALHOU")),
+            _ => log(&format!("[console] CET '{cmd}' -> give {name} x{n} FAILED")),
         }
         return;
     }
@@ -8931,10 +8931,10 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
     match r {
         Some(res) if res[0] != 0 => log(&format!("[console] '{cmd}' -> OK (GiveItem ret={})", res[0])),
         Some(res) => log(&format!(
-            "[console] '{cmd}' -> NO-OP (GiveItem retornou {} — owner/tx errado?)",
+            "[console] '{cmd}' -> NO-OP (GiveItem returned {} — wrong owner/tx?)",
             res[0]
         )),
-        None => log(&format!("[console] '{cmd}' -> FALHOU (resolve/from_tdbid/call)")),
+        None => log(&format!("[console] '{cmd}' -> FAILED (resolve/from_tdbid/call)")),
     }
 }
 
