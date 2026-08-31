@@ -387,6 +387,13 @@ pub(crate) fn log_anomaly(msg: &str) {
 }
 
 pub(crate) fn log(msg: &str) {
+    // A saída de COMANDO precisa aparecer na aba Console mesmo no build público, onde o resto
+    // desta função é no-op. Sem isto, digitar `help`/`give`/`money` não devolve NADA na tela e a
+    // ferramenta parece travada — o resultado só existia pra quem rodasse um build `devlog`.
+    // O log em si (arquivo/K-LOG) continua gateado por `devlog`, como era.
+    if msg.starts_with("[console]") {
+        crate::overlay::console_out(msg);
+    }
     // Build PÚBLICO (sem feature `devlog`): silencioso — não escreve /tmp/cp77-console.log nem
     // trace.log (o usuário final não precisa dos diagnósticos; um mod escrevendo em /tmp a cada
     // frame é comportamento desnecessário). Dev liga via `devtools`. (As STRINGS de debug em si

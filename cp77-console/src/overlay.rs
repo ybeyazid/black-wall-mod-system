@@ -1167,6 +1167,39 @@ unsafe fn init_renderer(dev: &metal::DeviceRef, pixfmt: u64) -> Option<Renderer>
     ctx.io_mut().config_mac_os_behaviors = true;
     apply_theme(ctx.style_mut(), load_theme());
 
+    // Fonte com cobertura ESTENDIDA. A default do imgui (ProggyClean) só cobre Latin-1, então
+    // qualquer idioma com Latin Extended-A saía com "?" no lugar da letra — em turco isso atinge
+    // ş/ı/ğ, e "Eşyalar" virava "E?yalar". O ■ do badge (U+25A0) caía no mesmo buraco.
+    // Carrega uma monoespaçada do sistema; se nenhuma abrir, o imgui monta a default sozinho e a
+    // UI continua funcionando (só volta a perder os acentos estendidos).
+    {
+        // Terminado em 0, como o imgui exige. Latin-1 + Latin Extended-A + formas geométricas.
+        const RANGES: &[u32] = &[0x0020, 0x00FF, 0x0100, 0x017F, 0x25A0, 0x25FF, 0];
+        const CANDIDATES: [&str; 3] = [
+            "/System/Library/Fonts/SFNSMono.ttf",
+            "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        ];
+        let mut picked: Option<&str> = None;
+        for path in CANDIDATES {
+            let Ok(data) = std::fs::read(path) else { continue };
+            ctx.fonts().add_font(&[imgui::FontSource::TtfData {
+                data: &data,
+                size_pixels: 14.0,
+                config: Some(imgui::FontConfig {
+                    glyph_ranges: imgui::FontGlyphRanges::from_slice(RANGES),
+                    ..Default::default()
+                }),
+            }]);
+            picked = Some(path);
+            break;
+        }
+        match picked {
+            Some(p) => crate::log(&format!("[overlay] fonte: {p}")),
+            None => crate::log("[overlay] sem fonte de sistema — default do imgui (sem Latin Extended-A)"),
+        }
+    }
+
     // Atlas de fonte → textura Metal.
     let (tw, th, data) = {
         let atlas = ctx.fonts().build_rgba32_texture();
@@ -1384,8 +1417,40 @@ fn apply_theme(style: &mut imgui::Style, idx: usize) {
     style.colors[TabActive as usize] = p[3];
 }
 
+/// Saída PRÓPRIA do console (aba Console), independente do `log()`.
+///
+/// POR QUE existe: as respostas de comando (`[console] ...`) saíam por `log()`, que é NO-OP no
+/// build público — então digitar `help` ou `give` não mostrava nada e a ferramenta parecia
+/// quebrada. Pior: a aba Console era sobrescrita com `tail_log(60)` a cada 30 frames, então
+/// mesmo o que o overlay escrevia direto (as linhas do `help`) sumia meio segundo depois.
+/// Agora a aba Console lê DAQUI (sempre ligado, limitado) e o log segue só pro K-LOG/arquivo.
+static CONSOLE_OUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const CONSOLE_OUT_MAX: usize = 400;
+
+/// Empurra uma linha pra aba Console. Barato e sem alocação no caminho de render.
+pub fn console_out(line: &str) {
+    if let Ok(mut v) = CONSOLE_OUT.lock() {
+        v.push(line.to_string());
+        if v.len() > CONSOLE_OUT_MAX {
+            let drop = v.len() - CONSOLE_OUT_MAX;
+            v.drain(..drop);
+        }
+    }
+}
+
+/// Limpa a saída do console (botão/limpeza da view).
+pub fn console_out_clear() {
+    if let Ok(mut v) = CONSOLE_OUT.lock() {
+        v.clear();
+    }
+}
+
+fn console_out_lines() -> Vec<String> {
+    CONSOLE_OUT.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
 /// Últimas `n` linhas do log do console (a saída pra aba Console).
-// Marca de crate::i18n::t("klog.clear"): a view do console só mostra as linhas APÓS este índice (ex.: esconde o
+// Marca de "limpar": a view do console só mostra as linhas APÓS este índice (ex.: esconde o
 // spam de boot na 1a abertura do overlay). O arquivo /tmp/cp77-console.log fica intacto (debug).
 static LINE_CLEAR: AtomicU32 = AtomicU32::new(0);
 pub fn clear_console_view() {
@@ -1725,6 +1790,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         if !c.is_empty() {
                             if c.eq_ignore_ascii_case("help") {
                                 for line in HELP_LINES {
+                                    console_out(line);
                                     st.log_lines.push((*line).to_string());
                                 }
                             } else {
@@ -2034,8 +2100,12 @@ unsafe fn render_imgui(cb_raw: Id, drawable: Id) {
     {
         FRAME_H.store(h.to_bits(), Ordering::Relaxed);
         rd.ui.frame = rd.ui.frame.wrapping_add(1);
+        // A aba Console mostra a saída PRÓPRIA do console (ver `console_out`). Antes isto
+        // sobrescrevia `log_lines` com `tail_log(60)` a cada 30 frames — o que apagava as linhas
+        // que o próprio overlay tinha acabado de escrever (o `help` sumia meio segundo depois) e,
+        // no build público, deixava a aba vazia porque o `log()` é no-op lá.
         if show && rd.ui.frame % 30 == 1 {
-            rd.ui.log_lines = tail_log(60);
+            rd.ui.log_lines = console_out_lines();
         }
         // `cet-console-history` self-test AUTOMATIZÁVEL no menu (sem HID): roda 1× no `cmd_history` REAL
         // do overlay, gate ~/.bwms-histtest (dev). Ver `run_history_selftest`.
