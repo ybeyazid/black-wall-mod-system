@@ -254,6 +254,14 @@ fn letter_key(kc: u16) -> Option<imgui::Key> {
 }
 
 static ORIG_PRESENT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Originais das VARIANTES de present. O jogo não usa só `presentDrawable:` — com frame
+/// pacing ligado ele chama `presentDrawable:afterMinimumDuration:` (confirmado ao vivo por
+/// breakpoint: `-[_MTLCommandBuffer presentDrawable:afterMinimumDuration:]` na thread
+/// `redDispatcher15`). Swizzlar só a variante simples faz o hook INSTALAR mas nunca DISPARAR:
+/// o overlay fica invisível enquanto o hook de input (sendEvent, separado) segue funcionando —
+/// o sintoma é "o cursor muda e o mouse do jogo trava, mas não aparece painel".
+static ORIG_PRESENT_AFTER_MIN: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ORIG_PRESENT_AT_TIME: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_SENDEVENT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Injeta um key press (keyDown+keyUp) no app via NSEvent + sendEvent original — SEM acessibilidade,
@@ -2231,6 +2239,36 @@ extern "C" fn my_present(this: Id, cmd: Sel, drawable: Id) {
     }
 }
 
+/// `presentDrawable:afterMinimumDuration:` — o caminho que o jogo usa com frame pacing.
+/// Mesmo corpo do `my_present`, só muda a assinatura do original (recebe um `f64` a mais).
+extern "C" fn my_present_after_min(this: Id, cmd: Sel, drawable: Id, dur: f64) {
+    unsafe {
+        render_imgui(this, drawable);
+        #[cfg(feature = "capture")]
+        crate::capture::on_present(this, drawable);
+        let orig = ORIG_PRESENT_AFTER_MIN.load(Ordering::Relaxed);
+        if !orig.is_null() {
+            let f: extern "C" fn(Id, Sel, Id, f64) = std::mem::transmute(orig);
+            f(this, cmd, drawable, dur);
+        }
+    }
+}
+
+/// `presentDrawable:atTime:` — mesma ideia; ainda não observado neste build, mas é a terceira
+/// variante pública e custa duas linhas cobrir.
+extern "C" fn my_present_at_time(this: Id, cmd: Sel, drawable: Id, t: f64) {
+    unsafe {
+        render_imgui(this, drawable);
+        #[cfg(feature = "capture")]
+        crate::capture::on_present(this, drawable);
+        let orig = ORIG_PRESENT_AT_TIME.load(Ordering::Relaxed);
+        if !orig.is_null() {
+            let f: extern "C" fn(Id, Sel, Id, f64) = std::mem::transmute(orig);
+            f(this, cmd, drawable, t);
+        }
+    }
+}
+
 unsafe fn install_present_hook() {
     let dev = MTLCreateSystemDefaultDevice();
     if dev.is_null() {
@@ -2251,14 +2289,42 @@ unsafe fn install_present_hook() {
     let name = CStr::from_ptr(class_getName(cb_class))
         .to_string_lossy()
         .into_owned();
-    let m = class_getInstanceMethod(cb_class, sel("presentDrawable:"));
-    if m.is_null() {
-        crate::log(&format!("[overlay] sem presentDrawable: em {name}"));
-        return;
+    // Swizzla TODAS as variantes de present, não só a simples. Qual delas o jogo chama depende
+    // do caminho de apresentação (frame pacing/VSync), não do build da loja: neste Mac ele usa
+    // `presentDrawable:afterMinimumDuration:` (breakpoint ao vivo em
+    // `-[_MTLCommandBuffer presentDrawable:afterMinimumDuration:]`, thread `redDispatcher15`).
+    // Cobrindo as três, o overlay aparece independente do caminho escolhido.
+    let mut n = 0;
+    for (name_sel, slot, imp) in [
+        (
+            "presentDrawable:",
+            &ORIG_PRESENT,
+            my_present as Imp,
+        ),
+        (
+            "presentDrawable:afterMinimumDuration:",
+            &ORIG_PRESENT_AFTER_MIN,
+            my_present_after_min as Imp,
+        ),
+        (
+            "presentDrawable:atTime:",
+            &ORIG_PRESENT_AT_TIME,
+            my_present_at_time as Imp,
+        ),
+    ] {
+        let m = class_getInstanceMethod(cb_class, sel(name_sel));
+        if m.is_null() {
+            crate::log(&format!("[overlay] sem {name_sel} em {name}"));
+            continue;
+        }
+        slot.store(method_getImplementation(m) as *mut c_void, Ordering::Relaxed);
+        method_setImplementation(m, imp);
+        crate::log(&format!("[overlay] {name_sel} swizzlado em {name}"));
+        n += 1;
     }
-    ORIG_PRESENT.store(method_getImplementation(m) as *mut c_void, Ordering::Relaxed);
-    method_setImplementation(m, my_present as Imp);
-    crate::log(&format!("[overlay] presentDrawable: swizzlado em {name}"));
+    if n == 0 {
+        crate::log(&format!("[overlay] NENHUMA variante de present em {name} — overlay ficará invisível"));
+    }
 }
 
 pub fn start() {
