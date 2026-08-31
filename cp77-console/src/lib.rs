@@ -8938,10 +8938,25 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
     };
     match r {
         Some(res) if res[0] != 0 => log(&format!("[console] '{cmd}' -> OK (GiveItem ret={})", res[0])),
-        Some(res) => log(&format!(
-            "[console] '{cmd}' -> NO-OP (GiveItem returned {} — wrong owner/tx?)",
-            res[0]
-        )),
+        Some(res) => {
+            // `GiveItem` devolvendo 0 quase sempre é o ID e não o contexto. O caso mais comum é o
+            // usuário escrever o nome sem o namespace (`give money`, `give katana`) — TweakDBID é
+            // o hash do nome INTEIRO, então `money` simplesmente não existe e o engine devolve 0
+            // sem erro. Culpar "owner/tx" mandava o usuário procurar no lugar errado; dizer o que
+            // provavelmente está errado e como escrever certo resolve na primeira leitura.
+            let name = parts.get(1).copied().unwrap_or("");
+            let hint = if !name.is_empty() && !name.contains('.') {
+                format!(" - '{name}' has no namespace; try 'Items.{name}'")
+            } else if !name.is_empty() {
+                format!(" - is '{name}' a record in this build's TweakDB?")
+            } else {
+                String::new()
+            };
+            log(&format!(
+                "[console] '{cmd}' -> NO-OP (GiveItem returned {}){hint}",
+                res[0]
+            ))
+        }
         None => log(&format!("[console] '{cmd}' -> FAILED (resolve/from_tdbid/call)")),
     }
 }

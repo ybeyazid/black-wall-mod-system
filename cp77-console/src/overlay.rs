@@ -1173,8 +1173,17 @@ unsafe fn init_renderer(dev: &metal::DeviceRef, pixfmt: u64) -> Option<Renderer>
     // Carrega uma monoespaçada do sistema; se nenhuma abrir, o imgui monta a default sozinho e a
     // UI continua funcionando (só volta a perder os acentos estendidos).
     {
-        // Terminado em 0, como o imgui exige. Latin-1 + Latin Extended-A + formas geométricas.
-        const RANGES: &[u32] = &[0x0020, 0x00FF, 0x0100, 0x017F, 0x25A0, 0x25FF, 0];
+        // Terminado em 0. Precisa cobrir TUDO que a UI escreve, não só as letras: o `help` usa
+        // setas (→ ↑ ↓) e as respostas de comando usam travessão (—). Faltando esses, a linha sai
+        // com "?" no meio e parece erro de execução, não de fonte.
+        const RANGES: &[u32] = &[
+            0x0020, 0x00FF, // Latin-1
+            0x0100, 0x017F, // Latin Extended-A (ş ı ğ Ş İ Ğ …)
+            0x2010, 0x203A, // pontuação geral (– — ' ' " ")
+            0x2190, 0x21FF, // setas (← ↑ → ↓)
+            0x25A0, 0x25FF, // formas geométricas (o ■ do badge)
+            0,
+        ];
         const CANDIDATES: [&str; 3] = [
             "/System/Library/Fonts/SFNSMono.ttf",
             "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
