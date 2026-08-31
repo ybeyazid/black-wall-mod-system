@@ -2494,9 +2494,14 @@ pub(crate) unsafe fn prove_loc() -> bool {
     // NÃO chamo GetText da thread do heartbeat: ela pega o LOCK do mapa de loc que o game thread
     // segura → DEADLOCK (travou a thread na v2, 0 [hb]). `c_str` é accessor puro (sem lock), safe.
     // Node: {next i32@+0, hash32 u32@+4, key u64@+8, value(CString)@+0x10}.
-    let cstr_data: unsafe extern "C" fn(*const u8) -> *const i8 =
-        core::mem::transmute(crate::rebase(0x1_0002_93f8));
+    // guard de null: sem mapa pro build, `rebase` devolve null e chamar isso seria blr xzr.
+    // `<null>` já é a resposta que o closure dá pra ponteiro inválido, então degradar é coerente.
+    let cstr_p = crate::rebase(0x1_0002_93f8);
     let read_cstr = |cs: *const u8| -> String {
+        if cstr_p.is_null() {
+            return "<null>".to_string();
+        }
+        let cstr_data: unsafe extern "C" fn(*const u8) -> *const i8 = core::mem::transmute(cstr_p);
         let p = cstr_data(cs);
         if !p.is_null() && crate::gum::is_readable(p as *const c_void, 1) {
             std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
@@ -5480,9 +5485,14 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 return;
             }
             log("[equiprawv3] chamando 0x103b1f624 direto via transmute...");
-            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
-            tf(es_ptr, req_ptr);
-            log("[equiprawv3] transmute retornou — ZERO CRASH, via completa!");
+            let tp = crate::rebase(0x1_03b1_f624u64);
+            if tp.is_null() {
+                log("[equiprawv3] sem mapa pra 0x103b1f624 neste build -> pulando (inerte)");
+            } else {
+                let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(tp);
+                tf(es_ptr, req_ptr);
+                log("[equiprawv3] transmute retornou — ZERO CRASH, via completa!");
+            }
         }
         return;
     }
@@ -5577,9 +5587,14 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             // escrita de 8 bytes, offset fixo (não resolvível via RTTI — não é propriedade refletida).
             (req_ptr as *mut u8).add(0x40).cast::<*mut c_void>().write_unaligned(es_ptr);
             log(&format!("[equiprawv4] req+0x40={es_ptr:p} (fix do campo interno não-refletido) — req montado, chamando 0x103b1f624 direto..."));
-            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
-            tf(es_ptr, req_ptr);
-            log("[equiprawv4] transmute retornou — ZERO CRASH, via completa!");
+            let tp = crate::rebase(0x1_03b1_f624u64);
+            if tp.is_null() {
+                log("[equiprawv4] sem mapa pra 0x103b1f624 neste build -> pulando (inerte)");
+            } else {
+                let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(tp);
+                tf(es_ptr, req_ptr);
+                log("[equiprawv4] transmute retornou — ZERO CRASH, via completa!");
+            }
         }
         return;
     }
@@ -5682,9 +5697,14 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 "[equiprawv5] frame montado (fr={:p} bc={:p} locals={:p} cprop={:p} itype={:p}) — chamando 0x103b1f624(es_ptr, &frame)...",
                 fr.as_ptr(), bc.as_ptr(), locals.as_ptr(), cprop.as_ptr(), itype
             ));
-            let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
-            tf(es_ptr, fr.as_mut_ptr() as *mut c_void);
-            log("[equiprawv5] transmute retornou — ZERO CRASH, via completa (frame real)!");
+            let tp = crate::rebase(0x1_03b1_f624u64);
+            if tp.is_null() {
+                log("[equiprawv5] sem mapa pra 0x103b1f624 neste build -> pulando (inerte)");
+            } else {
+                let tf: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(tp);
+                tf(es_ptr, fr.as_mut_ptr() as *mut c_void);
+                log("[equiprawv5] transmute retornou — ZERO CRASH, via completa (frame real)!");
+            }
         }
         return;
     }
@@ -5824,9 +5844,14 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 return;
             }
             log("[equiprawv2] chamando 0x103b1f624 direto via transmute, DIRETO de run_cmd (zero aninhamento)");
-            let f: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(crate::rebase(0x1_03b1_f624u64));
-            f(es_ptr, req_ptr);
-            log("[equiprawv2] transmute retornou — zero crash até aqui!");
+            let fp = crate::rebase(0x1_03b1_f624u64);
+            if fp.is_null() {
+                log("[equiprawv2] sem mapa pra 0x103b1f624 neste build -> pulando (inerte)");
+            } else {
+                let f: extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(fp);
+                f(es_ptr, req_ptr);
+                log("[equiprawv2] transmute retornou — zero crash até aqui!");
+            }
         }
         return;
     }
