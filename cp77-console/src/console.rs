@@ -505,8 +505,16 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
         }
     };
     let tdbid = crate::cname::tweak_db_id(EFFECT).to_le_bytes();
+    // A aridade REAL da função, lida da RTTI. Mandar menos argumentos do que a assinatura pede é
+    // a hipótese nº1 pra "o comando diz ON mas nada acontece" — melhor ver o número do que supor.
+    let np = rtti::param_count(&f);
+    let ptypes: Vec<String> = (0..np)
+        .map(|i| crate::cname::resolve_cname(rtti::fn_param_type(f.func, i as usize)))
+        .collect();
     crate::log(&format!(
-        "[cloak] {fname}('{EFFECT}' tdbid={:#018x})",
+        "[cloak] {fname}({}) params={np} static={} tdbid={:#018x}",
+        ptypes.join(", "),
+        f.is_static,
         u64::from_le_bytes(tdbid)
     ));
     rtti::call_func(&f, ses, &[Arg::Raw(eid), Arg::Tdb(tdbid)]);

@@ -391,7 +391,14 @@ pub(crate) fn log(msg: &str) {
     // desta função é no-op. Sem isto, digitar `help`/`give`/`money` não devolve NADA na tela e a
     // ferramenta parece travada — o resultado só existia pra quem rodasse um build `devlog`.
     // O log em si (arquivo/K-LOG) continua gateado por `devlog`, como era.
-    if msg.starts_with("[console]") {
+    // Prefixos que o USUÁRIO age em cima (resposta de comando + diagnóstico dos cheats). Vão pra
+    // aba Console mesmo no build público, onde o resto desta função é no-op. Sem isto, um cheat
+    // que não funciona não tem NENHUM sinal na tela — foi exatamente o que aconteceu com o
+    // `cloak`: o comando dizia "ON" e o motivo real ficava num log que só existe em build dev.
+    const USER_FACING: [&str; 8] = [
+        "[console]", "[cloak]", "[ram]", "[god]", "[heal]", "[give]", "[sig]", "[level]",
+    ];
+    if USER_FACING.iter().any(|p| msg.starts_with(p)) {
         crate::overlay::console_out(msg);
     }
     // Build PÚBLICO (sem feature `devlog`): silencioso — não escreve /tmp/cp77-console.log nem
