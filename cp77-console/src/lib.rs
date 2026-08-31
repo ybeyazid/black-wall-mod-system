@@ -282,6 +282,19 @@ fn steam_to_epic(s: u64) -> Option<u64> {
         0x1_03e2_f17c => 0x1_0360_2724, // PoolArchive::Allocate (símbolo)
         0x1_03e2_ebd4 => 0x1_0360_217c, // open-archive
         0x1_0908_b798 => 0x1_090c_a9c8, // OPCODE_TABLE (âncora funcOperatorAdd<int>)
+        // CNamePool::Get — de longe o mais pedido em runtime (10371x num boot de 75s; o
+        // segundo colocado pede 2x). Achado pelo DADO, não por padrão de código: a string
+        // "gameStatsSystem" existe UMA vez no __cstring (0x106c6dca2); quem a referencia por
+        // adrp+add chama `CNamePool::Add(hash, name)` @ 0x100a5ccd4 com o hash literal em x0
+        // (0x761774a571cc8913 = cname("gameStatsSystem"), confere com o teste em cname.rs).
+        // Dentro do Add: `and x21,x19,#0x7ffff` + `adrp 0x107520000 + #0xac0` → a BASE do pool
+        // é 0x107520ac0. Só 7 funções referenciam essa base; 3 recebem hash em x0, e das 3 uma
+        // devolve bool (`cset w0,lo` = Exists) e duas devolvem `add x0,x8,#0x14` (ponteiro pra
+        // string DENTRO do nó — não pro __cstring, porque o Add copia). CONFIRMADO chamando a
+        // função no jogo vivo via lldb: os 3 vetores de teste de `cname.rs` devolvem a string
+        // certa. A outra sobrevivente (0x100a5cb10) devolve ponteiros IDÊNTICOS — são dois
+        // pontos de entrada da mesma busca; qualquer uma serve pro contrato `fn(u64)->*const i8`.
+        0x1_0345_28e8 => 0x1_00a5_c820, // CNamePool::Get
         // NÃO mapeados ainda (ficam inertes, ver doc acima): CNamePool::Get, TweakDB::Get,
         // TweakDB singleton, CreateRecord, RecordExists, InitializeArchives, RequestResource,
         // depot vtable, DEPOT_SINGLETON, boot phase dispatcher, os 2 phase getters e RESLINK
