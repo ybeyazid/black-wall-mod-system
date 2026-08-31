@@ -1385,7 +1385,7 @@ fn apply_theme(style: &mut imgui::Style, idx: usize) {
 }
 
 /// Últimas `n` linhas do log do console (a saída pra aba Console).
-// Marca de "clear": a view do console só mostra as linhas APÓS este índice (ex.: esconde o
+// Marca de crate::i18n::t("klog.clear"): a view do console só mostra as linhas APÓS este índice (ex.: esconde o
 // spam de boot na 1a abertura do overlay). O arquivo /tmp/cp77-console.log fica intacto (debug).
 static LINE_CLEAR: AtomicU32 = AtomicU32::new(0);
 pub fn clear_console_view() {
@@ -1651,7 +1651,7 @@ fn build_badge(ui: &imgui::Ui, ticks: u64) {
 
 /// Constrói a UI: abas Console (terminal) / Items (busca+pin) / Game cheats.
 fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
-    ui.window("BWMS  //  CP2077 console  ( ` toggles )")
+    ui.window(crate::i18n::t("hdr.title"))
         .size([660.0, 460.0], imgui::Condition::FirstUseEver)
         // longe do topo: em janela, a barra de título do macOS rouba o clique perto da borda.
         .position([60.0, 150.0], imgui::Condition::FirstUseEver)
@@ -1669,11 +1669,29 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                     ui.tooltip_text(tag);
                 }
             }
-            ui.text_disabled(format!("theme: {} - {}", THEMES[st.theme].0, THEMES[st.theme].1));
+            ui.text_disabled(format!("{}: {} - {}", crate::i18n::t("hdr.theme"), THEMES[st.theme].0, THEMES[st.theme].1));
+            // Seletor de idioma. O idioma da sessão já foi resolvido (OnceLock, ver `i18n`), então
+            // clicar aqui GRAVA o override e avisa que vale no próximo boot — em vez de trocar
+            // metade dos rótulos no meio do frame e parecer quebrado.
+            {
+                let cur = crate::i18n::lang();
+                ui.text_disabled(format!("{}:", crate::i18n::t("hdr.language")));
+                for l in crate::i18n::Lang::ALL {
+                    ui.same_line();
+                    let sel = l == cur;
+                    if sel {
+                        ui.text(l.label());
+                    } else if ui.button(format!("{}##lang{}", l.label(), l.code())) {
+                        crate::i18n::set_override(l);
+                    }
+                }
+                ui.same_line();
+                ui.text_disabled(format!("({})", crate::i18n::t("hdr.language_next_boot")));
+            }
             ui.separator();
             if let Some(_tb) = ui.tab_bar("##tabs") {
                 // ---- CONSOLE: terminal puro (saída em cima, comando embaixo) ----
-                if let Some(_t) = ui.tab_item("Console") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.console")) {
                     ui.child_window("##out").size([0.0, -30.0]).build(|| {
                         for line in &st.log_lines {
                             ui.text_wrapped(line);
@@ -1722,10 +1740,10 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                     }
                 }
                 // ---- ITEMS: busca + Give + pin favorito ----
-                if let Some(_t) = ui.tab_item("Items") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.items")) {
                     ui.set_next_item_width(330.0);
                     ui.input_text("##search", &mut st.search_buf)
-                        .hint("filter (e.g. erebus, katana, money)")
+                        .hint(crate::i18n::t("items.filter"))
                         .build();
                     ui.same_line();
                     ui.set_next_item_width(80.0);
@@ -1742,7 +1760,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         let mut shown = 0u32;
                         for row in catalog().iter() {
                             if shown >= 250 {
-                                ui.text_disabled("... refine the search");
+                                ui.text_disabled(crate::i18n::t("items.refine"));
                                 break;
                             }
                             let [id, label, ty, _sheet] = *row;
@@ -1778,9 +1796,9 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                 }
                 // ---- FAVORITOS: itens pinados na aba Items. Os CHEATS foram removidos daqui
                 // (não duplicar) — vivem em Settings > Cheats (redscript/config). ----
-                if let Some(_t) = ui.tab_item("Favorites") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.favorites")) {
                     if !st.favorites.is_empty() {
-                        ui.text("Favorites (pinned from the Items tab):");
+                        ui.text(crate::i18n::t("fav.header"));
                         let mut remove = None;
                         for (i, (id, label)) in st.favorites.iter().enumerate() {
                             if ui.button(&format!("Give##f{i}")) {
@@ -1798,26 +1816,26 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                             st.fav_dirty = true;
                         }
                     } else {
-                        ui.text_disabled("No favorites yet. Pin items from the Items tab (+ button) to see them here.");
+                        ui.text_disabled(crate::i18n::t("fav.empty"));
                     }
                     ui.separator();
-                    ui.text_disabled("Cheats (Godmode/Money/Perks/Level...) live in Settings > Cheats — not duplicated here.");
+                    ui.text_disabled(crate::i18n::t("mods.cheats_note"));
                 }
                 // ---- MODS: lista de mods BWMS instalados com toggle ativo/inativo ----
-                if let Some(_t) = ui.tab_item("Mods") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.mods")) {
                     let mut badge_on = BADGE_ENABLED.load(Ordering::Relaxed);
-                    if ui.checkbox("Show badge (top-right corner)", &mut badge_on) {
+                    if ui.checkbox(crate::i18n::t("klog.badge"), &mut badge_on) {
                         BADGE_ENABLED.store(badge_on, Ordering::Relaxed);
                     }
                     ui.separator();
                     let (n_active, n_inactive, n_problems) = crate::mod_scan::summary();
                     let total = n_active + n_inactive;
                     if total == 0 {
-                        if ui.button("Scan") {
+                        if ui.button(crate::i18n::t("klog.scan")) {
                             crate::mod_scan::refresh_async();
                         }
                         ui.same_line();
-                        ui.text_disabled("No mods in BWMS/mods/ (yet)");
+                        ui.text_disabled(crate::i18n::t("mods.empty"));
                     } else {
                         // Linha de resumo
                         ui.text(format!("{n_active} ativo{} · {n_inactive} inativo{} · {n_problems} problema{}",
@@ -1826,7 +1844,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                             if n_problems == 1 { "" } else { "s" },
                         ));
                         ui.same_line();
-                        if ui.button("Refresh") {
+                        if ui.button(crate::i18n::t("mods.refresh")) {
                             crate::mod_scan::refresh_async();
                         }
                         if crate::mod_scan::NEEDS_RESTART.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1865,18 +1883,18 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                     }
                 }
                 // ---- K-LOG: captura de teclas (input/atalhos), fora do console ----
-                if let Some(_t) = ui.tab_item("K-LOG") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.klog")) {
                     let mut cap = KEY_CAPTURE.load(Ordering::Relaxed);
-                    if ui.checkbox("capture keys (keyCode/char)", &mut cap) {
+                    if ui.checkbox(crate::i18n::t("klog.capture"), &mut cap) {
                         KEY_CAPTURE.store(cap, Ordering::Relaxed);
                     }
                     ui.same_line();
-                    if ui.button("clear") {
+                    if ui.button(crate::i18n::t("klog.clear")) {
                         if let Ok(mut k) = KEY_LOG.lock() {
                             k.clear();
                         }
                     }
-                    ui.text_disabled("keys captured while the overlay is CLOSED (input/hotkey debug)");
+                    ui.text_disabled(crate::i18n::t("klog.capture_note"));
                     ui.separator();
                     ui.child_window("##klog").size([0.0, 0.0]).build(|| {
                         if let Ok(k) = KEY_LOG.lock() {
@@ -1887,7 +1905,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         ui.set_scroll_here_y_with_ratio(1.0);
                     });
                 }
-                if let Some(_t) = ui.tab_item("LUT") {
+                if let Some(_t) = ui.tab_item(crate::i18n::t("tab.lut")) {
                     let cur = LUT_PRESET.load(Ordering::Relaxed);
                     ui.text(format!("Filtro ativo: {}", LUT_NAMES[cur as usize]));
                     ui.spacing();
@@ -1900,7 +1918,7 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         }
                     }
                     ui.separator();
-                    ui.text("Effects (toggle on top of the grade):");
+                    ui.text(crate::i18n::t("lut.effects"));
                     let mut fx = EFFECTS.load(Ordering::Relaxed);
                     for (b, name) in FX_NAMES.iter().enumerate() {
                         let bit = 1u32 << b;
@@ -1914,8 +1932,8 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                         }
                     }
                     ui.separator();
-                    ui.text_disabled("Grade (color) + effects LIVE on the frame; each one toggles on/off.");
-                    ui.text_disabled("Coming soon (needs the render-pass upgrade): Bloom, Chromatic aberration, Barrel.");
+                    ui.text_disabled(crate::i18n::t("lut.note"));
+                    ui.text_disabled(crate::i18n::t("lut.soon"));
                 }
             }
         });

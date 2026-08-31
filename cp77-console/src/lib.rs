@@ -24,6 +24,7 @@ mod crashreport;
 // efeito em runtime até alguém ligar os 3 pontos de integração documentados no arquivo.
 mod fnoverride;
 mod gum;
+mod i18n;
 // RASCUNHO (2026-08-11, prep CET `DumpVTablesTask`/`PENDENCIAS-UNIFICADAS.md` item `#44`): dump
 // de vtable→nome-de-classe por construção real de instância, versão BOUNDED/filtrada (não o
 // "tudo de uma vez" do CET original) — ver doc-comment no topo de `vtabledump.rs`. Compilado
