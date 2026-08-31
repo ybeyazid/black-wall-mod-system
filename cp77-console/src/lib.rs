@@ -8955,6 +8955,17 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 log(&format!("[console] 'cloak off' -> {}", if ok { "OFF" } else { "FAILED" }));
                 return;
             }
+            // Munição infinita (sem recarregar): GameplayRestriction.InfiniteAmmo.
+            ["ammo"] | ["ammo", "on"] => {
+                let ok = console::infinite_ammo(reg, player, true);
+                log(&format!("[console] 'ammo' -> {}", if ok { "ON" } else { "FAILED" }));
+                return;
+            }
+            ["ammo", "off"] => {
+                let ok = console::infinite_ammo(reg, player, false);
+                log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
+                return;
+            }
             ["ram"] => {
                 let ok = console::ram(reg, player);
                 log(&format!("[console] 'ram' -> {}", if ok { "OK (Memory=100)" } else { "FAILED" }));

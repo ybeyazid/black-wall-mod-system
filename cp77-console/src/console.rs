@@ -477,8 +477,22 @@ pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
 /// `ApplyStatusEffect(entityID, TweakDBID)` / `RemoveStatusEffect(entityID, TweakDBID)` no
 /// `gameStatusEffectSystem`. O nº de params é logado: se este build pedir mais, aparece no log em
 /// vez de falhar em silêncio.
-pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
-    const EFFECT: &str = "BaseStatusEffect.Cloaked";
+/// Aplica/remove um status effect do jogo no jogador, por nome de record.
+///
+/// Base de `cloak` e `infinite_ammo`: os dois são o MESMO mecanismo — um record que o jogo já
+/// define e cuja lógica a CDPR já escreveu. Usar o efeito pronto em vez de mexer no sistema por
+/// baixo (percepção dos NPCs, contador de munição) mantém a IA e o HUD coerentes.
+///
+/// Loga a aridade REAL e os tipos dos params, lidos da RTTI: mandar menos argumento do que a
+/// assinatura pede é a causa nº1 de "o comando diz ON e nada acontece", e isso vira um número na
+/// tela em vez de suposição.
+pub unsafe fn status_effect(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    effect: &str,
+    on: bool,
+    tag: &str,
+) -> bool {
     let owner = auth_or(reg, captured_player);
     let gi = match get_gi(reg, owner) {
         Some(b) => b,
@@ -486,13 +500,13 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
     };
     let ses = system_flex(reg, owner, gi, "gameStatusEffectSystem", "GetStatusEffectSystem");
     if !rtti::sane(ses) {
-        crate::log("[cloak] StatusEffectSystem inacessível");
+        crate::log(&format!("[{tag}] StatusEffectSystem inacessível"));
         return false;
     }
     let eid = match entity_id(reg, owner) {
         Some(b) => b,
         None => {
-            crate::log("[cloak] GetEntityID falhou");
+            crate::log(&format!("[{tag}] GetEntityID falhou"));
             return false;
         }
     };
@@ -500,26 +514,37 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
     let f = match rtti::resolve_any(reg, &["gameStatusEffectSystem"], fname) {
         Some(g) => g,
         None => {
-            crate::log(&format!("[cloak] {fname} não resolvido"));
+            crate::log(&format!("[{tag}] {fname} não resolvido"));
             return false;
         }
     };
-    let tdbid = crate::cname::tweak_db_id(EFFECT).to_le_bytes();
-    // A aridade REAL da função, lida da RTTI. Mandar menos argumentos do que a assinatura pede é
-    // a hipótese nº1 pra "o comando diz ON mas nada acontece" — melhor ver o número do que supor.
+    let tdbid = crate::cname::tweak_db_id(effect).to_le_bytes();
     let np = rtti::param_count(&f);
     let ptypes: Vec<String> = (0..np)
         .map(|i| crate::cname::resolve_cname(rtti::fn_param_type(f.func, i as usize)))
         .collect();
     crate::log(&format!(
-        "[cloak] {fname}({}) params={np} static={} tdbid={:#018x}",
+        "[{tag}] {fname}({}) params={np} static={} '{effect}' tdbid={:#018x}",
         ptypes.join(", "),
         f.is_static,
         u64::from_le_bytes(tdbid)
     ));
     rtti::call_func(&f, ses, &[Arg::Raw(eid), Arg::Tdb(tdbid)]);
-    crate::log(&format!("[cloak] {} enviado", if on { "ON" } else { "OFF" }));
+    crate::log(&format!("[{tag}] {} enviado", if on { "ON" } else { "OFF" }));
     true
+}
+
+/// "NPCs não te veem": camuflagem óptica do jogo. `BaseStatusEffect.Cloaked` VERIFICADO como
+/// record existente no tweakdb.bin deste build (os nomes que inventei antes — `OpticalCamo`,
+/// `Invisible` — não são records).
+pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
+    status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", on, "cloak")
+}
+
+/// Munição infinita (sem recarregar): `GameplayRestriction.InfiniteAmmo`, também VERIFICADO no
+/// tweakdb.bin. É a mesma restrição que o jogo usa nos próprios trechos scriptados.
+pub unsafe fn infinite_ammo(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
+    status_effect(reg, captured_player, "GameplayRestriction.InfiniteAmmo", on, "ammo")
 }
 
 /// RAM do cyberdeck (quickhacks). É o pool `Memory` — o mesmo mecanismo de Health/Stamina,
