@@ -466,6 +466,54 @@ pub unsafe fn heal(reg: &Registry, captured_player: *mut c_void) -> bool {
     ok
 }
 
+/// "NPCs não te veem": aplica o efeito de camuflagem ÓPTICA do próprio jogo no jogador.
+///
+/// Cyberpunk já tem essa mecânica — o Optical Camo — e o estado dela é o status effect
+/// `BaseStatusEffect.Cloaked`, VERIFICADO como record existente no tweakdb.bin deste build (o
+/// TweakDBID bate na tabela de records). Usar o efeito do jogo em vez de mexer na percepção dos
+/// NPCs um a um significa que a IA continua se comportando como o jogo espera: quem trata
+/// "alvo camuflado" já está escrito e testado pela CDPR.
+///
+/// `ApplyStatusEffect(entityID, TweakDBID)` / `RemoveStatusEffect(entityID, TweakDBID)` no
+/// `gameStatusEffectSystem`. O nº de params é logado: se este build pedir mais, aparece no log em
+/// vez de falhar em silêncio.
+pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
+    const EFFECT: &str = "BaseStatusEffect.Cloaked";
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let ses = system_flex(reg, owner, gi, "gameStatusEffectSystem", "GetStatusEffectSystem");
+    if !rtti::sane(ses) {
+        crate::log("[cloak] StatusEffectSystem inacessível");
+        return false;
+    }
+    let eid = match entity_id(reg, owner) {
+        Some(b) => b,
+        None => {
+            crate::log("[cloak] GetEntityID falhou");
+            return false;
+        }
+    };
+    let fname = if on { "ApplyStatusEffect" } else { "RemoveStatusEffect" };
+    let f = match rtti::resolve_any(reg, &["gameStatusEffectSystem"], fname) {
+        Some(g) => g,
+        None => {
+            crate::log(&format!("[cloak] {fname} não resolvido"));
+            return false;
+        }
+    };
+    let tdbid = crate::cname::tweak_db_id(EFFECT).to_le_bytes();
+    crate::log(&format!(
+        "[cloak] {fname}('{EFFECT}' tdbid={:#018x})",
+        u64::from_le_bytes(tdbid)
+    ));
+    rtti::call_func(&f, ses, &[Arg::Raw(eid), Arg::Tdb(tdbid)]);
+    crate::log(&format!("[cloak] {} enviado", if on { "ON" } else { "OFF" }));
+    true
+}
+
 /// RAM do cyberdeck (quickhacks). É o pool `Memory` — o mesmo mecanismo de Health/Stamina,
 /// confirmado no binário: `gamedataStatPoolType` só tem Health, Stamina e Memory.
 /// Enche até 100%; o "ilimitado" é isto reaplicado no tick (ver `RAM_INFINITE` em lib.rs).

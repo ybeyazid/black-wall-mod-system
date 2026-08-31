@@ -8937,6 +8937,17 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
         match parts.as_slice() {
             ["money", n] => console::give(reg, player, tx, "Items.money", n.parse().unwrap_or(1)),
             // RAM do cyberdeck. `ram` enche uma vez; `ram on|off` mantém cheia (ver RAM_INFINITE).
+            // "NPC'ler görmesin": camuflagem óptica do jogo (BaseStatusEffect.Cloaked).
+            ["cloak"] | ["cloak", "on"] => {
+                let ok = console::cloak(reg, player, true);
+                log(&format!("[console] 'cloak' -> {}", if ok { "ON" } else { "FAILED" }));
+                return;
+            }
+            ["cloak", "off"] => {
+                let ok = console::cloak(reg, player, false);
+                log(&format!("[console] 'cloak off' -> {}", if ok { "OFF" } else { "FAILED" }));
+                return;
+            }
             ["ram"] => {
                 let ok = console::ram(reg, player);
                 log(&format!("[console] 'ram' -> {}", if ok { "OK (Memory=100)" } else { "FAILED" }));
