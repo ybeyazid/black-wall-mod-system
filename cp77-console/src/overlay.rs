@@ -1952,12 +1952,16 @@ unsafe fn render_imgui(cb_raw: Id, drawable: Id) {
         .unwrap_or(false)
         || std::path::Path::new("/tmp/bwms-fire-start").exists();
     let boot = crate::selfboot::boot_splash_active() && (fire_start || !engagement_active());
-    if !show && !badge && !boot {
-        return;
-    }
     // Gestão do cursor: ABERTO = acopla (clicar no overlay). Ao FECHAR (borda de descida),
     // DESACOPLA p/ devolver a câmera ao jogo — sem isto o mouse-look trava depois do `,
     // porque o jogo só desacopla 1× ao entrar em gameplay e não "re-desacopla" sozinho.
+    //
+    // ORDEM IMPORTA (bug real, achado no Epic 2026-09-01): isto tem que rodar ANTES do
+    // early-return de "nada pra desenhar". Fechar o console é exatamente o caso `show=false`;
+    // se `badge` e `boot` também forem falsos, o return abaixo disparava PRIMEIRO e a borda de
+    // descida nunca era processada — o mouse ficava preso à câmera pra sempre e o mouse-look
+    // travava, embora o jogo continuasse rodando atrás. O comentário acima já descrevia esse
+    // sintoma; o que faltava era o desacople ser alcançável no frame em que o painel fecha.
     let prev_show = PREV_SHOW.swap(show, Ordering::Relaxed);
     if show {
         CGAssociateMouseAndMouseCursorPosition(true);
@@ -1967,6 +1971,9 @@ unsafe fn render_imgui(cb_raw: Id, drawable: Id) {
     } else if prev_show {
         CGAssociateMouseAndMouseCursorPosition(false); // fechou agora → mouse volta pra câmera
         OVERLAY_CLOSE_EDGE.store(true, Ordering::Relaxed); // `cet-lifecycle-events`: onOverlayClose
+    }
+    if !show && !badge && !boot {
+        return;
     }
     let w = msg_usize(tex_raw, sel("width")) as f32;
     let h = msg_usize(tex_raw, sel("height")) as f32;

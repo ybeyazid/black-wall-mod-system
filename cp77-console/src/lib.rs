@@ -100,6 +100,22 @@ pub(crate) fn game_base() -> usize {
 /// layout deslocado) traduz Steam-vmaddr → vmaddr do build via [`steam_to_gog`]/
 /// [`steam_to_epic`] ANTES de aplicar o slide. Steam/Unknown = identidade (comportamento
 /// histórico, byte-idêntico).
+/// True na PRIMEIRA vez que este vmaddr aparece; false depois.
+///
+/// Sem isto, um endereço não-mapeado que é consultado TODO TICK (o budget do watchdog do motor
+/// é o caso real) enche o log com a mesma linha milhares de vezes e — pior — inunda a view
+/// K-LOG do console in-game, que passa a ser inútil. O log de "sem mapa" é diagnóstico: a
+/// informação está na PRIMEIRA ocorrência, as repetições não acrescentam nada.
+fn first_time_unmapped(vmaddr: u64) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut s| s.insert(vmaddr))
+        .unwrap_or(false)
+}
+
 pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
     let v = match game_build() {
         // O mapa do Epic é PARCIAL de propósito (ver [`steam_to_epic`]): o `None` aqui é o
@@ -107,9 +123,11 @@ pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
         GameBuild::Epic => match steam_to_epic(vmaddr) {
             Some(v) => v,
             None => {
-                log(&format!(
-                    "[rebase] vmaddr {vmaddr:#x} sem mapa Epic -> SKIP (null; feature inerte)"
-                ));
+                if first_time_unmapped(vmaddr) {
+                    log(&format!(
+                        "[rebase] vmaddr {vmaddr:#x} sem mapa Epic -> SKIP (null; feature inerte)"
+                    ));
+                }
                 return core::ptr::null_mut();
             }
         },
@@ -127,7 +145,11 @@ pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
                 // assinatura de patch aplicado em local errado, não de null-deref comum).
                 // Fix: nunca mais devolver o vmaddr cru — retorna null, que todo call-site já
                 // trata como "não instala" via `gum::is_readable` (retorna false pra null).
-                log(&format!("[rebase] vmaddr {vmaddr:#x} sem mapa GOG -> SKIP (null; nunca mais passthrough)"));
+                // 1x por vmaddr (ver `first_time_unmapped`): um endereço consultado todo tick
+                // repetiria esta linha milhares de vezes e inundaria o K-LOG do console.
+                if first_time_unmapped(vmaddr) {
+                    log(&format!("[rebase] vmaddr {vmaddr:#x} sem mapa GOG -> SKIP (null; nunca mais passthrough)"));
+                }
                 return core::ptr::null_mut();
             }
         },
