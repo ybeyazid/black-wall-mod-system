@@ -42,6 +42,10 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    /// Não existe getter pro estado de "associado"; a VISIBILIDADE do cursor é o proxy fiel:
+    /// no menu o jogo mostra o cursor (e o mantém acoplado), em gameplay ele esconde (e
+    /// desacopla p/ o mouse-look). Lido ANTES de mexermos, serve pra RESTAURAR no fechamento.
+    fn CGCursorIsVisible() -> bool;
 }
 
 #[inline]
@@ -502,6 +506,9 @@ pub unsafe fn inject_key(keycode: u16, chars: &str) {
 static LOGGED: AtomicBool = AtomicBool::new(false);
 static SHOW: AtomicBool = AtomicBool::new(false); // começa ESCONDIDO (` abre)
 static PREV_SHOW: AtomicBool = AtomicBool::new(false); // p/ detectar a borda fechar→devolver o mouse
+/// Estado do cursor ANTES de abrirmos o overlay, pra restaurar igual ao fechar.
+/// Ver `CGCursorIsVisible` acima: true = estávamos num menu (cursor livre), false = gameplay.
+static CURSOR_WAS_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// `cet-lifecycle-events`: bordas abrir/fechar do overlay, sinalizadas AQUI (thread do render, via
 /// presentDrawable) mas consumidas+disparadas (`fire_event`) de dentro do `cp77_tick` (thread do
 /// jogo) — chamar a VM/redscript fora da thread do jogo é arriscado (lição desta sessão: 3ptest/
@@ -1964,12 +1971,20 @@ unsafe fn render_imgui(cb_raw: Id, drawable: Id) {
     // sintoma; o que faltava era o desacople ser alcançável no frame em que o painel fecha.
     let prev_show = PREV_SHOW.swap(show, Ordering::Relaxed);
     if show {
-        CGAssociateMouseAndMouseCursorPosition(true);
         if !prev_show {
+            // ANTES de acoplar: guarda como o jogo estava, pra devolver igual no fechamento.
+            CURSOR_WAS_VISIBLE.store(CGCursorIsVisible(), Ordering::Relaxed);
             OVERLAY_OPEN_EDGE.store(true, Ordering::Relaxed); // `cet-lifecycle-events`: onOverlayOpen
         }
+        CGAssociateMouseAndMouseCursorPosition(true);
     } else if prev_show {
-        CGAssociateMouseAndMouseCursorPosition(false); // fechou agora → mouse volta pra câmera
+        // RESTAURA em vez de forçar `false`. Desacoplar sempre está certo em gameplay (mouse-look)
+        // mas ERRADO num menu: lá o cursor tem que andar livre, e forçar `false` prende ele no
+        // ponto onde estava — o item do menu fica "colado" e não dá pra navegar (achado ao vivo
+        // no Epic 2026-09-01, no menu principal). Como não há getter pro estado de acoplamento,
+        // usamos a visibilidade lida na abertura: visível = menu → re-acopla; escondido =
+        // gameplay → desacopla e a câmera volta a funcionar.
+        CGAssociateMouseAndMouseCursorPosition(CURSOR_WAS_VISIBLE.load(Ordering::Relaxed));
         OVERLAY_CLOSE_EDGE.store(true, Ordering::Relaxed); // `cet-lifecycle-events`: onOverlayClose
     }
     if !show && !badge && !boot {
