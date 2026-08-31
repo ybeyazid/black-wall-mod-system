@@ -96,11 +96,23 @@ pub(crate) fn game_base() -> usize {
 
 /// VM addr do binário (base 0x1_0000_0000) → endereço real em runtime.
 ///
-/// Os offsets estáticos do projeto são da build STEAM. No GOG (mesma versão, layout
-/// deslocado) traduz Steam-vmaddr → GOG-vmaddr via [`steam_to_gog`] ANTES de aplicar o
-/// slide. Steam/Unknown = identidade (comportamento histórico, byte-idêntico).
+/// Os offsets estáticos do projeto são da build STEAM. No GOG e no Epic (mesma versão,
+/// layout deslocado) traduz Steam-vmaddr → vmaddr do build via [`steam_to_gog`]/
+/// [`steam_to_epic`] ANTES de aplicar o slide. Steam/Unknown = identidade (comportamento
+/// histórico, byte-idêntico).
 pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
     let v = match game_build() {
+        // O mapa do Epic é PARCIAL de propósito (ver [`steam_to_epic`]): o `None` aqui é o
+        // caminho ESPERADO pra toda feature ainda não mapeada, não um erro.
+        GameBuild::Epic => match steam_to_epic(vmaddr) {
+            Some(v) => v,
+            None => {
+                log(&format!(
+                    "[rebase] vmaddr {vmaddr:#x} sem mapa Epic -> SKIP (null; feature inerte)"
+                ));
+                return core::ptr::null_mut();
+            }
+        },
         GameBuild::Gog => match steam_to_gog(vmaddr) {
             Some(v) => v,
             None => {
@@ -135,20 +147,27 @@ pub(crate) fn un_rebase(ptr: *const c_void) -> u64 {
     (p - b) as u64 + LINK_BASE
 }
 
-/// Qual build do jogo. Steam e GOG = MESMA versão/instruções, layout diferente → os
+/// Qual build do jogo. Steam, GOG e Epic = MESMA versão/instruções, layout diferente → os
 /// vmaddr estáticos deslocam. Detectado 1x lendo o prólogo do executor; auto-validante.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GameBuild {
     Steam,
     Gog,
+    Epic,
     Unknown,
 }
 
-/// Prólogo do executor (`stp x28,x27..; stp x26,x25..`). IGUAL nos 2 builds — só o
+/// Prólogo do executor (`stp x28,x27..; stp x26,x25..`). IGUAL nos 3 builds — só o
 /// ENDEREÇO muda → serve de assinatura pra identificar o build. (= selfboot::EXEC_PROLOGUE.)
 const DETECT_EXEC_PROLOGUE: u64 = 0xa901_67fa_a9ba_6ffc;
 const STEAM_EXEC_VM: u64 = 0x1_0217_3120;
 const GOG_EXEC_VM: u64 = 0x1_027b_a1b4;
+/// Epic (`com.cdprojektred.cyberpunk.egs`, 2.3.1 build 5314028). Achado por backtrace no
+/// `redDispatcher2` (breakpoint em `funcOperatorAdd<int>`): é o ÚNICO frame de 5 args da
+/// cadeia (`x0..x4` salvos no prólogo = func, ctx, frame, res, retType). O `DETECT_EXEC_PROLOGUE`
+/// acima casa byte-a-byte aqui — confirmação independente, já que o endereço NÃO foi achado
+/// por essa assinatura.
+const EPIC_EXEC_VM: u64 = 0x1_0422_5588;
 
 /// Build detectado (cacheado). Lê o prólogo do executor no vmaddr de cada build até casar.
 /// Unknown (nenhum casou) → tratado como Steam na tradução; os checks de prólogo por-hook
@@ -166,6 +185,8 @@ pub(crate) fn game_build() -> GameBuild {
             GameBuild::Steam
         } else if probe(GOG_EXEC_VM) {
             GameBuild::Gog
+        } else if probe(EPIC_EXEC_VM) {
+            GameBuild::Epic
         } else {
             GameBuild::Unknown
         };
@@ -178,7 +199,7 @@ pub(crate) fn game_build() -> GameBuild {
 pub(crate) static BUILD_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// True se o build é reconhecido (Steam ou GOG). `Unknown` = versão do jogo que os nossos offsets
+/// True se o build é reconhecido (Steam, GOG ou Epic). `Unknown` = versão do jogo que os nossos offsets
 /// NÃO cobrem (auto-atualização além de 2.31, distribuição diferente) → aplicar os endereços
 /// Steam-identity num binário desconhecido lê/escreve memória errada e crasha. O gate no `on_load`
 /// usa isto pra NÃO instalar nenhum hook de endereço (o jogo boota vanilla), em vez de arriscar.
@@ -216,6 +237,55 @@ fn steam_to_gog(s: u64) -> Option<u64> {
         0x1_03f5_ec7c => 0x1_00a2_a7bc, // phase getter vizinha (+8, dev measure)
         0x1_0908_b798 => 0x1_08e8_c088, // OPCODE_TABLE (native-com-args; âncora funcOperatorAdd<int>)
         0x1_0900_3000 => 0x1_0910_6a88, // DEPOT_SINGLETON (dev; âncora depot-accessor)
+        _ => return None,
+    })
+}
+
+/// Mapa Steam-vmaddr → Epic-vmaddr (`com.cdprojektred.cyberpunk.egs`, 2.3.1 build 5314028).
+/// Mesma versão/instruções; o layout desloca porque o Epic linka `libGameServicesEpic`/EOS
+/// no lugar do Galaxy. O delta NÃO é uniforme — medido: `+0x29A8478`, `+0x271C804` e um
+/// NEGATIVO (`-0x1ADDCE4`) → é reordenação real por objeto, nenhum rebase único resolve.
+///
+/// PARCIAL (12 de 26 pares): só entram endereços VERIFICADOS. Todo o resto cai no `None` do
+/// [`rebase`], que devolve null → o call-site não instala o hook. Isso é seguro por desenho
+/// (mesma garantia que o GOG já usa desde o fix de 2026-07-31); o custo é que as features
+/// não-mapeadas (TweakDB, archives, depot, boot-phase) ficam INERTES no Epic, não que
+/// crashem.
+///
+/// Como cada par foi obtido (notes: `bwms-epic-re/findings.md`):
+///   - EXEC: backtrace do `redDispatcher2`; único frame de 5 args + `DETECT_EXEC_PROLOGUE`.
+///   - CRTTISystem::Get: previsto pela distância EXEC↔CRTTI (Steam `0x15d6c`, GOG `0x15d74`
+///     → mesmo objeto) e CONFIRMADO em runtime — chamado via lldb, a vtable do objeto
+///     devolvido tem 10/10 slots com código real (o candidato descartado tinha 1/10, o resto
+///     eram stubs `ret`).
+///   - GetFunction: lido direto do slot +0x30 dessa vtable viva.
+///   - bind*: `BINDSIG` achado por assinatura de prólogo em janela graduada; os outros por
+///     distância relativa a ele — `BIND_ORCH − CLASS_VALIDATE` bate EXATO (`0x8C4`) e as duas
+///     previsões caíram em entrada de função (prólogo logo depois de um `ret`).
+///   - Pool*/PoolArchive: símbolo (`nm` — o binário Epic NÃO é stripped, 68654 símbolos).
+///   - open-archive: vizinho de `PoolArchive::Allocate` (`0x5a8` de distância), hit exato.
+///   - OPCODE_TABLE: disasm de `funcOperatorAdd<int>`; as 7417 referências à página batem
+///     todas nesse mesmo endereço.
+fn steam_to_epic(s: u64) -> Option<u64> {
+    Some(match s {
+        0x1_0217_3120 => 0x1_0422_5588, // EXEC (executor universal)
+        0x1_0218_8e8c => 0x1_0423_b2c8, // CRTTISystem::Get
+        0x1_0219_5024 => 0x1_0424_7370, // GetFunction (vtbl+0x30)
+        0x1_021f_cee0 => 0x1_042a_e748, // bind orchestrator (resolve-log)
+        0x1_021e_897c => 0x1_0429_a1ec, // bind orch entry
+        0x1_021e_8c84 => 0x1_0429_a4f4, // bind resolve-loop
+        0x1_021f_c61c => 0x1_042a_de84, // class-validate (mesma âncora BINDSIG; a distância
+        // `BIND_ORCH − CLASS_VALIDATE` bate EXATA entre Steam e Epic: 0x8C4)
+        0x1_0002_2808 => 0x1_0002_21e8, // PoolDefault::AllocateAligned (símbolo)
+        0x1_0002_2cb0 => 0x1_0002_2690, // PoolDefault::Free (símbolo)
+        0x1_0001_d9a0 => 0x1_0001_d380, // PoolRoot::GetHandle (símbolo)
+        0x1_03e2_f17c => 0x1_0360_2724, // PoolArchive::Allocate (símbolo)
+        0x1_03e2_ebd4 => 0x1_0360_217c, // open-archive
+        0x1_0908_b798 => 0x1_090c_a9c8, // OPCODE_TABLE (âncora funcOperatorAdd<int>)
+        // NÃO mapeados ainda (ficam inertes, ver doc acima): CNamePool::Get, TweakDB::Get,
+        // TweakDB singleton, CreateRecord, RecordExists, InitializeArchives, RequestResource,
+        // depot vtable, DEPOT_SINGLETON, boot phase dispatcher, os 2 phase getters e RESLINK
+        // (candidato `0x1_0427_7c48` PROVÁVEL mas não confirmado — fica de fora de propósito).
         _ => return None,
     })
 }
