@@ -1764,6 +1764,12 @@ fn build_ui(ui: &imgui::Ui, st: &mut UiState) {
                 }
                 ui.same_line();
                 ui.text_disabled(format!("({})", crate::i18n::t("hdr.language_next_boot")));
+                // Carimbo do build. Existe porque "o jogo pegou a versão nova?" não era
+                // respondível de dentro: o dylib só é lido no arranque, então um teste feito
+                // logo depois de instalar pode estar rodando o binário ANTERIOR e parecer que a
+                // correção não funcionou. Agora dá pra conferir num relance.
+                ui.same_line();
+                ui.text_disabled(format!("| build {}", crate::build_stamp()));
             }
             ui.separator();
             if let Some(_tb) = ui.tab_bar("##tabs") {

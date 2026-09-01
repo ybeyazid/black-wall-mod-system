@@ -386,6 +386,12 @@ pub(crate) fn log_anomaly(msg: &str) {
     }
 }
 
+/// Carimbo do build (epoch em segundos, injetado pelo build.rs). Muda a cada compilação, então
+/// serve pra confirmar QUAL dylib o jogo carregou — o arquivo em disco pode já ser o novo.
+pub(crate) fn build_stamp() -> &'static str {
+    env!("BWMS_BUILD_STAMP")
+}
+
 pub(crate) fn log(msg: &str) {
     // A saída de COMANDO precisa aparecer na aba Console mesmo no build público, onde o resto
     // desta função é no-op. Sem isto, digitar `help`/`give`/`money` não devolve NADA na tela e a
@@ -395,8 +401,9 @@ pub(crate) fn log(msg: &str) {
     // aba Console mesmo no build público, onde o resto desta função é no-op. Sem isto, um cheat
     // que não funciona não tem NENHUM sinal na tela — foi exatamente o que aconteceu com o
     // `cloak`: o comando dizia "ON" e o motivo real ficava num log que só existe em build dev.
-    const USER_FACING: [&str; 8] = [
-        "[console]", "[cloak]", "[ram]", "[god]", "[heal]", "[give]", "[sig]", "[level]",
+    const USER_FACING: [&str; 10] = [
+        "[console]", "[cloak]", "[ammo]", "[ram]", "[god]", "[heal]", "[give]", "[sig]",
+        "[level]", "[build]",
     ];
     if USER_FACING.iter().any(|p| msg.starts_with(p)) {
         crate::overlay::console_out(msg);
@@ -8964,6 +8971,10 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             ["ammo", "off"] => {
                 let ok = console::infinite_ammo(reg, player, false);
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
+                return;
+            }
+            ["ver"] | ["version"] => {
+                log(&format!("[build] stamp={} (compare com o do instalador)", build_stamp()));
                 return;
             }
             ["ram"] => {
