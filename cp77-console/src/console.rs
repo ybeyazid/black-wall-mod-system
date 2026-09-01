@@ -531,23 +531,42 @@ pub unsafe fn status_effect(
     ));
     // Monta a lista com o TAMANHO que a assinatura declara. Neste build o Apply é
     // (entEntityID, TweakDBID, TweakDBID, entEntityID, Uint32, Vector4, Bool, entEntityID) = 8;
-    // mandar só os 2 primeiros fazia a chamada não ter efeito NENHUM, sem erro — foi exatamente
-    // o que aconteceu com o `cloak`. Preenche o resto por TIPO em vez de por posição, pra
-    // continuar valendo se o Remove (ou outro build) declarar uma assinatura diferente.
-    let mut args: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
-    for i in args.len()..(np as usize) {
-        let ty = crate::cname::resolve_cname(rtti::fn_param_type(f.func, i));
-        args.push(match ty.as_str() {
-            "TweakDBID" => Arg::Tdb([0u8; 8]),
-            "Bool" => Arg::Bool(false),
-            // o Uint32 desta assinatura é a contagem de pilhas: 0 aplicaria "nenhuma".
-            "Uint32" => Arg::I32(1),
-            "Int32" => Arg::I32(0),
-            // entEntityID (instigador), Vector4 (posição) e afins: 16 bytes zerados = "nenhum".
-            _ => Arg::Raw([0u8; 16]),
-        });
+    // mandar só os 2 primeiros fazia a chamada não ter efeito NENHUM, sem erro. Preenche por
+    // TIPO em vez de por posição, pra continuar valendo se outra assinatura aparecer.
+    //
+    // `instigator`: entEntityID que NÃO seja o 1o (o 1o é o alvo). Zerado = "ninguém"; vários
+    // sistemas do jogo descartam um efeito sem instigador, então a 2a tentativa usa o jogador.
+    let build_args = |instigator: [u8; 16]| -> Vec<Arg> {
+        let mut v: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
+        for i in v.len()..(np as usize) {
+            let ty = crate::cname::resolve_cname(rtti::fn_param_type(f.func, i));
+            v.push(match ty.as_str() {
+                "TweakDBID" => Arg::Tdb([0u8; 8]),
+                "Bool" => Arg::Bool(false),
+                // este Uint32 é a contagem de pilhas: 0 aplicaria "nenhuma".
+                "Uint32" => Arg::I32(1),
+                "Int32" => Arg::I32(0),
+                "entEntityID" => Arg::Raw(instigator),
+                _ => Arg::Raw([0u8; 16]), // Vector4 e afins: 16 bytes zerados
+            });
+        }
+        v
+    };
+    let a1 = build_args([0u8; 16]);
+    let argc = a1.len();
+    let r1 = rtti::call_func(&f, ses, &a1);
+    crate::log(&format!(
+        "[{tag}] tentativa 1 (instigator=0): argc={argc} ret={:02x?}",
+        r1.map(|v| v[0])
+    ));
+    // As duas tentativas ficam no log: o resultado diz QUAL funciona, em vez de deixar suposição.
+    if !matches!(r1, Some(v) if v[0] != 0) {
+        let r2 = rtti::call_func(&f, ses, &build_args(eid));
+        crate::log(&format!(
+            "[{tag}] tentativa 2 (instigator=player): ret={:02x?}",
+            r2.map(|v| v[0])
+        ));
     }
-    rtti::call_func(&f, ses, &args);
     crate::log(&format!("[{tag}] {} enviado", if on { "ON" } else { "OFF" }));
     true
 }
