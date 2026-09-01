@@ -529,7 +529,25 @@ pub unsafe fn status_effect(
         f.is_static,
         u64::from_le_bytes(tdbid)
     ));
-    rtti::call_func(&f, ses, &[Arg::Raw(eid), Arg::Tdb(tdbid)]);
+    // Monta a lista com o TAMANHO que a assinatura declara. Neste build o Apply é
+    // (entEntityID, TweakDBID, TweakDBID, entEntityID, Uint32, Vector4, Bool, entEntityID) = 8;
+    // mandar só os 2 primeiros fazia a chamada não ter efeito NENHUM, sem erro — foi exatamente
+    // o que aconteceu com o `cloak`. Preenche o resto por TIPO em vez de por posição, pra
+    // continuar valendo se o Remove (ou outro build) declarar uma assinatura diferente.
+    let mut args: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
+    for i in args.len()..(np as usize) {
+        let ty = crate::cname::resolve_cname(rtti::fn_param_type(f.func, i));
+        args.push(match ty.as_str() {
+            "TweakDBID" => Arg::Tdb([0u8; 8]),
+            "Bool" => Arg::Bool(false),
+            // o Uint32 desta assinatura é a contagem de pilhas: 0 aplicaria "nenhuma".
+            "Uint32" => Arg::I32(1),
+            "Int32" => Arg::I32(0),
+            // entEntityID (instigador), Vector4 (posição) e afins: 16 bytes zerados = "nenhum".
+            _ => Arg::Raw([0u8; 16]),
+        });
+    }
+    rtti::call_func(&f, ses, &args);
     crate::log(&format!("[{tag}] {} enviado", if on { "ON" } else { "OFF" }));
     true
 }
