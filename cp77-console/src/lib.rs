@@ -8973,6 +8973,9 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
                 return;
             }
+            // `findfunc <filtro>`: procura no registro GLOBAL de funções. Par de `funcs`, que
+            // olha dentro de uma classe — juntos cobrem os dois lugares onde um método pode estar.
+            ["findfunc", filter] => { list_global_funcs(reg, filter); return; }
             // `funcs <Classe> [filtro]`: lista os nomes REAIS das funções de uma classe na
             // RTTI. Existe porque "não resolveu" custava uma recompilação pra descobrir como o
             // método se chama — as funções de redscript entram com a assinatura colada no nome.
@@ -9418,6 +9421,23 @@ fn list_class_funcs(reg: &crate::rtti::Registry, class: &str, filter: &str) {
         }
         if v.len() > 60 {
             log(&format!("[funcs]   ... e mais {} (use um filtro)", v.len() - 60));
+        }
+    }
+}
+
+
+/// Imprime funções GLOBAIS cujo nome contém `filter`. Suporte de `findfunc <filtro>`.
+fn list_global_funcs(reg: &crate::rtti::Registry, filter: &str) {
+    unsafe {
+        let mut v = crate::rtti::list_global_functions(reg, filter);
+        v.sort();
+        v.dedup();
+        log(&format!("[funcs] globais com '{filter}': {}", v.len()));
+        for n in v.iter().take(60) {
+            log(&format!("[funcs]   {n}"));
+        }
+        if v.len() > 60 {
+            log(&format!("[funcs]   ... e mais {} (refine o filtro)", v.len() - 60));
         }
     }
 }

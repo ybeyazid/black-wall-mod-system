@@ -2120,10 +2120,55 @@ pub unsafe fn resolve_any_name(
             }
         }
     }
+    // Última tentativa: função GLOBAL. Statics de redscript nem sempre entram na tabela da
+    // classe — `funcs RPGManager Modifier` mostrou que `CreateStatModifier` não está lá — e o
+    // registro global é onde as declaradas em `.reds` costumam parar.
+    for n in names {
+        let g = resolve_global_function_robust(reg, n);
+        if !g.is_null() {
+            let gb = g as *const u8;
+            let rp = rd_ptr(gb.add(0x18));
+            let ret_type = if rp.is_null() { std::ptr::null_mut() } else { rd_ptr(rp as *const u8) };
+            crate::log(&format!("[{tag}] resolvido como função GLOBAL: {n}"));
+            return Some(ResolvedFn { func: g, ret_type, is_static: true });
+        }
+    }
     crate::log(&format!(
-        "[{tag}] não resolveu: classes={classes:?} nomes={names:?}"
+        "[{tag}] não resolveu: classes={classes:?} nomes={names:?} (nem como global)"
     ));
     None
+}
+
+/// Lista funções GLOBAIS cujo nome contém `filter`. Par de `list_functions` pro registro global —
+/// juntos respondem "como este método se chama de verdade" sem recompilar.
+pub unsafe fn list_global_functions(reg: &Registry, filter: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (entries, n) = reg.get_global_functions();
+    if entries.is_null() || n == 0 || n > 200_000 || !crate::gum::is_readable(entries, 8) {
+        return out;
+    }
+    let base = entries as *const u8;
+    let f_lower = filter.to_lowercase();
+    for i in 0..n {
+        let slot = base.add(i * 8);
+        if !crate::gum::is_readable(slot as *const c_void, 8) {
+            break;
+        }
+        let f = rd_ptr(slot) as *const u8;
+        if f.is_null() || !crate::gum::is_readable(f as *const c_void, 0x20) {
+            continue;
+        }
+        for h in [rd_u64(f.add(0x10)), rd_u64(f.add(0x08))] {
+            if h == 0 {
+                continue;
+            }
+            let nm = crate::cname::resolve_cname(h);
+            if !nm.is_empty() && (f_lower.is_empty() || nm.to_lowercase().contains(&f_lower)) {
+                out.push(nm);
+            }
+        }
+    }
+    out
 }
 
 /// Lista os nomes das funções de uma classe (instância + estáticas, subindo os pais). Ferramenta

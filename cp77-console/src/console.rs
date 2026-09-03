@@ -586,6 +586,23 @@ pub unsafe fn status_effect(
             break;
         }
     }
+    // DESLIGAR: cada `RemoveStatusEffect` tira UMA pilha. Rodar `cloak` várias vezes empilhou o
+    // efeito, então uma chamada só o deixa aplicado — foi o que prendeu o personagem invisível.
+    // Repete até o jogo dizer que sumiu, com teto pra nunca virar laço infinito no frame.
+    if !on && !landed {
+        let args = build_args([0u8; 16], np);
+        for i in 1..=32 {
+            rtti::call_func(&f, ses, &args);
+            if has_effect(reg, ses, eid, tdbid) == Some(false) {
+                crate::log(&format!("[{tag}] removido após {i} pilha(s)"));
+                landed = true;
+                break;
+            }
+        }
+        if !landed {
+            crate::log(&format!("[{tag}] 32 remoções e o jogo ainda diz has=SIM"));
+        }
+    }
     crate::log(&format!(
         "[{tag}] {} — jogo confirma: {}",
         if on { "ON" } else { "OFF" },
@@ -666,7 +683,17 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
         // Desligar remove TAMBÉM o `BaseStatusEffect.Cloaked` da tentativa anterior: aquele
         // efeito entrou de verdade no jogador e foi junto pro SAVE, deixando o personagem
         // invisível ao carregar. Trocar de mecanismo não pode deixar o estado antigo preso.
-        let se = status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", false, "cloak");
+        let mut se = status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", false, "cloak");
+        // Se a remoção não vencer, o jogo tem records feitos pra ISTO: `Cloaked_Exit` (a saída da
+        // camuflagem) e `ForceVisibility` (forçar visibilidade). Aplicá-los é o caminho do próprio
+        // jogo pra devolver o personagem, em vez de insistir num Remove que já se mostrou insuficiente.
+        if !se {
+            for rec in ["BaseStatusEffect.Cloaked_Exit", "BaseStatusEffect.ForceVisibility"] {
+                if status_effect(reg, captured_player, rec, true, "cloak") {
+                    se = true;
+                }
+            }
+        }
         let st = stat_unmod(reg, captured_player, "OpticalCamoIsActive", "cloak");
         se || st
     }
