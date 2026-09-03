@@ -401,9 +401,9 @@ pub(crate) fn log(msg: &str) {
     // aba Console mesmo no build público, onde o resto desta função é no-op. Sem isto, um cheat
     // que não funciona não tem NENHUM sinal na tela — foi exatamente o que aconteceu com o
     // `cloak`: o comando dizia "ON" e o motivo real ficava num log que só existe em build dev.
-    const USER_FACING: [&str; 11] = [
+    const USER_FACING: [&str; 12] = [
         "[console]", "[cloak]", "[ammo]", "[ram]", "[god]", "[heal]", "[give]", "[sig]",
-        "[level]", "[build]", "[se]",
+        "[level]", "[build]", "[se]", "[stat]",
     ];
     if USER_FACING.iter().any(|p| msg.starts_with(p)) {
         crate::overlay::console_out(msg);
@@ -8973,6 +8973,24 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
                 return;
             }
+            // `stat`/`statw <Nome> [valor]`: modificador de stat no JOGADOR ou na ARMA ativa,
+            // com leitura antes/depois. É o mecanismo por trás de `cloak` e `ammo` — exposto
+            // cru pra testar um stat candidato sem recompilar.
+            ["stat", name] => { console::stat_mod(reg, player, name, 1.0, console::StatTarget::Player, "stat"); return; }
+            ["stat", name, v] => {
+                let val: f32 = v.parse().unwrap_or(1.0);
+                console::stat_mod(reg, player, name, val, console::StatTarget::Player, "stat");
+                return;
+            }
+            ["statw", name] => { console::stat_mod(reg, player, name, 1.0, console::StatTarget::Weapon, "stat"); return; }
+            ["statw", name, v] => {
+                let val: f32 = v.parse().unwrap_or(1.0);
+                console::stat_mod(reg, player, name, val, console::StatTarget::Weapon, "stat");
+                return;
+            }
+            ["stat?", name] => { console::stat_read(reg, player, name, console::StatTarget::Player); return; }
+            ["statw?", name] => { console::stat_read(reg, player, name, console::StatTarget::Weapon); return; }
+            ["stat-", name] => { console::stat_unmod(reg, player, name, "stat"); return; }
             // `se <record> [on|off]` / `se? <record>`: status effect ARBITRÁRIO por nome.
             // Testar um candidato passa a custar uma linha digitada em vez de recompilar +
             // reiniciar o jogo, que é o ciclo caro deste port.

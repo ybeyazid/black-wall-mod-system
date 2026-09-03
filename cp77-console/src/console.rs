@@ -653,17 +653,260 @@ pub unsafe fn status_effect_query(
     true
 }
 
-/// "NPCs não te veem": camuflagem óptica do jogo. `BaseStatusEffect.Cloaked` VERIFICADO como
-/// record existente no tweakdb.bin deste build (os nomes que inventei antes — `OpticalCamo`,
-/// `Invisible` — não são records).
+/// "NPCs não te veem": a camuflagem óptica do jogo, pelo stat `OpticalCamoIsActive` do JOGADOR.
+///
+/// `BaseStatusEffect.Cloaked` foi abandonado com medição, não por palpite: `HasStatusEffect`
+/// confirmou que ele ENTRA no jogador (`has=SIM`) e mesmo assim os NPCs continuavam vendo — é o
+/// efeito do lado deles (Oda/Maxtac), não do jogador. O que o jogo usa no jogador é a família de
+/// stats `OpticalCamo*` (`IsActive`, `Charges`, `Duration`...), toda confirmada neste build.
 pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
-    status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", on, "cloak")
+    if on {
+        stat_mod(reg, captured_player, "OpticalCamoIsActive", 1.0, StatTarget::Player, "cloak")
+    } else {
+        stat_unmod(reg, captured_player, "OpticalCamoIsActive", "cloak")
+    }
 }
 
-/// Munição infinita (sem recarregar): `GameplayRestriction.InfiniteAmmo`, também VERIFICADO no
-/// tweakdb.bin. É a mesma restrição que o jogo usa nos próprios trechos scriptados.
+/// Munição infinita: o stat `MagazineAutoRefill` da ARMA — o carregador se reenche, então não há
+/// recarga nem consumo. Fica na arma, não no jogador; trocar de arma exige rodar de novo.
+///
+/// `GameplayRestriction.InfiniteAmmo` foi abandonado com medição: nas TRÊS formas da chamada o
+/// jogo respondeu `has=nao` — não é um record de status effect, então o sistema o descarta em
+/// silêncio. Era isso que fazia o comando dizer ON e a munição continuar caindo.
 pub unsafe fn infinite_ammo(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
-    status_effect(reg, captured_player, "GameplayRestriction.InfiniteAmmo", on, "ammo")
+    if on {
+        stat_mod(reg, captured_player, "MagazineAutoRefill", 1.0, StatTarget::Weapon, "ammo")
+    } else {
+        stat_unmod(reg, captured_player, "MagazineAutoRefill", "ammo")
+    }
+}
+
+/// Alvo de um stat: o jogador ou a arma que ele tem na mão. São `StatsObjectID` diferentes —
+/// `MagazineAutoRefill` mora na ARMA, `OpticalCamoIsActive` mora no JOGADOR.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatTarget {
+    Player,
+    Weapon,
+}
+
+/// Arma ativa do jogador. Estático `GetActiveWeapon(GameObject)` — a assinatura está no bundle
+/// de redscript deste build. A classe dona não está no bundle, então tenta as candidatas e loga
+/// qual resolveu, em vez de fixar um palpite.
+unsafe fn active_weapon(reg: &Registry, owner: *mut c_void) -> *mut c_void {
+    for cls in ["GameObject", "gameObject", "RPGManager", "gameRPGManager", "WeaponObject", "gameweaponObject"] {
+        if let Some(f) = rtti::resolve_func(reg, cls, "GetActiveWeapon") {
+            let w = if f.is_static {
+                rtti::call_ptr(&f, std::ptr::null_mut(), &[Arg::Handle(owner, refcnt())])
+            } else {
+                rtti::call_ptr(&f, owner, &[])
+            };
+            if rtti::sane(w) {
+                crate::log(&format!("[stat] arma ativa via {cls}.GetActiveWeapon = {w:p}"));
+                return w;
+            }
+        }
+    }
+    crate::log("[stat] GetActiveWeapon não resolveu em nenhuma classe candidata");
+    std::ptr::null_mut()
+}
+
+/// Lê um stat do alvo. É a MEDIÇÃO que diz se o modificador pegou — sem ela, "apliquei" é
+/// palpite outra vez (foi exatamente o que custou as últimas rodadas com o status effect).
+unsafe fn stat_value(
+    reg: &Registry,
+    sts: *mut c_void,
+    target: [u8; 16],
+    stype: u64,
+) -> Option<f32> {
+    let f = rtti::resolve_any(reg, &["gameStatsSystem"], "GetStatValue")?;
+    let r = rtti::call_func(&f, sts, &[Arg::Raw(target), Arg::Enum(stype)])?;
+    Some(f32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+}
+
+/// Aplica um modificador de stat — o mecanismo que o PRÓPRIO jogo usa pra ligar camuflagem
+/// óptica e recarga automática, em vez de um status effect que o sistema recusa em silêncio.
+///
+/// POR QUE ESTE CAMINHO: a medição com `HasStatusEffect` mostrou que
+/// `GameplayRestriction.InfiniteAmmo` NUNCA entra (`has=nao` nas três formas da chamada), e que
+/// `BaseStatusEffect.Cloaked` entra mas não muda a percepção dos NPCs — é o efeito do lado dos
+/// NPCs (Oda/Maxtac), não do jogador. O que o jogo usa pro jogador são STATS:
+/// `BaseStats.OpticalCamoIsActive` e `BaseStats.MagazineAutoRefill`, ambos confirmados na tabela
+/// de records deste build.
+///
+/// Loga o valor ANTES e DEPOIS: o jogo respondendo se o modificador pegou.
+pub unsafe fn stat_mod(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    stat: &str,
+    value: f32,
+    target: StatTarget,
+    tag: &str,
+) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let sts = system_flex(reg, owner, gi, "gameStatsSystem", "GetStatsSystem");
+    if !rtti::sane(sts) {
+        crate::log(&format!("[{tag}] StatsSystem inacessível"));
+        return false;
+    }
+    let obj = match target {
+        StatTarget::Player => owner,
+        StatTarget::Weapon => {
+            let w = active_weapon(reg, owner);
+            if !rtti::sane(w) {
+                return false;
+            }
+            w
+        }
+    };
+    let tid = match entity_id(reg, obj) {
+        Some(b) => b,
+        None => {
+            crate::log(&format!("[{tag}] GetEntityID do alvo falhou"));
+            return false;
+        }
+    };
+    let stype = match rtti::resolve_enum_value(reg, "gamedataStatType", stat) {
+        Some(v) => v,
+        None => {
+            crate::log(&format!("[{tag}] gamedataStatType::{stat} não existe neste build"));
+            return false;
+        }
+    };
+    let before = stat_value(reg, sts, tid, stype);
+    // `Additive` soma ao valor base; pra um stat booleano (0/1) é o que liga.
+    let mtype = match rtti::resolve_enum_value(reg, "gameStatModifierType", "Additive") {
+        Some(v) => v,
+        None => {
+            crate::log(&format!("[{tag}] gameStatModifierType::Additive não resolveu"));
+            return false;
+        }
+    };
+    let cm = match rtti::resolve_any(reg, &["RPGManager", "gameRPGManager"], "CreateStatModifier") {
+        Some(f) => f,
+        None => {
+            crate::log(&format!("[{tag}] CreateStatModifier não resolveu"));
+            return false;
+        }
+    };
+    // Devolve um `ref<gameStatModifierData>` = handle de 16B {ponteiro, refcount}.
+    let m = match rtti::call_func(&cm, std::ptr::null_mut(), &[Arg::Enum(stype), Arg::Enum(mtype), Arg::F32(value)]) {
+        Some(b) => trunc16(b),
+        None => {
+            crate::log(&format!("[{tag}] CreateStatModifier falhou"));
+            return false;
+        }
+    };
+    if u64::from_le_bytes(m[..8].try_into().unwrap()) == 0 {
+        crate::log(&format!("[{tag}] CreateStatModifier devolveu handle nulo"));
+        return false;
+    }
+    let add = match rtti::resolve_any(reg, &["gameStatsSystem"], "AddModifier") {
+        Some(f) => f,
+        None => {
+            crate::log(&format!("[{tag}] AddModifier não resolveu"));
+            return false;
+        }
+    };
+    let np = rtti::param_count(&add) as usize;
+    rtti::call_func(&add, sts, &[Arg::Raw(tid), Arg::Raw(m)]);
+    // Guarda o handle: desligar é `RemoveModifier(mesmo alvo, MESMO handle)`. Sem isto, o único
+    // "off" possível seria empilhar um modificador negativo por cima — que zera o valor mas
+    // deixa lixo acumulado no alvo a cada liga/desliga.
+    applied().lock().unwrap().push((stat.to_string(), tid, m));
+    let after = stat_value(reg, sts, tid, stype);
+    let moved = matches!((before, after), (Some(a), Some(b)) if (b - a).abs() > 0.0001);
+    crate::log(&format!(
+        "[{tag}] {stat} {} {:?} -> {:?} (AddModifier params={np}) | jogo confirma: {}",
+        if matches!(target, StatTarget::Weapon) { "na ARMA:" } else { "no JOGADOR:" },
+        before,
+        after,
+        if moved { "SIM" } else { "NAO (valor não mudou)" }
+    ));
+    moved
+}
+
+/// Modificadores que NÓS aplicamos, pra poder removê-los depois pelo handle exato.
+fn applied() -> &'static std::sync::Mutex<Vec<(String, [u8; 16], [u8; 16])>> {
+    static A: std::sync::OnceLock<std::sync::Mutex<Vec<(String, [u8; 16], [u8; 16])>>> =
+        std::sync::OnceLock::new();
+    A.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Remove os modificadores que aplicamos pra este stat. Só os nossos: um `RemoveModifier` com
+/// handle de terceiros mexeria em buff de perk/cyberware do jogador.
+pub unsafe fn stat_unmod(reg: &Registry, captured_player: *mut c_void, stat: &str, tag: &str) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let sts = system_flex(reg, owner, gi, "gameStatsSystem", "GetStatsSystem");
+    if !rtti::sane(sts) {
+        crate::log(&format!("[{tag}] StatsSystem inacessível"));
+        return false;
+    }
+    let rm = match rtti::resolve_any(reg, &["gameStatsSystem"], "RemoveModifier") {
+        Some(f) => f,
+        None => {
+            crate::log(&format!("[{tag}] RemoveModifier não resolveu"));
+            return false;
+        }
+    };
+    let mut guard = applied().lock().unwrap();
+    let mut n = 0;
+    guard.retain(|(name, tid, m)| {
+        if name != stat {
+            return true;
+        }
+        rtti::call_func(&rm, sts, &[Arg::Raw(*tid), Arg::Raw(*m)]);
+        n += 1;
+        false
+    });
+    crate::log(&format!("[{tag}] {stat}: {n} modificador(es) removido(s)"));
+    n > 0
+}
+
+/// `stat?`/`statw?`: só lê, não aplica nada.
+pub unsafe fn stat_read(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    stat: &str,
+    target: StatTarget,
+) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let sts = system_flex(reg, owner, gi, "gameStatsSystem", "GetStatsSystem");
+    if !rtti::sane(sts) {
+        crate::log("[stat] StatsSystem inacessível");
+        return false;
+    }
+    let obj = match target {
+        StatTarget::Player => owner,
+        StatTarget::Weapon => active_weapon(reg, owner),
+    };
+    if !rtti::sane(obj) {
+        return false;
+    }
+    let tid = match entity_id(reg, obj) {
+        Some(b) => b,
+        None => return false,
+    };
+    let stype = match rtti::resolve_enum_value(reg, "gamedataStatType", stat) {
+        Some(v) => v,
+        None => {
+            crate::log(&format!("[stat] gamedataStatType::{stat} não existe neste build"));
+            return false;
+        }
+    };
+    crate::log(&format!("[stat] {stat} = {:?}", stat_value(reg, sts, tid, stype)));
+    true
 }
 
 /// RAM do cyberdeck (quickhacks). É o pool `Memory` — o mesmo mecanismo de Health/Stamina,
