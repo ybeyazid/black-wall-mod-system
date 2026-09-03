@@ -2096,6 +2096,75 @@ pub unsafe fn game_instance_vtable_dump(game: *mut c_void, n: usize) -> Vec<(usi
 }
 
 /// Resolve uma função RED por classe+método, subindo a cadeia de heranças.
+/// Resolve tentando VÁRIOS nomes em várias classes. Existe porque as funções definidas em
+/// redscript não entram na RTTI com o nome curto: entram com a ASSINATURA colada
+/// (`CreateStatModifier;gamedataStatTypegameStatModifierTypeFloat`), enquanto as nativas do
+/// engine entram com o nome cru. Procurar só o nome curto acha as nativas e erra as scriptadas —
+/// foi exatamente o que fez `CreateStatModifier` e `GetActiveWeapon` "não resolverem".
+/// Loga qual par (classe, nome) pegou, pra o acerto ficar registrado em vez de ser refeito.
+pub unsafe fn resolve_any_name(
+    reg: &Registry,
+    classes: &[&str],
+    names: &[&str],
+    tag: &str,
+) -> Option<ResolvedFn> {
+    for c in classes {
+        let cls = reg.class_by_name(c);
+        if cls.is_null() {
+            continue;
+        }
+        for n in names {
+            if let Some(f) = resolve_in_class(cls, n) {
+                crate::log(&format!("[{tag}] resolvido: {c}.{n} (static={})", f.is_static));
+                return Some(f);
+            }
+        }
+    }
+    crate::log(&format!(
+        "[{tag}] não resolveu: classes={classes:?} nomes={names:?}"
+    ));
+    None
+}
+
+/// Lista os nomes das funções de uma classe (instância + estáticas, subindo os pais). Ferramenta
+/// de diagnóstico: "não resolveu" passa a ser uma pergunta respondível no console, em vez de uma
+/// recompilação pra descobrir como o método se chama de verdade.
+pub unsafe fn list_functions(cls0: *mut c_void, filter: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cls = cls0;
+    let mut guard = 0;
+    while !cls.is_null() && guard < 64 {
+        guard += 1;
+        if !crate::gum::is_readable(cls as *const c_void, 0x60) {
+            break;
+        }
+        let clsb = cls as *const u8;
+        for off in [0x48usize, 0x58usize] {
+            let fp = rd_ptr(clsb.add(off)) as *const u8;
+            let n = rd_u32(clsb.add(off + 8));
+            if fp.is_null() || n >= 20_000 || !crate::gum::is_readable(fp as *const c_void, 8) {
+                continue;
+            }
+            for i in 0..n as usize {
+                let slot = fp.add(i * 8);
+                if !crate::gum::is_readable(slot as *const c_void, 8) {
+                    break;
+                }
+                let f = rd_ptr(slot) as *const u8;
+                if f.is_null() || !crate::gum::is_readable(f as *const c_void, 0x20) {
+                    continue;
+                }
+                let nm = crate::cname::resolve_cname(rd_u64(f.add(0x10)));
+                if filter.is_empty() || nm.to_lowercase().contains(&filter.to_lowercase()) {
+                    out.push(format!("{}{nm}", if off == 0x58 { "static " } else { "" }));
+                }
+            }
+        }
+        cls = rd_ptr(clsb.add(0x10));
+    }
+    out
+}
+
 pub unsafe fn resolve_func(reg: &Registry, class_name: &str, method: &str) -> Option<ResolvedFn> {
     resolve_in_class(reg.class_by_name(class_name), method)
 }

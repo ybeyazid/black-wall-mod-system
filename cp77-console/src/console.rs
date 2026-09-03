@@ -663,7 +663,12 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
     if on {
         stat_mod(reg, captured_player, "OpticalCamoIsActive", 1.0, StatTarget::Player, "cloak")
     } else {
-        stat_unmod(reg, captured_player, "OpticalCamoIsActive", "cloak")
+        // Desligar remove TAMBÉM o `BaseStatusEffect.Cloaked` da tentativa anterior: aquele
+        // efeito entrou de verdade no jogador e foi junto pro SAVE, deixando o personagem
+        // invisível ao carregar. Trocar de mecanismo não pode deixar o estado antigo preso.
+        let se = status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", false, "cloak");
+        let st = stat_unmod(reg, captured_player, "OpticalCamoIsActive", "cloak");
+        se || st
     }
 }
 
@@ -692,22 +697,27 @@ pub enum StatTarget {
 /// Arma ativa do jogador. Estático `GetActiveWeapon(GameObject)` — a assinatura está no bundle
 /// de redscript deste build. A classe dona não está no bundle, então tenta as candidatas e loga
 /// qual resolveu, em vez de fixar um palpite.
-unsafe fn active_weapon(reg: &Registry, owner: *mut c_void) -> *mut c_void {
-    for cls in ["GameObject", "gameObject", "RPGManager", "gameRPGManager", "WeaponObject", "gameweaponObject"] {
-        if let Some(f) = rtti::resolve_func(reg, cls, "GetActiveWeapon") {
-            let w = if f.is_static {
-                rtti::call_ptr(&f, std::ptr::null_mut(), &[Arg::Handle(owner, refcnt())])
-            } else {
-                rtti::call_ptr(&f, owner, &[])
-            };
-            if rtti::sane(w) {
-                crate::log(&format!("[stat] arma ativa via {cls}.GetActiveWeapon = {w:p}"));
-                return w;
-            }
-        }
+unsafe fn active_weapon(reg: &Registry, owner: *mut c_void) -> Option<*mut c_void> {
+    // Nomes: o curto (caso seja nativa) e os MANGLED do bundle de redscript deste build —
+    // `GetActiveWeapon;GameObject` (estático, recebe o dono) e `GetActiveWeapon;` (sem args).
+    let f = rtti::resolve_any_name(
+        reg,
+        &["GameObject", "gameObject", "RPGManager", "gameRPGManager", "PlayerPuppet",
+          "gamePuppet", "ScriptedPuppet", "gameScriptedPuppet", "WeaponObject", "gameweaponObject"],
+        &["GetActiveWeapon;GameObject", "GetActiveWeapon;", "GetActiveWeapon"],
+        "stat",
+    )?;
+    let w = if f.is_static {
+        rtti::call_ptr(&f, std::ptr::null_mut(), &[Arg::Handle(owner, refcnt())])
+    } else {
+        rtti::call_ptr(&f, owner, &[])
+    };
+    if rtti::sane(w) {
+        crate::log(&format!("[stat] arma ativa = {w:p}"));
+        return Some(w);
     }
-    crate::log("[stat] GetActiveWeapon não resolveu em nenhuma classe candidata");
-    std::ptr::null_mut()
+    crate::log("[stat] GetActiveWeapon resolveu mas devolveu nada (arma na mão?)");
+    None
 }
 
 /// Lê um stat do alvo. É a MEDIÇÃO que diz se o modificador pegou — sem ela, "apliquei" é
@@ -718,7 +728,12 @@ unsafe fn stat_value(
     target: [u8; 16],
     stype: u64,
 ) -> Option<f32> {
-    let f = rtti::resolve_any(reg, &["gameStatsSystem"], "GetStatValue")?;
+    let f = rtti::resolve_any_name(
+        reg,
+        &["gameStatsSystem"],
+        &["GetStatValue", "GetStatValue;GameObjectStatsObjectIDgamedataStatType", "GetStatValue;GameObjectgamedataStatType"],
+        "stat",
+    )?;
     let r = rtti::call_func(&f, sts, &[Arg::Raw(target), Arg::Enum(stype)])?;
     Some(f32::from_le_bytes([r[0], r[1], r[2], r[3]]))
 }
@@ -754,13 +769,10 @@ pub unsafe fn stat_mod(
     }
     let obj = match target {
         StatTarget::Player => owner,
-        StatTarget::Weapon => {
-            let w = active_weapon(reg, owner);
-            if !rtti::sane(w) {
-                return false;
-            }
-            w
-        }
+        StatTarget::Weapon => match active_weapon(reg, owner) {
+            Some(w) => w,
+            None => return false,
+        },
     };
     let tid = match entity_id(reg, obj) {
         Some(b) => b,
@@ -785,12 +797,14 @@ pub unsafe fn stat_mod(
             return false;
         }
     };
-    let cm = match rtti::resolve_any(reg, &["RPGManager", "gameRPGManager"], "CreateStatModifier") {
+    let cm = match rtti::resolve_any_name(
+        reg,
+        &["RPGManager", "gameRPGManager"],
+        &["CreateStatModifier;gamedataStatTypegameStatModifierTypeFloat", "CreateStatModifier"],
+        tag,
+    ) {
         Some(f) => f,
-        None => {
-            crate::log(&format!("[{tag}] CreateStatModifier não resolveu"));
-            return false;
-        }
+        None => return false,
     };
     // Devolve um `ref<gameStatModifierData>` = handle de 16B {ponteiro, refcount}.
     let m = match rtti::call_func(&cm, std::ptr::null_mut(), &[Arg::Enum(stype), Arg::Enum(mtype), Arg::F32(value)]) {
@@ -804,12 +818,9 @@ pub unsafe fn stat_mod(
         crate::log(&format!("[{tag}] CreateStatModifier devolveu handle nulo"));
         return false;
     }
-    let add = match rtti::resolve_any(reg, &["gameStatsSystem"], "AddModifier") {
+    let add = match rtti::resolve_any_name(reg, &["gameStatsSystem"], &["AddModifier", "AddModifier;"], tag) {
         Some(f) => f,
-        None => {
-            crate::log(&format!("[{tag}] AddModifier não resolveu"));
-            return false;
-        }
+        None => return false,
     };
     let np = rtti::param_count(&add) as usize;
     rtti::call_func(&add, sts, &[Arg::Raw(tid), Arg::Raw(m)]);
@@ -849,12 +860,9 @@ pub unsafe fn stat_unmod(reg: &Registry, captured_player: *mut c_void, stat: &st
         crate::log(&format!("[{tag}] StatsSystem inacessível"));
         return false;
     }
-    let rm = match rtti::resolve_any(reg, &["gameStatsSystem"], "RemoveModifier") {
+    let rm = match rtti::resolve_any_name(reg, &["gameStatsSystem"], &["RemoveModifier", "RemoveModifier;"], tag) {
         Some(f) => f,
-        None => {
-            crate::log(&format!("[{tag}] RemoveModifier não resolveu"));
-            return false;
-        }
+        None => return false,
     };
     let mut guard = applied().lock().unwrap();
     let mut n = 0;
@@ -889,7 +897,7 @@ pub unsafe fn stat_read(
     }
     let obj = match target {
         StatTarget::Player => owner,
-        StatTarget::Weapon => active_weapon(reg, owner),
+        StatTarget::Weapon => active_weapon(reg, owner).unwrap_or(std::ptr::null_mut()),
     };
     if !rtti::sane(obj) {
         return false;

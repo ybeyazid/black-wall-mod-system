@@ -401,9 +401,9 @@ pub(crate) fn log(msg: &str) {
     // aba Console mesmo no build público, onde o resto desta função é no-op. Sem isto, um cheat
     // que não funciona não tem NENHUM sinal na tela — foi exatamente o que aconteceu com o
     // `cloak`: o comando dizia "ON" e o motivo real ficava num log que só existe em build dev.
-    const USER_FACING: [&str; 12] = [
+    const USER_FACING: [&str; 13] = [
         "[console]", "[cloak]", "[ammo]", "[ram]", "[god]", "[heal]", "[give]", "[sig]",
-        "[level]", "[build]", "[se]", "[stat]",
+        "[level]", "[build]", "[se]", "[stat]", "[funcs]",
     ];
     if USER_FACING.iter().any(|p| msg.starts_with(p)) {
         crate::overlay::console_out(msg);
@@ -8973,6 +8973,11 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
                 return;
             }
+            // `funcs <Classe> [filtro]`: lista os nomes REAIS das funções de uma classe na
+            // RTTI. Existe porque "não resolveu" custava uma recompilação pra descobrir como o
+            // método se chama — as funções de redscript entram com a assinatura colada no nome.
+            ["funcs", class] | ["funcs", class, ""] => { list_class_funcs(reg, class, ""); return; }
+            ["funcs", class, filter] => { list_class_funcs(reg, class, filter); return; }
             // `stat`/`statw <Nome> [valor]`: modificador de stat no JOGADOR ou na ARMA ativa,
             // com leitura antes/depois. É o mecanismo por trás de `cloak` e `ammo` — exposto
             // cru pra testar um stat candidato sem recompilar.
@@ -9390,5 +9395,29 @@ mod null_vtable_guard_tests {
     #[test]
     fn struct_puro_com_primeira_word_nao_zerada_tambem_nao_e_anomalia() {
         assert!(!null_vtable_is_anomalous(false, 0x3f80_0000));
+    }
+}
+
+
+/// Imprime no console os nomes das funções de uma classe (filtro opcional por substring).
+/// Suporte de `funcs <Classe> [filtro]`; corta em 60 linhas pra não afogar o buffer.
+fn list_class_funcs(reg: &crate::rtti::Registry, class: &str, filter: &str) {
+    unsafe {
+        let cls = reg.class_by_name(class);
+        if cls.is_null() {
+            log(&format!("[funcs] classe '{class}' não existe na RTTI"));
+            return;
+        }
+        let mut v = crate::rtti::list_functions(cls, filter);
+        v.sort();
+        v.dedup();
+        log(&format!("[funcs] {class}: {} função(ões){}", v.len(),
+            if filter.is_empty() { String::new() } else { format!(" com '{filter}'") }));
+        for n in v.iter().take(60) {
+            log(&format!("[funcs]   {n}"));
+        }
+        if v.len() > 60 {
+            log(&format!("[funcs]   ... e mais {} (use um filtro)", v.len() - 60));
+        }
     }
 }
