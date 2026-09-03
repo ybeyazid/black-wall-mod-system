@@ -1019,7 +1019,10 @@ pub(crate) fn ram_infinite() -> bool {
 /// jogo), mas a RESERVA continua caindo, porque é dela que a recarga puxa. O jogo não expõe "não
 /// consumir", então o que o jogador percebe como munição infinita é a reserva reposta no tick.
 static AMMO_INFINITE: AtomicBool = AtomicBool::new(false);
-const AMMO_EVERY_TICKS: u64 = 30;
+/// A cada ~2s a 60fps. O custo real deste caminho não é a matemática, é o `GiveItem`: cada um
+/// levanta os eventos de inventário do jogo. Quatro por disparo a cada meio segundo era gasto sem
+/// retorno — a reserva não cai nem perto dessa velocidade.
+const AMMO_EVERY_TICKS: u64 = 120;
 pub(crate) fn set_ammo_infinite(on: bool) {
     AMMO_INFINITE.store(on, Ordering::Relaxed);
 }

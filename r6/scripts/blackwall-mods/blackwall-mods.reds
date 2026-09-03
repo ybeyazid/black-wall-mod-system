@@ -34,6 +34,10 @@ public class BwmsCheatTick extends DelayCallback {
 
 // Reagenda enquanto algum cheat continuo estiver ligado. `m_bwTicking` evita dois tickers
 // vivos ao mesmo tempo se o jogador ligar RAM e Municao em seguida.
+//
+// 2 segundos, nao um: o custo aqui nao e a conta, e o `GiveItem` — cada um levanta os eventos de
+// inventario do jogo. Nem a RAM nem a reserva de municao caem rapido o bastante pra justificar
+// mais que isso.
 @addMethod(PlayerPuppet)
 public func BWMSCheatSchedule() -> Void {
   if this.m_bwTicking { return; };
@@ -41,7 +45,7 @@ public func BWMSCheatSchedule() -> Void {
   this.m_bwTicking = true;
   let cb: ref<BwmsCheatTick> = new BwmsCheatTick();
   cb.Player = this;
-  GameInstance.GetDelaySystem(this.GetGame()).DelayCallback(cb, 1.00, false);
+  GameInstance.GetDelaySystem(this.GetGame()).DelayCallback(cb, 2.00, false);
 }
 
 @addMethod(PlayerPuppet)

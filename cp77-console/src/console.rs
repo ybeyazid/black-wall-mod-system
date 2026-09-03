@@ -150,9 +150,20 @@ unsafe fn give_quiet(reg: &Registry, captured_player: *mut c_void, tx: *mut c_vo
         }
     };
     let owner = auth_or(reg, captured_player);
-    let gi = match rtti::resolve_func(reg, "gameTransactionSystem", "GiveItem") {
-        Some(g) => g,
-        None => return,
+    // `resolve_func` varre a tabela de funções da classe e a cadeia de pais A CADA chamada. No
+    // caminho do tick isso se repetiria quatro vezes por disparo sem nunca mudar de resposta.
+    static GIVE: std::sync::OnceLock<(usize, usize, bool)> = std::sync::OnceLock::new();
+    let cached = GIVE.get_or_init(|| match rtti::resolve_func(reg, "gameTransactionSystem", "GiveItem") {
+        Some(g) => (g.func as usize, g.ret_type as usize, g.is_static),
+        None => (0, 0, false),
+    });
+    if cached.0 == 0 {
+        return;
+    }
+    let gi = rtti::ResolvedFn {
+        func: cached.0 as *mut c_void,
+        ret_type: cached.1 as *mut c_void,
+        is_static: cached.2,
     };
     rtti::call_func(&gi, tx, &[Arg::Handle(owner, refcnt()), Arg::Item16(item), Arg::I32(qty)]);
 }
@@ -946,7 +957,9 @@ pub unsafe fn stat_mod_ex(
             return false;
         }
     };
-    let before = stat_value(reg, sts, tid, stype);
+    // As duas leituras do stat são a MEDIÇÃO, não a ação: no caminho do tick elas seriam duas
+    // chamadas RTTI por segundo sem ninguém pra ler o resultado.
+    let before = if verbose { stat_value(reg, sts, tid, stype) } else { None };
     // `Additive` soma ao valor base; pra um stat booleano (0/1) é o que liga.
     let mtype = match rtti::resolve_enum_value(reg, "gameStatModifierType", "Additive") {
         Some(v) => v,
@@ -986,11 +999,11 @@ pub unsafe fn stat_mod_ex(
     // "off" possível seria empilhar um modificador negativo por cima — que zera o valor mas
     // deixa lixo acumulado no alvo a cada liga/desliga.
     applied().lock().unwrap().push((stat.to_string(), tid, m));
+    if !verbose {
+        return true;
+    }
     let after = stat_value(reg, sts, tid, stype);
     let moved = matches!((before, after), (Some(a), Some(b)) if (b - a).abs() > 0.0001);
-    if !verbose {
-        return moved;
-    }
     crate::log(&format!(
         "[{tag}] {stat} {} {:?} -> {:?} (AddModifier params={np}) | jogo confirma: {}",
         if matches!(target, StatTarget::Weapon) { "na ARMA:" } else { "no JOGADOR:" },
