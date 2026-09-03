@@ -61,14 +61,27 @@ public func BWMSCheatTick() -> Void {
   // Municao: o pente grande mata a recarga, mas a RESERVA continua caindo porque e dela que a
   // recarga puxa. Repor a reserva e a outra metade — sem ela o cheat parece nao funcionar.
   if this.m_bwAmmoOn {
-    let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(game);
-    ts.GiveItem(this, ItemID.FromTDBID(t"Ammo.HandgunAmmo"), 200);
-    ts.GiveItem(this, ItemID.FromTDBID(t"Ammo.RifleAmmo"), 200);
-    ts.GiveItem(this, ItemID.FromTDBID(t"Ammo.ShotgunAmmo"), 200);
-    ts.GiveItem(this, ItemID.FromTDBID(t"Ammo.SniperRifleAmmo"), 200);
+    this.BWMSTopUpAmmo(t"Ammo.HandgunAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.RifleAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.ShotgunAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.SniperRifleAmmo");
     this.BWMSApplyMagazine();
   };
   this.BWMSCheatSchedule();
+}
+
+// So repoe o que FALTA. Dar municao de dois em dois segundos sem olhar quanto ja existe enche a
+// tela de "ALINDI: ..." — cada GiveItem levanta a notificacao de item recebido do jogo, mesmo
+// quando a reserva ja esta cheia. Perguntar a quantidade antes custa uma chamada e cala o resto.
+@addMethod(PlayerPuppet)
+public func BWMSTopUpAmmo(ammo: TweakDBID) -> Void {
+  let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(this.GetGame());
+  let id: ItemID = ItemID.FromTDBID(ammo);
+  // Limiar alto e reposicao grande de proposito: assim a notificacao aparece raramente, e quando
+  // aparece corresponde a municao de verdade gasta.
+  if ts.GetItemQuantity(this, id) < 100 {
+    ts.GiveItem(this, id, 500);
+  };
 }
 
 // O modificador vive na ARMA, entao trocar de arma o deixaria para tras. Remover e reaplicar a
@@ -169,8 +182,9 @@ private func PopulateMenuItemList() -> Void {
 private final func BWHasGodMode() -> Bool {
   let owner: ref<GameObject> = this.GetPlayerControlledObject();
   if !IsDefined(owner) { return false; };
-  return GameInstance.GetGodModeSystem(owner.GetGame())
-    .HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable);
+  let sys: ref<GodModeSystem> = GameInstance.GetGodModeSystem(owner.GetGame());
+  return sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable)
+      || sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Immortal);
 }
 
 @addMethod(PauseMenuGameController)
@@ -228,11 +242,21 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
   if Equals(data.eventName, n"BWModsGod") {
     this.PlaySound(n"Button", n"OnPress");
     if IsDefined(owner) {
+      // Os DOIS tipos, nao so um: `Invulnerable` e "nao toma dano" e `Immortal` e "nao morre".
+      // Ligar so um deixa um buraco de semantica — e era o unico ligado aqui.
       let sys: ref<GodModeSystem> = GameInstance.GetGodModeSystem(owner.GetGame());
-      if sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable) {
-        sys.RemoveGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable, n"BlackwallMods");
+      let id: EntityID = owner.GetEntityID();
+      if this.BWHasGodMode() {
+        sys.RemoveGodMode(id, gameGodModeType.Invulnerable, n"BlackwallMods");
+        sys.RemoveGodMode(id, gameGodModeType.Immortal, n"BlackwallMods");
       } else {
-        sys.AddGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable, n"BlackwallMods");
+        sys.AddGodMode(id, gameGodModeType.Invulnerable, n"BlackwallMods");
+        sys.AddGodMode(id, gameGodModeType.Immortal, n"BlackwallMods");
+        // O God Mode nao repoe o que ja foi perdido: sem isto, ligar com pouca vida deixa o
+        // jogador ligado e quase morto, o que se parece com "nao funcionou".
+        GameInstance.GetStatPoolsSystem(owner.GetGame())
+          .RequestSettingStatPoolValue(Cast<StatsObjectID>(id),
+                                       gamedataStatPoolType.Health, 100.00, owner, true);
       };
     };
     this.BWShowModsPage(); return true;

@@ -375,8 +375,11 @@ pub unsafe fn godmode(reg: &Registry, captured_player: *mut c_void, on: bool) ->
             return false;
         }
     };
-    // Invulnerable primeiro (dano zero); Immortal/Default como fallback.
-    for mem in ["Invulnerable", "Immortal", "Default"] {
+    // Os DOIS tipos, não o primeiro que resolver: `Invulnerable` é "não toma dano" e `Immortal`
+    // é "não morre". Parar no primeiro deixava um buraco de semântica — e, se o primeiro fosse o
+    // membro errado, o comando dizia ON tendo mandado outra coisa.
+    let mut sent = 0;
+    for mem in ["Invulnerable", "Immortal"] {
         if let Some(ev) = rtti::resolve_enum_value(reg, "gameGodModeType", mem) {
             crate::log(&format!("[god] {fname}({mem}={ev})"));
             rtti::call_func(
@@ -384,12 +387,24 @@ pub unsafe fn godmode(reg: &Registry, captured_player: *mut c_void, on: bool) ->
                 sys,
                 &[Arg::Raw(eid), Arg::Enum(ev), Arg::CName(cname("Console"))],
             );
-            crate::log(&format!("[god] godmode {} ({mem}) enviado", if on { "ON" } else { "OFF" }));
-            return true;
+            sent += 1;
         }
     }
-    crate::log("[god] nenhum membro de gameGodModeType resolveu");
-    false
+    if sent == 0 {
+        crate::log("[god] nenhum membro de gameGodModeType resolveu");
+        return false;
+    }
+    // O jogo responde: `HasGodMode` é a mesma leitura que o menu ESC usa pro rótulo.
+    crate::log(&format!(
+        "[god] {} enviado ({sent} tipo(s)) — jogo confirma: {}",
+        if on { "ON" } else { "OFF" },
+        match hasgod(reg, captured_player) {
+            Some(true) => "SIM",
+            Some(false) => "nao",
+            None => "?(HasGodMode não resolveu)",
+        }
+    ));
+    true
 }
 
 /// `redscript-cheat-effects-proof` (2026-07-13) — checagem READ-ONLY de `HasGodMode` (mesma
@@ -827,11 +842,27 @@ pub const AMMO_TYPES: [&str; 4] = [
     "Ammo.SniperRifleAmmo",
 ];
 
+/// Quantidade de um item no inventário do jogador. `None` se não deu pra perguntar — e aí o
+/// chamador repõe assim mesmo: é melhor uma notificação a mais do que um cheat que não repõe.
+unsafe fn item_quantity(reg: &Registry, captured_player: *mut c_void, tx: *mut c_void, name: &str) -> Option<i32> {
+    let f = rtti::resolve_any_name(reg, &["gameTransactionSystem"], &["GetItemQuantity"], "ammo")?;
+    let item = rtti::from_tdbid(reg, name)?;
+    let owner = auth_or(reg, captured_player);
+    let r = rtti::call_func(&f, tx, &[Arg::Handle(owner, refcnt()), Arg::Item16(item)])?;
+    Some(i32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+}
+
 /// Repõe a reserva de munição. Chamada do tick enquanto `ammo on` está ligado. Silenciosa de
 /// propósito: uma linha de log por tipo a cada tick afogaria o console em segundos.
 pub unsafe fn refill_ammo(reg: &Registry, player: *mut c_void, tx: *mut c_void) {
     for a in AMMO_TYPES {
-        give_quiet(reg, player, tx, a, 200);
+        // Só repõe o que FALTA. Dar munição a cada tick sem olhar quanto já existe enche a tela
+        // de "picked up ..." — cada GiveItem levanta a notificação de item recebido do jogo,
+        // mesmo com a reserva cheia. Perguntar a quantidade antes cala isso.
+        match item_quantity(reg, player, tx, a) {
+            Some(q) if q >= 100 => continue,
+            _ => give_quiet(reg, player, tx, a, 500),
+        }
     }
     // O modificador de pente vive na ARMA, então trocar de arma o deixaria pra trás e o cheat
     // pareceria ter desligado sozinho. Remover e reaplicar na arma ATUAL é mais simples do que

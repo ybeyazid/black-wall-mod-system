@@ -8997,6 +8997,22 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
                 return;
             }
+            // `enumv <Enum>`: membros + VALORES. Um valor errado vira uma chamada silenciosa
+            // que não faz nada — foi exatamente a suspeita sobre `gameGodModeType`.
+            ["enumv", name] => {
+                unsafe {
+                    let v = crate::rtti::list_enum(reg, name);
+                    if v.is_empty() {
+                        log(&format!("[funcs] enum '{name}' não existe ou está vazio"));
+                    } else {
+                        log(&format!("[funcs] {name}: {} membro(s)", v.len()));
+                        for (n, val) in v.iter().take(40) {
+                            log(&format!("[funcs]   {n} = {val}"));
+                        }
+                    }
+                }
+                return;
+            }
             // `findfunc <filtro>`: procura no registro GLOBAL de funções. Par de `funcs`, que
             // olha dentro de uma classe — juntos cobrem os dois lugares onde um método pode estar.
             ["findfunc", filter] => { list_global_funcs(reg, filter); return; }

@@ -1736,6 +1736,27 @@ pub unsafe fn resolve_enum_value(reg: &Registry, enum_type: &str, member: &str) 
     None
 }
 
+/// Lista os membros de um enum com os VALORES. Par de `funcs`/`findfunc` pro lado dos enums:
+/// `AddGodMode(Invulnerable=0)` no log é uma afirmação que ninguém conferiu, e um valor errado
+/// aqui manda "None" pro jogo e o cheat não faz nada — sem erro nenhum.
+pub unsafe fn list_enum(reg: &Registry, enum_type: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let en = reg.enum_by_name(enum_type) as *const u8;
+    if en.is_null() {
+        return out;
+    }
+    let hp = rd_ptr(en.add(0x28)) as *const u8;
+    let n = rd_u32(en.add(0x30));
+    let vp = rd_ptr(en.add(0x38)) as *const u8;
+    if hp.is_null() || vp.is_null() || n > 100_000 {
+        return out;
+    }
+    for i in 0..n as usize {
+        out.push((crate::cname::resolve_cname(rd_u64(hp.add(i * 8))), rd_u64(vp.add(i * 8))));
+    }
+    out
+}
+
 pub struct ResolvedFn {
     pub func: *mut c_void,
     pub ret_type: *mut c_void,
