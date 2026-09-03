@@ -655,6 +655,50 @@ unsafe fn has_effect(
     Some(r[0] != 0)
 }
 
+/// Aplica/remove um efeito com UMA chamada (assinatura completa) e uma linha de log.
+///
+/// `status_effect` tenta três formas e mede com `HasStatusEffect`, o que é certo pra INVESTIGAR.
+/// Pra os efeitos instantâneos isso é ruído: eles rodam a lógica e não deixam camada, então
+/// `has` responde `nao` mesmo tendo funcionado — foi medido em jogo (`BlockTargetingPlayer`,
+/// `DontShootAtMe`, `SetFriendly` deram `has=nao` e os NPCs pararam de atacar). Aqui a chamada é
+/// uma só e o log diz o que foi ENVIADO, sem afirmar um resultado que esta leitura não sustenta.
+unsafe fn effect_once(reg: &Registry, captured_player: *mut c_void, effect: &str, on: bool, tag: &str) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let ses = system_flex(reg, owner, gi, "gameStatusEffectSystem", "GetStatusEffectSystem");
+    let eid = match entity_id(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    if !rtti::sane(ses) {
+        return false;
+    }
+    let fname = if on { "ApplyStatusEffect" } else { "RemoveStatusEffect" };
+    let f = match rtti::resolve_any(reg, &["gameStatusEffectSystem"], fname) {
+        Some(g) => g,
+        None => return false,
+    };
+    let tdbid = crate::cname::tweak_db_id(effect).to_le_bytes();
+    let np = rtti::param_count(&f) as usize;
+    let mut v: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
+    for i in v.len()..np {
+        let ty = crate::cname::resolve_cname(rtti::fn_param_type(f.func, i));
+        v.push(match ty.as_str() {
+            "TweakDBID" => Arg::Tdb([0u8; 8]),
+            "Bool" => Arg::Bool(false),
+            "Uint32" => Arg::I32(1),
+            "Int32" => Arg::I32(0),
+            _ => Arg::Raw([0u8; 16]),
+        });
+    }
+    let ok = rtti::call_func(&f, ses, &v).is_some();
+    crate::log(&format!("[{tag}] {} {effect}", if on { "aplicado:" } else { "removido:" }));
+    ok
+}
+
 /// `se <record> [on|off]` do console: aplica/remove QUALQUER status effect por nome. Existe pra
 /// que testar um candidato não custe recompilar e reiniciar o jogo — o ciclo caro aqui.
 pub unsafe fn status_effect_named(
@@ -698,32 +742,46 @@ pub unsafe fn status_effect_query(
     true
 }
 
-/// "NPCs não te veem": a camuflagem óptica do jogo, pelo stat `OpticalCamoIsActive` do JOGADOR.
+/// "Os NPCs te deixam em paz": três records de comportamento + o stat de visibilidade.
 ///
-/// `BaseStatusEffect.Cloaked` foi abandonado com medição, não por palpite: `HasStatusEffect`
-/// confirmou que ele ENTRA no jogador (`has=SIM`) e mesmo assim os NPCs continuavam vendo — é o
-/// efeito do lado deles (Oda/Maxtac), não do jogador. O que o jogo usa no jogador é a família de
-/// stats `OpticalCamo*` (`IsActive`, `Charges`, `Duration`...), toda confirmada neste build.
+/// Limite honesto, porque o nome do comando promete mais: isto NÃO é invisibilidade. Os NPCs
+/// continuam ENXERGANDO o jogador; o que muda é que param de atacar (a polícia desce do carro e
+/// fica parada).
+///
+/// Vale registrar o que NÃO funciona, pra ninguém repetir o caminho: `BaseStatusEffect.Cloaked`
+/// entra no jogador (`HasStatusEffect` responde SIM) e a percepção não muda — é o efeito do lado
+/// dos NPCs (Oda/MaxTac). `OpticalCamoIsActive` aceita a escrita (0 -> 1 confirmado pelo jogo) e
+/// não liga nada: o jogo LÊ esse stat, não obedece a ele. `VisibilityReduction` idem.
 pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
+    // Os três records vêm de MEDIÇÃO em jogo, não de leitura de nome: com eles aplicados os NPCs
+    // continuam enxergando o jogador mas param de atacar, e a polícia desce do carro e fica
+    // parada. `Visibility` entra junto porque é o stat de que o jogo monta a detecção.
+    //
+    // O que NÃO entra, e por quê: `BaseStatusEffect.Cloaked` (entra no jogador, `has=SIM`, e não
+    // muda percepção — é o efeito do lado dos NPCs, Oda/MaxTac) e `OpticalCamoIsActive` (aceita a
+    // escrita, 0 -> 1 confirmado pelo jogo, e não liga nada — é um stat que o jogo LÊ).
+    const RECORDS: [&str; 3] = [
+        "BaseStatusEffect.BlockTargetingPlayer",
+        "BaseStatusEffect.DontShootAtMe",
+        "BaseStatusEffect.SetFriendly",
+    ];
     if on {
-        stat_mod(reg, captured_player, "OpticalCamoIsActive", 1.0, StatTarget::Player, "cloak")
-    } else {
-        // Desligar remove TAMBÉM o `BaseStatusEffect.Cloaked` da tentativa anterior: aquele
-        // efeito entrou de verdade no jogador e foi junto pro SAVE, deixando o personagem
-        // invisível ao carregar. Trocar de mecanismo não pode deixar o estado antigo preso.
-        let mut se = status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", false, "cloak");
-        // Se a remoção não vencer, o jogo tem records feitos pra ISTO: `Cloaked_Exit` (a saída da
-        // camuflagem) e `ForceVisibility` (forçar visibilidade). Aplicá-los é o caminho do próprio
-        // jogo pra devolver o personagem, em vez de insistir num Remove que já se mostrou insuficiente.
-        if !se {
-            for rec in ["BaseStatusEffect.Cloaked_Exit", "BaseStatusEffect.ForceVisibility"] {
-                if status_effect(reg, captured_player, rec, true, "cloak") {
-                    se = true;
-                }
-            }
+        for r in RECORDS {
+            effect_once(reg, captured_player, r, true, "cloak");
         }
-        let st = stat_unmod(reg, captured_player, "OpticalCamoIsActive", "cloak");
-        se || st
+        stat_mod(reg, captured_player, "Visibility", -1000.0, StatTarget::Player, "cloak");
+        crate::log("[cloak] ON (NPCs param de atacar; ainda podem ENXERGAR você)");
+        true
+    } else {
+        for r in RECORDS {
+            effect_once(reg, captured_player, r, false, "cloak");
+        }
+        stat_unmod(reg, captured_player, "Visibility", "cloak");
+        // Herança: o `BaseStatusEffect.Cloaked` das tentativas anteriores entra de verdade e vai
+        // pro SAVE junto, deixando o personagem invisível ao carregar. Desligar tem que limpá-lo.
+        status_effect(reg, captured_player, "BaseStatusEffect.Cloaked", false, "cloak");
+        crate::log("[cloak] OFF");
+        true
     }
 }
 
