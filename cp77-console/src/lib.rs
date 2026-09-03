@@ -1014,6 +1014,18 @@ pub(crate) fn set_ram_infinite(on: bool) {
 pub(crate) fn ram_infinite() -> bool {
     RAM_INFINITE.load(Ordering::Relaxed)
 }
+
+/// Munição infinita: mesma forma da RAM. `MagazineCapacity` na arma já mata a recarga (medido em
+/// jogo), mas a RESERVA continua caindo, porque é dela que a recarga puxa. O jogo não expõe "não
+/// consumir", então o que o jogador percebe como munição infinita é a reserva reposta no tick.
+static AMMO_INFINITE: AtomicBool = AtomicBool::new(false);
+const AMMO_EVERY_TICKS: u64 = 30;
+pub(crate) fn set_ammo_infinite(on: bool) {
+    AMMO_INFINITE.store(on, Ordering::Relaxed);
+}
+pub(crate) fn ammo_infinite() -> bool {
+    AMMO_INFINITE.load(Ordering::Relaxed)
+}
 static CURRENT_TX: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 pub(crate) fn registry() -> Option<&'static rtti::Registry> {
@@ -1367,6 +1379,15 @@ pub extern "C" fn cp77_tick() {
         let p = current_player();
         if !p.is_null() {
             unsafe { crate::console::ram(reg, p) };
+        }
+    }
+    // Munição infinita (comando `ammo on`): repõe a reserva. Precisa do tx (transaction system)
+    // além do player, então só roda quando os dois estão publicados.
+    if ammo_infinite() && ticks() % AMMO_EVERY_TICKS == 0 {
+        let p = current_player();
+        let tx = current_tx();
+        if !p.is_null() && !tx.is_null() {
+            unsafe { crate::console::refill_ammo(reg, p, tx) };
         }
     }
     // TweakDB runtime: dump observe-only do singleton (gated ~/.bwms-tdbdump) p/ confirmar

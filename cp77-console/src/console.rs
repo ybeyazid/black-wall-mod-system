@@ -129,6 +129,34 @@ pub unsafe fn give(
     r
 }
 
+/// `give` sem log e com o `gameItemID` em cache. Existe pro caminho do TICK: `give` loga cinco
+/// linhas por chamada, o que afogaria o console em segundos, e `from_tdbid` é uma chamada RTTI
+/// que não precisa se repetir — o ItemID de um nome não muda durante a sessão.
+unsafe fn give_quiet(reg: &Registry, captured_player: *mut c_void, tx: *mut c_void, name: &str, qty: u32) {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<(String, [u8; 16])>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let item = {
+        let mut g = cache.lock().unwrap();
+        match g.iter().find(|(n, _)| n == name) {
+            Some((_, it)) => *it,
+            None => match rtti::from_tdbid(reg, name) {
+                Some(it) => {
+                    g.push((name.to_string(), it));
+                    it
+                }
+                None => return,
+            },
+        }
+    };
+    let owner = auth_or(reg, captured_player);
+    let gi = match rtti::resolve_func(reg, "gameTransactionSystem", "GiveItem") {
+        Some(g) => g,
+        None => return,
+    };
+    rtti::call_func(&gi, tx, &[Arg::Handle(owner, refcnt()), Arg::Item16(item), Arg::I32(qty)]);
+}
+
 /// Sistema scriptável pela via da VM: `GameInstance.GetScriptableSystemsContainer(gi).Get(CName)`.
 unsafe fn scriptable_system(
     reg: &Registry,
@@ -707,9 +735,34 @@ pub unsafe fn cloak(reg: &Registry, captured_player: *mut c_void, on: bool) -> b
 /// silêncio. Era isso que fazia o comando dizer ON e a munição continuar caindo.
 pub unsafe fn infinite_ammo(reg: &Registry, captured_player: *mut c_void, on: bool) -> bool {
     if on {
-        stat_mod(reg, captured_player, "MagazineAutoRefill", 1.0, StatTarget::Weapon, "ammo")
+        // MEDIDO em jogo: `MagazineCapacity` na arma resolve a recarga (o pente passa a durar
+        // centenas de tiros). `MagazineAutoRefill` foi aplicado e confirmado pelo jogo (0 -> 1) e
+        // mesmo assim não mudou nada — é um stat que o jogo LÊ, não um que aceita ordem.
+        let mag = stat_mod(reg, captured_player, "MagazineCapacity", 999.0, StatTarget::Weapon, "ammo");
+        // A reserva continua caindo, porque recarregar puxa dela. Repor a munição é o mesmo
+        // desenho já provado da RAM infinita: o jogo não expõe "custo zero", então o que o
+        // jogador percebe como munição que não acaba é a reserva sendo enchida de volta.
+        crate::set_ammo_infinite(true);
+        mag
     } else {
-        stat_unmod(reg, captured_player, "MagazineAutoRefill", "ammo")
+        crate::set_ammo_infinite(false);
+        stat_unmod(reg, captured_player, "MagazineCapacity", "ammo")
+    }
+}
+
+/// Tipos de munição deste build — os quatro confirmados na tabela de records.
+pub const AMMO_TYPES: [&str; 4] = [
+    "Ammo.HandgunAmmo",
+    "Ammo.RifleAmmo",
+    "Ammo.ShotgunAmmo",
+    "Ammo.SniperRifleAmmo",
+];
+
+/// Repõe a reserva de munição. Chamada do tick enquanto `ammo on` está ligado. Silenciosa de
+/// propósito: uma linha de log por tipo a cada tick afogaria o console em segundos.
+pub unsafe fn refill_ammo(reg: &Registry, player: *mut c_void, tx: *mut c_void) {
+    for a in AMMO_TYPES {
+        give_quiet(reg, player, tx, a, 200);
     }
 }
 
