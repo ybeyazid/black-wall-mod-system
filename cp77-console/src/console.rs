@@ -519,26 +519,32 @@ pub unsafe fn status_effect(
         }
     };
     let tdbid = crate::cname::tweak_db_id(effect).to_le_bytes();
-    let np = rtti::param_count(&f);
+    let np = rtti::param_count(&f) as usize;
+    // O tipo de RETORNO importa pra leitura do resultado: se for Void, o `01` que líamos como
+    // "deu certo" é lixo do buffer, não resposta. Logado uma vez, junto da assinatura.
+    let rty = rtti::fn_ret_type(f.func);
+    let rname = if rty.is_null() {
+        "Void".to_string()
+    } else {
+        crate::cname::resolve_cname(rtti::type_name_getname(rty))
+    };
     let ptypes: Vec<String> = (0..np)
-        .map(|i| crate::cname::resolve_cname(rtti::fn_param_type(f.func, i as usize)))
+        .map(|i| crate::cname::resolve_cname(rtti::fn_param_type(f.func, i)))
         .collect();
     crate::log(&format!(
-        "[{tag}] {fname}({}) params={np} static={} '{effect}' tdbid={:#018x}",
+        "[{tag}] {fname}({}) -> {rname} params={np} static={} '{effect}' tdbid={:#018x}",
         ptypes.join(", "),
         f.is_static,
         u64::from_le_bytes(tdbid)
     ));
-    // Monta a lista com o TAMANHO que a assinatura declara. Neste build o Apply é
-    // (entEntityID, TweakDBID, TweakDBID, entEntityID, Uint32, Vector4, Bool, entEntityID) = 8;
-    // mandar só os 2 primeiros fazia a chamada não ter efeito NENHUM, sem erro. Preenche por
-    // TIPO em vez de por posição, pra continuar valendo se outra assinatura aparecer.
+    // Monta a lista com o TAMANHO pedido. Preenche por TIPO (não por posição), pra continuar
+    // valendo se outra assinatura aparecer.
     //
     // `instigator`: entEntityID que NÃO seja o 1o (o 1o é o alvo). Zerado = "ninguém"; vários
-    // sistemas do jogo descartam um efeito sem instigador, então a 2a tentativa usa o jogador.
-    let build_args = |instigator: [u8; 16]| -> Vec<Arg> {
+    // sistemas do jogo descartam um efeito sem instigador.
+    let build_args = |instigator: [u8; 16], n: usize| -> Vec<Arg> {
         let mut v: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
-        for i in v.len()..(np as usize) {
+        for i in v.len()..n {
             let ty = crate::cname::resolve_cname(rtti::fn_param_type(f.func, i));
             v.push(match ty.as_str() {
                 "TweakDBID" => Arg::Tdb([0u8; 8]),
@@ -552,22 +558,98 @@ pub unsafe fn status_effect(
         }
         v
     };
-    let a1 = build_args([0u8; 16]);
-    let argc = a1.len();
-    let r1 = rtti::call_func(&f, ses, &a1);
-    crate::log(&format!(
-        "[{tag}] tentativa 1 (instigator=0): argc={argc} ret={:02x?}",
-        r1.map(|v| v[0])
-    ));
-    // As duas tentativas ficam no log: o resultado diz QUAL funciona, em vez de deixar suposição.
-    if !matches!(r1, Some(v) if v[0] != 0) {
-        let r2 = rtti::call_func(&f, ses, &build_args(eid));
+    // Três formas plausíveis da MESMA chamada. O valor de retorno não é prova (pode ser Void),
+    // então cada uma é seguida de `HasStatusEffect` — o jogo respondendo se o efeito ESTÁ no
+    // jogador. É a única leitura que separa "não aplicou" de "aplicou e o record é inerte".
+    let variants: [(&str, Vec<Arg>); 3] = [
+        ("assinatura completa, instigator=0", build_args([0u8; 16], np)),
+        ("assinatura completa, instigator=player", build_args(eid, np)),
+        ("só os 2 obrigatórios (resto omitido)", build_args([0u8; 16], np.min(2))),
+    ];
+    let mut landed = false;
+    for (why, args) in variants {
+        let argc = args.len();
+        let r = rtti::call_func(&f, ses, &args);
+        let has = has_effect(reg, ses, eid, tdbid);
         crate::log(&format!(
-            "[{tag}] tentativa 2 (instigator=player): ret={:02x?}",
-            r2.map(|v| v[0])
+            "[{tag}] {why}: argc={argc} ret={:02x?} has={}",
+            r.map(|v| v[0]),
+            match has {
+                Some(true) => "SIM",
+                Some(false) => "nao",
+                None => "?(HasStatusEffect não resolveu)",
+            }
         ));
+        // Ligar: parar na 1a forma que o jogo confirma. Desligar: seguir até o efeito sumir.
+        if has == Some(on) {
+            landed = true;
+            break;
+        }
     }
-    crate::log(&format!("[{tag}] {} enviado", if on { "ON" } else { "OFF" }));
+    crate::log(&format!(
+        "[{tag}] {} — jogo confirma: {}",
+        if on { "ON" } else { "OFF" },
+        if landed { "SIM" } else { "NAO (nenhuma forma pegou)" }
+    ));
+    landed
+}
+
+/// Pergunta ao jogo se o efeito ESTÁ no jogador. `None` = não deu pra perguntar (método não
+/// resolvido) — diferente de `Some(false)`, que é o jogo dizendo "não está".
+unsafe fn has_effect(
+    reg: &Registry,
+    ses: *mut c_void,
+    eid: [u8; 16],
+    tdbid: [u8; 8],
+) -> Option<bool> {
+    let f = rtti::resolve_any(reg, &["gameStatusEffectSystem"], "HasStatusEffect")?;
+    let np = rtti::param_count(&f) as usize;
+    let mut v: Vec<Arg> = vec![Arg::Raw(eid), Arg::Tdb(tdbid)];
+    v.truncate(np);
+    let r = rtti::call_func(&f, ses, &v)?;
+    Some(r[0] != 0)
+}
+
+/// `se <record> [on|off]` do console: aplica/remove QUALQUER status effect por nome. Existe pra
+/// que testar um candidato não custe recompilar e reiniciar o jogo — o ciclo caro aqui.
+pub unsafe fn status_effect_named(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    effect: &str,
+    on: bool,
+) -> bool {
+    status_effect(reg, captured_player, effect, on, "se")
+}
+
+/// `se? <record>`: só pergunta, não aplica nada.
+pub unsafe fn status_effect_query(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    effect: &str,
+) -> bool {
+    let owner = auth_or(reg, captured_player);
+    let gi = match get_gi(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    let ses = system_flex(reg, owner, gi, "gameStatusEffectSystem", "GetStatusEffectSystem");
+    let eid = match entity_id(reg, owner) {
+        Some(b) => b,
+        None => return false,
+    };
+    if !rtti::sane(ses) {
+        crate::log("[se] StatusEffectSystem inacessível");
+        return false;
+    }
+    let tdbid = crate::cname::tweak_db_id(effect).to_le_bytes();
+    crate::log(&format!(
+        "[se] '{effect}' has={}",
+        match has_effect(reg, ses, eid, tdbid) {
+            Some(true) => "SIM",
+            Some(false) => "nao",
+            None => "?(HasStatusEffect não resolveu)",
+        }
+    ));
     true
 }
 

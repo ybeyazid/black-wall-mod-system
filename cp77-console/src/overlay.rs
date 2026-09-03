@@ -1319,12 +1319,14 @@ unsafe fn init_renderer(dev: &metal::DeviceRef, pixfmt: u64) -> Option<Renderer>
 /// Os 4 estilos estéticos do Cyberpunk 2077 como temas: nome + tagline.
 /// Texto do comando `help` — só os comandos PRÁTICOS de cheat (o que o hint do campo já anuncia),
 /// não a lista inteira de comandos internos de dev/RE (esses ficam em CODEBASE.md, não na UI).
-const HELP_LINES: [&str; 12] = [
+const HELP_LINES: [&str; 14] = [
     "commands: money N | give Items.X [N] | remove Items.X [N] | godmode [off] | heal | level N",
     "          summon (calls a vehicle) | attrs/perks/relic N (points) | hasgod (query)",
     "          ram (refill cyberdeck RAM) | ram on|off (keep it full)",
     "          cloak on|off (optical camo — NPCs stop seeing you)",
     "          ammo on|off (infinite ammo — no reloading)",
+    "          se <Record> [on|off] (apply any status effect by name)",
+    "          se? <Record> (ask the game whether the effect is on you)",
     "keys: ↑/↓ browse the history of commands typed this session.",
     "'Items.X' = the item's TweakDBID (e.g. Items.money, Items.PreventionEliteBundle_Cyberware).",
     "",

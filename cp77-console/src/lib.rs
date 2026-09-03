@@ -401,9 +401,9 @@ pub(crate) fn log(msg: &str) {
     // aba Console mesmo no build público, onde o resto desta função é no-op. Sem isto, um cheat
     // que não funciona não tem NENHUM sinal na tela — foi exatamente o que aconteceu com o
     // `cloak`: o comando dizia "ON" e o motivo real ficava num log que só existe em build dev.
-    const USER_FACING: [&str; 10] = [
+    const USER_FACING: [&str; 11] = [
         "[console]", "[cloak]", "[ammo]", "[ram]", "[god]", "[heal]", "[give]", "[sig]",
-        "[level]", "[build]",
+        "[level]", "[build]", "[se]",
     ];
     if USER_FACING.iter().any(|p| msg.starts_with(p)) {
         crate::overlay::console_out(msg);
@@ -8971,6 +8971,21 @@ fn run_cmd(reg: &rtti::Registry, player: *mut c_void, tx: *mut c_void, cmd: &str
             ["ammo", "off"] => {
                 let ok = console::infinite_ammo(reg, player, false);
                 log(&format!("[console] 'ammo off' -> {}", if ok { "OFF" } else { "FAILED" }));
+                return;
+            }
+            // `se <record> [on|off]` / `se? <record>`: status effect ARBITRÁRIO por nome.
+            // Testar um candidato passa a custar uma linha digitada em vez de recompilar +
+            // reiniciar o jogo, que é o ciclo caro deste port.
+            ["se", name] | ["se", name, "on"] => {
+                console::status_effect_named(reg, player, name, true);
+                return;
+            }
+            ["se", name, "off"] => {
+                console::status_effect_named(reg, player, name, false);
+                return;
+            }
+            ["se?", name] | ["sehas", name] => {
+                console::status_effect_query(reg, player, name);
                 return;
             }
             ["ver"] | ["version"] => {
