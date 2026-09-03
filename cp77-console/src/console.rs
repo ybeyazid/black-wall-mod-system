@@ -822,6 +822,11 @@ pub unsafe fn refill_ammo(reg: &Registry, player: *mut c_void, tx: *mut c_void) 
     for a in AMMO_TYPES {
         give_quiet(reg, player, tx, a, 200);
     }
+    // O modificador de pente vive na ARMA, então trocar de arma o deixaria pra trás e o cheat
+    // pareceria ter desligado sozinho. Remover e reaplicar na arma ATUAL é mais simples do que
+    // rastrear identidade de arma, e correto por construção. Mesma escolha feita no menu ESC.
+    stat_unmod_ex(reg, player, "MagazineCapacity", "ammo", false);
+    stat_mod_ex(reg, player, "MagazineCapacity", 999.0, StatTarget::Weapon, "ammo", false);
 }
 
 /// Alvo de um stat: o jogador ou a arma que ele tem na mão. São `StatsObjectID` diferentes —
@@ -894,6 +899,21 @@ pub unsafe fn stat_mod(
     value: f32,
     target: StatTarget,
     tag: &str,
+) -> bool {
+    stat_mod_ex(reg, captured_player, stat, value, target, tag, true)
+}
+
+/// `verbose=false` é o caminho do TICK: mesma aplicação, sem a linha de antes/depois. Aquela
+/// linha é a MEDIÇÃO — vale ouro quando se está investigando, e afoga o console se repetida de
+/// segundo em segundo.
+pub unsafe fn stat_mod_ex(
+    reg: &Registry,
+    captured_player: *mut c_void,
+    stat: &str,
+    value: f32,
+    target: StatTarget,
+    tag: &str,
+    verbose: bool,
 ) -> bool {
     let owner = auth_or(reg, captured_player);
     let gi = match get_gi(reg, owner) {
@@ -968,6 +988,9 @@ pub unsafe fn stat_mod(
     applied().lock().unwrap().push((stat.to_string(), tid, m));
     let after = stat_value(reg, sts, tid, stype);
     let moved = matches!((before, after), (Some(a), Some(b)) if (b - a).abs() > 0.0001);
+    if !verbose {
+        return moved;
+    }
     crate::log(&format!(
         "[{tag}] {stat} {} {:?} -> {:?} (AddModifier params={np}) | jogo confirma: {}",
         if matches!(target, StatTarget::Weapon) { "na ARMA:" } else { "no JOGADOR:" },
@@ -988,6 +1011,10 @@ fn applied() -> &'static std::sync::Mutex<Vec<(String, [u8; 16], [u8; 16])>> {
 /// Remove os modificadores que aplicamos pra este stat. Só os nossos: um `RemoveModifier` com
 /// handle de terceiros mexeria em buff de perk/cyberware do jogador.
 pub unsafe fn stat_unmod(reg: &Registry, captured_player: *mut c_void, stat: &str, tag: &str) -> bool {
+    stat_unmod_ex(reg, captured_player, stat, tag, true)
+}
+
+pub unsafe fn stat_unmod_ex(reg: &Registry, captured_player: *mut c_void, stat: &str, tag: &str, verbose: bool) -> bool {
     let owner = auth_or(reg, captured_player);
     let gi = match get_gi(reg, owner) {
         Some(b) => b,
@@ -1012,7 +1039,9 @@ pub unsafe fn stat_unmod(reg: &Registry, captured_player: *mut c_void, stat: &st
         n += 1;
         false
     });
-    crate::log(&format!("[{tag}] {stat}: {n} modificador(es) removido(s)"));
+    if verbose {
+        crate::log(&format!("[{tag}] {stat}: {n} modificador(es) removido(s)"));
+    }
     n > 0
 }
 

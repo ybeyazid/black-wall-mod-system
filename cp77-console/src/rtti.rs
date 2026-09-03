@@ -2096,6 +2096,16 @@ pub unsafe fn game_instance_vtable_dump(game: *mut c_void, n: usize) -> Vec<(usi
 }
 
 /// Resolve uma função RED por classe+método, subindo a cadeia de heranças.
+/// `true` só na PRIMEIRA vez que este par (tag, chave) aparece. Uma resolução que dá certo é
+/// notícia uma vez; repetida a cada tick vira ruído que esconde o resto do log — e o caminho do
+/// tick (munição infinita) chama isto de segundo em segundo.
+fn first_time(tag: &str, key: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    seen.lock().unwrap().insert(format!("{tag}|{key}"))
+}
+
 /// Resolve tentando VÁRIOS nomes em várias classes. Existe porque as funções definidas em
 /// redscript não entram na RTTI com o nome curto: entram com a ASSINATURA colada
 /// (`CreateStatModifier;gamedataStatTypegameStatModifierTypeFloat`), enquanto as nativas do
@@ -2115,7 +2125,9 @@ pub unsafe fn resolve_any_name(
         }
         for n in names {
             if let Some(f) = resolve_in_class(cls, n) {
-                crate::log(&format!("[{tag}] resolvido: {c}.{n} (static={})", f.is_static));
+                if first_time(tag, &format!("{c}.{n}")) {
+                    crate::log(&format!("[{tag}] resolvido: {c}.{n} (static={})", f.is_static));
+                }
                 return Some(f);
             }
         }
@@ -2129,7 +2141,9 @@ pub unsafe fn resolve_any_name(
             let gb = g as *const u8;
             let rp = rd_ptr(gb.add(0x18));
             let ret_type = if rp.is_null() { std::ptr::null_mut() } else { rd_ptr(rp as *const u8) };
-            crate::log(&format!("[{tag}] resolvido como função GLOBAL: {n}"));
+            if first_time(tag, n) {
+                crate::log(&format!("[{tag}] resolvido como função GLOBAL: {n}"));
+            }
             return Some(ResolvedFn { func: g, ret_type, is_static: true });
         }
     }
