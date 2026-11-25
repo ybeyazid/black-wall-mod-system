@@ -1,0 +1,6 @@
+# Pares Steam 2.5.0 -> Epic 2.5.0 que a assinatura não acha única: a janela casa em 3 e 4 lugares do __text Epic.
+# Escolhidos pelo deslocamento dos vizinhos resolvidos (o mesmo objeto anda junto entre builds) e conferidos fora da janela:
+# 0x104393324 (AddChildWidget) tem no alvo Epic o prólogo `sub sp, sp, #0x40` que o C175_ADD_CHILD_WIDGET_PROLOGO espera;
+# 0x1051d71dc (inserção de banco de som) tem no alvo Epic os mesmos 8 bytes que o bwms-build-conhecida.txt guarda pro Steam.
+0x104393324 0x104d3b318
+0x1051d71dc 0x102d7fa90

@@ -4482,9 +4482,14 @@ pub(crate) unsafe fn traceresult_result_id(traceresult: u64) -> Option<u32> {
 /// Chama uma função do motor que devolve Handle por sret (`x8`), com `w0`/`w1` de argumento.
 pub(crate) unsafe fn chamar_handle_sret(vmaddr: u64, w0: u32, w1: u32) -> [u64; 2] {
     let mut out = [0u64; 2];
+    // Sem tradução neste build (corpo de template sem par no Epic) o `rebase` é nulo: handle vazio em vez de saltar pro 0.
+    let f = crate::rebase(vmaddr);
+    if f.is_null() {
+        return out;
+    }
     core::arch::asm!(
         "blr {f}",
-        f = in(reg) crate::rebase(vmaddr),
+        f = in(reg) f,
         in("x0") w0 as u64,
         in("x1") w1 as u64,
         in("x8") out.as_mut_ptr(),

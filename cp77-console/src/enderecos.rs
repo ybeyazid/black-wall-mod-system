@@ -164,7 +164,18 @@ fn tabela_gog_25() -> &'static HashMap<u64, u64> {
     MAPA_GOG.get_or_init(|| pares_de_texto(GOG_25))
 }
 
-/// `steam gog` por linha, em hexadecimal com `0x`; `#` abre comentário.
+// Epic 2.5.0: o mesmo caso do GOG, outra ordem de funções. Tabela fixa medida pelo `build-core.sh` contra a cópia vanilla do binário Epic.
+#[cfg(feature = "devtools")]
+static EPIC_25: &str = include_str!("../dados/enderecos-epic-2.5.0.txt");
+#[cfg(not(feature = "devtools"))]
+static EPIC_25: &str = include_str!("../dados/enderecos-epic-2.5.0-publico.txt");
+
+fn tabela_epic_25() -> &'static HashMap<u64, u64> {
+    static MAPA_EPIC: OnceLock<HashMap<u64, u64>> = OnceLock::new();
+    MAPA_EPIC.get_or_init(|| pares_de_texto(EPIC_25))
+}
+
+/// `steam outro` por linha, em hexadecimal com `0x`; `#` abre comentário.
 fn pares_de_texto(texto: &str) -> HashMap<u64, u64> {
     let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
     texto
@@ -183,6 +194,14 @@ pub(crate) fn traduzir_gog_25(vm: u64) -> Option<u64> {
         return Some(vm);
     }
     tabela_gog_25().get(&vm).copied()
+}
+
+/// O endereço Steam `vm` no Epic 2.5.0, pela tabela fixa.
+pub(crate) fn traduzir_epic_25(vm: u64) -> Option<u64> {
+    if vm == bwms_primitives::enderecos::LINK_BASE {
+        return Some(vm);
+    }
+    tabela_epic_25().get(&vm).copied()
 }
 
 /// O endereço Steam `vm` neste build, pela tabela. A base da imagem (o cabeçalho Mach-O) é a base em qualquer build.
@@ -247,6 +266,20 @@ mod tests {
             assert!(m.contains_key(&crate::jogo::scripts::EXECUTOR_VM));
             assert_eq!(m.get(&0x1_0156_e184), Some(&0x1_016d_67f4));
             assert_eq!(m.get(&0x1_01c6_e2e4), Some(&0x1_016c_9df0));
+        }
+    }
+
+    /// As tabelas Epic têm o executor (a detecção lê o prólogo nele) e os pares manuais; os dois corpos de template repetido que o GOG
+    /// achou pelos chamadores ficam sem par no Epic (sem o binário Steam não há chamador pra comparar), e o `rebase` deles volta nulo.
+    #[test]
+    fn tabelas_epic_25_tem_executor_e_pares_manuais() {
+        for texto in [include_str!("../dados/enderecos-epic-2.5.0.txt"), include_str!("../dados/enderecos-epic-2.5.0-publico.txt")] {
+            let m = pares_de_texto(texto);
+            assert!(m.len() > 600);
+            assert!(m.contains_key(&crate::jogo::scripts::EXECUTOR_VM));
+            assert_eq!(m.get(&0x1_0439_3324), Some(&0x1_04d3_b318));
+            assert_eq!(m.get(&0x1_051d_71dc), Some(&0x1_02d7_fa90));
+            assert!(!m.contains_key(&0x1_0156_e184) && !m.contains_key(&0x1_01c6_e2e4));
         }
     }
 }

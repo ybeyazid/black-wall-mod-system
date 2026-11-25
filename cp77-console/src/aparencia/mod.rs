@@ -6482,9 +6482,14 @@ pub(crate) const SUFIXO_ITEMID_VALIDO_VM: u64 = 0x1_0171_2af4;
 /// Função do motor que devolve `Handle` pelo `x8`.
 pub(crate) unsafe fn chamar_sret_handle(vm: u64, x0: u64, x1: u64) -> [u64; 2] {
     let mut h = [0u64; 2];
+    // Sem tradução neste build (corpo de template sem par no Epic) o `rebase` é nulo: handle vazio em vez de saltar pro 0.
+    let f = crate::rebase(vm);
+    if f.is_null() {
+        return h;
+    }
     core::arch::asm!(
         "blr {f}",
-        f = in(reg) crate::rebase(vm) as u64,
+        f = in(reg) f as u64,
         in("x0") x0,
         in("x1") x1,
         in("x8") h.as_mut_ptr() as u64,

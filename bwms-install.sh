@@ -65,10 +65,10 @@ done
 # Só no caminho de INSTALAÇÃO. Desinstalar tem que funcionar SEMPRE — e principalmente numa build
 # que este gate recusa, que é exatamente a do usuário que precisa voltar atrás.
 if [ "$MODE" = install ] && [ -f "$FINGERPRINT" ]; then
-  # One fingerprint per supported store build (Steam; GOG next to it as bwms-build-conhecida-gog.txt): the build is supported when EVERY
-  # checkpoint of one of them matches.
+  # One fingerprint per supported store build (Steam; GOG and Epic next to it as bwms-build-conhecida-gog.txt / -epic.txt): the build is
+  # supported when EVERY checkpoint of one of them matches.
   fp_ok=0; fp_total=0; fp_loja=""
-  for fp in "$FINGERPRINT" "${FINGERPRINT%.txt}-gog.txt"; do
+  for fp in "$FINGERPRINT" "${FINGERPRINT%.txt}-gog.txt" "${FINGERPRINT%.txt}-epic.txt"; do
     [ -f "$fp" ] || continue
     ok=0; total=0
     # __TEXT is mapped at 0x100000000 with file offset 0 on this game, so file offset = vmaddr - base.
@@ -80,8 +80,8 @@ if [ "$MODE" = install ] && [ -f "$FINGERPRINT" ]; then
       [ "$lido" = "$esperado" ] && ok=$((ok + 1))
     done < "$fp"
     if [ "$total" -gt 0 ] && [ "$ok" -eq "$total" ]; then
-      fp_ok=$ok; fp_total=$total; fp_loja=Steam
-      [ "$fp" != "$FINGERPRINT" ] && fp_loja=GOG
+      fp_ok=$ok; fp_total=$total
+      case "$fp" in *-gog.txt) fp_loja=GOG ;; *-epic.txt) fp_loja=Epic ;; *) fp_loja=Steam ;; esac
       break
     fi
     [ "$ok" -ge "$fp_ok" ] && { fp_ok=$ok; fp_total=$total; }
@@ -94,7 +94,7 @@ if [ "$MODE" = install ] && [ -f "$FINGERPRINT" ]; then
     echo "  version:     $(defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown) (supported: $SUPPORTED_VER)"
     echo
     echo "BWMS hooks the engine at fixed addresses measured on Cyberpunk 2077 $SUPPORTED_VER for macOS"
-    echo "(Steam and GOG). On another build those addresses point somewhere else, and the game dies with"
+    echo "(Steam, GOG and Epic). On another build those addresses point somewhere else, and the game dies with"
     echo "SIGTRAP the moment it starts — which is exactly what happened to an Epic Games install"
     echo "on 2026-09-04. Nothing was modified: your game is untouched."
     echo

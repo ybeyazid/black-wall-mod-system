@@ -27,21 +27,26 @@ STEAM_BIN="${CP77_STEAM_BIN:-$ROOT/cp77-symbols/binarios/Cyberpunk2077-2.5.0-ste
 if [ -f "$STEAM_BIN" ]; then
   (cd ../bwms-primitives && cargo run --release -q --example gerar_enderecos -- "$STEAM_BIN" ../cp77-console/src ../cp77-console/dados/enderecos-steam-2.5.0.bin ../cp77-console/dados/enderecos-steam-2.5.0-publico.bin)
 fi
-# GOG 2.5.0 (a mesma versão compilada à parte, funções em outra ordem): tradução fixa Steam -> GOG de cada tabela, resolvida contra a cópia
-# vanilla do binário GOG, mais os pares manuais (corpo de template repetido) que aquela tabela não resolveu. Sem o binário, ficam as de dados/.
-GOG_BIN="${CP77_GOG_BIN:-$ROOT/cp77-symbols/binarios/Cyberpunk2077-2.5.0-gog.bin}"
-if [ -f "$GOG_BIN" ]; then
+# GOG e Epic 2.5.0 (a mesma versão compilada à parte, funções em outra ordem): tradução fixa Steam -> loja de cada tabela, resolvida contra
+# a cópia vanilla do binário da loja, mais os pares manuais (corpo de template repetido) que aquela tabela não resolveu. Sem o binário, ficam
+# as de dados/.
+traduzir_loja() { # <loja> <NOME> <binário>
+  local loja="$1" nome="$2" bin="$3" T
   T=$(mktemp -d)
   for v in "" "-publico"; do
-    (cd ../bwms-primitives && cargo run --release -q --example resolver_em_outro_build -- "../cp77-console/dados/enderecos-steam-2.5.0$v.bin" "$GOG_BIN" "$T/sem" "$T/pares") >/dev/null
-    grep -v '^#' dados/enderecos-gog-2.5.0-manuais.txt | while read -r st gog; do if grep -qx "$st" "$T/sem"; then echo "$st $gog"; fi; done > "$T/manuais"
-    { echo "# Steam 2.5.0 -> GOG 2.5.0, gerado pelo build-core.sh: resolver_em_outro_build contra dados/enderecos-steam-2.5.0$v.bin e o binário GOG"
-      echo "# vanilla, mais dados/enderecos-gog-2.5.0-manuais.txt. Não editar à mão."
-      { cat "$T/pares"; echo; cat "$T/manuais"; } | grep -v '^$' | sort -u; } > "dados/enderecos-gog-2.5.0$v.txt"
-    echo "gog$v: $(grep -vc '^#' "dados/enderecos-gog-2.5.0$v.txt") pares; sem par: $(grep -vxF -f <(cut -d' ' -f1 "$T/manuais") "$T/sem" | tr '\n' ' ')"
+    (cd ../bwms-primitives && cargo run --release -q --example resolver_em_outro_build -- "../cp77-console/dados/enderecos-steam-2.5.0$v.bin" "$bin" "$T/sem" "$T/pares") >/dev/null
+    grep -v '^#' "dados/enderecos-$loja-2.5.0-manuais.txt" | while read -r st outro; do if grep -qx "$st" "$T/sem"; then echo "$st $outro"; fi; done > "$T/manuais"
+    { echo "# Steam 2.5.0 -> $nome 2.5.0, gerado pelo build-core.sh: resolver_em_outro_build contra dados/enderecos-steam-2.5.0$v.bin e o binário $nome"
+      echo "# vanilla, mais dados/enderecos-$loja-2.5.0-manuais.txt. Não editar à mão."
+      { cat "$T/pares"; echo; cat "$T/manuais"; } | grep -v '^$' | sort -u; } > "dados/enderecos-$loja-2.5.0$v.txt"
+    echo "$loja$v: $(grep -vc '^#' "dados/enderecos-$loja-2.5.0$v.txt") pares; sem par: $(grep -vxF -f <(cut -d' ' -f1 "$T/manuais") "$T/sem" | tr '\n' ' ')"
   done
   rm -rf "$T"
-fi
+}
+GOG_BIN="${CP77_GOG_BIN:-$ROOT/cp77-symbols/binarios/Cyberpunk2077-2.5.0-gog.bin}"
+[ -f "$GOG_BIN" ] && traduzir_loja gog GOG "$GOG_BIN"
+EPIC_BIN="${CP77_EPIC_BIN:-$ROOT/cp77-symbols/binarios/Cyberpunk2077-2.5.0-epic.bin}"
+[ -f "$EPIC_BIN" ] && traduzir_loja epic Epic "$EPIC_BIN"
 # O build PÚBLICO (sem `devtools`) usa o perfil `publico`: o mesmo opt-level do `release` do dev, com
 # pasta de saída própria (a medida que decidiu o opt-level está no comentário do perfil no Cargo.toml).
 PERFIL=publico

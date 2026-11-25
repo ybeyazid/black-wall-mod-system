@@ -270,7 +270,8 @@ fn build_line_de(b: crate::GameBuild) -> &'static str {
     match b {
         crate::GameBuild::Steam => "Steam 2.5.0 — supported: yes",
         crate::GameBuild::Gog => "GOG 2.5.0 — supported: yes",
-        crate::GameBuild::Unknown => "not Steam or GOG 2.5.0 — supported: no (BWMS did not activate)",
+        crate::GameBuild::Epic => "Epic 2.5.0 — supported: yes",
+        crate::GameBuild::Unknown => "not Steam, GOG or Epic 2.5.0 — supported: no (BWMS did not activate)",
     }
 }
 
@@ -656,7 +657,8 @@ mod tests {
     fn build_line_diz_a_versao_suportada() {
         assert_eq!(build_line_de(crate::GameBuild::Steam), "Steam 2.5.0 — supported: yes");
         assert_eq!(build_line_de(crate::GameBuild::Gog), "GOG 2.5.0 — supported: yes");
-        assert_eq!(build_line_de(crate::GameBuild::Unknown), "not Steam or GOG 2.5.0 — supported: no (BWMS did not activate)");
+        assert_eq!(build_line_de(crate::GameBuild::Epic), "Epic 2.5.0 — supported: yes");
+        assert_eq!(build_line_de(crate::GameBuild::Unknown), "not Steam, GOG or Epic 2.5.0 — supported: no (BWMS did not activate)");
         assert!(!build_line_de(crate::GameBuild::Steam).contains("2.31"));
     }
 }

@@ -159,6 +159,8 @@ pub(crate) fn rebase(vmaddr: u64) -> *mut c_void {
         Some(vmaddr)
     } else if game_build() == GameBuild::Gog {
         enderecos::traduzir_gog_25(vmaddr)
+    } else if game_build() == GameBuild::Epic {
+        enderecos::traduzir_epic_25(vmaddr)
     } else {
         enderecos::traduzir(vmaddr)
     };
@@ -190,11 +192,13 @@ pub(crate) fn un_rebase(ptr: *const c_void) -> u64 {
 
 /// Qual build do jogo: `Steam` = o prólogo do executor está no vmaddr do Steam 2.5.0, o layout de todos os offsets do código; `Gog` = o
 /// prólogo está no vmaddr GOG 2.5.0 do executor (a mesma versão compilada à parte: os mesmos layouts, as funções em outra ordem, traduzidas
-/// pela tabela fixa `enderecos::traduzir_gog_25`). Qualquer outro binário (Epic, outra versão) desloca vmaddr e layouts, e é `Unknown`.
+/// pela tabela fixa `enderecos::traduzir_gog_25`); `Epic` = o mesmo caso pelo `enderecos::traduzir_epic_25`. Qualquer outro binário (outra
+/// versão) desloca vmaddr e layouts, e é `Unknown`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GameBuild {
     Steam,
     Gog,
+    Epic,
     Unknown,
 }
 
@@ -212,6 +216,8 @@ pub(crate) fn game_build() -> GameBuild {
             GameBuild::Steam
         } else if enderecos::traduzir_gog_25(crate::jogo::scripts::EXECUTOR_VM).is_some_and(probe) {
             GameBuild::Gog
+        } else if enderecos::traduzir_epic_25(crate::jogo::scripts::EXECUTOR_VM).is_some_and(probe) {
+            GameBuild::Epic
         } else {
             GameBuild::Unknown
         };
@@ -224,11 +230,11 @@ pub(crate) fn game_build() -> GameBuild {
 pub(crate) static BUILD_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// True no Steam 2.5.0 e no GOG 2.5.0: todos os layouts do código (frame 0xA8, POD 0x100, `ScriptClass` +0x28) são da 2.5.0, e um binário de
+/// True no Steam, no GOG e no Epic 2.5.0: todos os layouts do código (frame 0xA8, POD 0x100, `ScriptClass` +0x28) são da 2.5.0, e um binário de
 /// outra versão com o endereço traduzido ainda leria struct errada. Fora deles o gate do `on_load` não instala nenhum gancho e o jogo boota
 /// vanilla.
 pub(crate) fn build_supported() -> bool {
-    matches!(game_build(), GameBuild::Steam | GameBuild::Gog)
+    matches!(game_build(), GameBuild::Steam | GameBuild::Gog | GameBuild::Epic)
 }
 
 /// Quantos endereços o `rebase` não achou neste build (o veredito do teste de endereços lê).
@@ -597,8 +603,9 @@ fn linha_do_gate() -> String {
         if base != 0 && unsafe { crate::memoria::is_readable(p, 8) } { format!("{:#018x}", unsafe { (p as *const u64).read_unaligned() }) } else { "ilegível".into() }
     };
     let gog = enderecos::traduzir_gog_25(crate::jogo::scripts::EXECUTOR_VM).map_or_else(|| "sem tabela".into(), ler);
+    let epic = enderecos::traduzir_epic_25(crate::jogo::scripts::EXECUTOR_VM).map_or_else(|| "sem tabela".into(), ler);
     format!(
-        "gate: build {b:?}, BWMS não ativou (base {base:#x}; executor Steam {}, GOG {gog}; esperado {:#018x})",
+        "gate: build {b:?}, BWMS não ativou (base {base:#x}; executor Steam {}, GOG {gog}, Epic {epic}; esperado {:#018x})",
         ler(crate::jogo::scripts::EXECUTOR_VM),
         crate::jogo::scripts::EXECUTOR_PROLOGO
     )
@@ -639,7 +646,7 @@ extern "C" fn on_load() {
     marcar_ultimo_boot(&linha_do_gate(), true);
     if !build_supported() {
         BUILD_UNSUPPORTED.store(true, Ordering::Relaxed);
-        crate::log_dev!("[build] RECUSADO: o binário não é o Steam nem o GOG 2.5.0 (detectado: {:?}) — BWMS não instala nenhum gancho, o jogo boota sem o BWMS.", game_build());
+        crate::log_dev!("[build] RECUSADO: o binário não é o Steam, o GOG nem o Epic 2.5.0 (detectado: {:?}) — BWMS não instala nenhum gancho, o jogo boota sem o BWMS.", game_build());
         return;
     }
     #[cfg(feature = "devlog")]
