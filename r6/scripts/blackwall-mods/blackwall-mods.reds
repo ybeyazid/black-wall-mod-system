@@ -195,8 +195,8 @@ protected const func EnterCondition(const stateContext: ref<StateContext>, const
 }
 
 // Sandevistan: o mundo anda na fracao `sande_escala` (10, 25, 50 ou 75 por cento; 25 sem a chave) e o V na velocidade normal. O menu MODS
-// liga a tecla (`cheat_sande`); a tecla, escolhida no menu e gravada em `sande_tecla`, vem pelo Rust (`tempo::entrada_do_sandevistan`), que
-// chama `BwmsSandevistanTecla` na thread do jogo. O Z do comeco brigava com o radio e o desmontar do inventario. Ativo ou nao e da sessao: a dilatacao do TimeSystem nao vai pro save.
+// liga a tecla (`cheat_sande`); Option+Z vem pelo Rust (`tempo::tecla_do_sandevistan`), que chama `BwmsSandevistanTecla` na thread do
+// jogo. O Z sozinho brigava com o radio e o desmontar do inventario. Ativo ou nao e da sessao: a dilatacao do TimeSystem nao vai pro save.
 public func BwmsSandevistanEscala() -> Int32 {
   let v: Int32 = StringToInt(BwmsConfigGet("sande_escala"));
   if v == 10 || v == 25 || v == 50 || v == 75 { return v; };
@@ -326,19 +326,6 @@ private final func BWPlayer() -> ref<PlayerPuppet> {
   return this.GetPlayerControlledObject() as PlayerPuppet;
 }
 
-// O rotulo da tecla vem do Rust, que a gravou. Durante a gravacao a pagina nao se redesenha sozinha: o rotulo novo aparece na proxima vez.
-@addMethod(PauseMenuGameController)
-private final func BWSandeTecla() -> String {
-  let t: String = BwmsConfigGet("sande_tecla");
-  if Equals(t, "bekle") {
-    return this.L("press a key... (ESC cancels)", "aperte uma tecla... (ESC cancela)", "请按一个键……（ESC 取消）", "bir tuşa bas... (ESC iptal)");
-  };
-  if Equals(t, "") {
-    return this.L("not set", "nenhuma", "未设置", "seçilmedi");
-  };
-  return BwmsConfigGet("sande_tecla_nome");
-}
-
 // Sufixo de estado para os itens que ligam/desligam. Mostrar o estado no proprio rotulo e o que
 // o God Mode ja fazia; sem isso, apertar um toggle nao da retorno nenhum.
 @addMethod(PauseMenuGameController)
@@ -360,9 +347,7 @@ private final func BWShowModsPage() -> Void {
     + this.BWOnOff(BwmsCheatLigado("cheat_npc")), n"BWModsCloak");
   this.AddMenuItem(this.L("Unlimited air jumps: ", "Pulos ilimitados no ar: ", "无限空中跳跃：", "Sınırsız Havada Zıplama: ")
     + this.BWOnOff(BwmsCheatLigado("cheat_pulo")), n"BWModsJump");
-  this.AddMenuItem("Sandevistan: " + this.BWOnOff(BwmsCheatLigado("cheat_sande")), n"BWModsSande");
-  this.AddMenuItem(this.L("Sandevistan key: ", "Tecla do Sandevistan: ", "斯安威斯坦按键：", "Sandevistan tuşu: ") + this.BWSandeTecla(),
-    n"BWModsSandeTecla");
+  this.AddMenuItem("Sandevistan (Option + Z): " + this.BWOnOff(BwmsCheatLigado("cheat_sande")), n"BWModsSande");
   this.AddMenuItem(this.L("Sandevistan world speed: ", "Velocidade do mundo no Sandevistan: ", "斯安威斯坦世界速度：", "Sandevistan dünya hızı: ")
     + "%" + IntToString(BwmsSandevistanEscala()), n"BWModsSandeEscala");
   this.AddMenuItem(this.L("Back", "Voltar", "返回", "Geri"), n"BWModsBack");
@@ -459,15 +444,6 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
     BwmsCheatGravar("cheat_sande", on);
     if !on && IsDefined(pp) && pp.m_bwSandeAtivo {
       pp.BWMSSandevistan(false);
-    };
-    this.BWShowModsPage(); return true;
-  };
-  if Equals(data.eventName, n"BWModsSandeTecla") {
-    this.PlaySound(n"Button", n"OnPress");
-    let t: String = BwmsConfigGet("sande_tecla");
-    if !Equals(t, "bekle") {
-      BwmsConfigSet("sande_tecla_onceki", t);
-      BwmsConfigSet("sande_tecla", "bekle");
     };
     this.BWShowModsPage(); return true;
   };

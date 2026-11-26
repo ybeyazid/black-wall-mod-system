@@ -1729,7 +1729,7 @@ pub extern "C" fn cp77_tick() {
             }
         }
     }
-    // Tecla do Sandevistan (marcada no `sendEvent:`, `tempo::entrada_do_sandevistan`): o liga/desliga roda nos scripts, com a GameInstance pela
+    // Tecla do Sandevistan (marcada no `sendEvent:`, `tempo::tecla_do_sandevistan`): o liga/desliga roda nos scripts, com a GameInstance pela
     // mesma receita do `BwmsAoEntrarNoJogo`. Fora do gameplay o pedido cai.
     if crate::tempo::sandevistan_pedido() && inicio::boot::gameplay_real() {
         if let Some(gi) = unsafe { crate::jogo::sessao::game_instance(reg, player) } {

@@ -8,50 +8,21 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::register::*;
 
-/// Sandevistan do menu MODS. A entrada fica na chave `sande_tecla` da config externa: `k<código do macOS>` para tecla, `m<botão>` para
-/// botão do mouse além do esquerdo e do direito (2 = meio, 3 e 4 = laterais); sem a chave, nenhuma. O menu grava `bekle` e a próxima
-/// entrada vira a do Sandevistan, com o rótulo em `sande_tecla_nome`; o ESC devolve a de antes (`sande_tecla_onceki`). Fora da gravação a
-/// entrada só vale com `cheat_sande` ligado. O `sendEvent:` roda na thread do AppKit e só marca o pedido; o `cp77_tick` o consome na thread
-/// do jogo e chama o `BwmsSandevistanTecla(game)` dos scripts. Devolve se a entrada é do Sandevistan, pra ela não seguir pro jogo.
+/// Sandevistan do menu MODS: Option+Z, só com `cheat_sande` ligado; o Z sozinho segue pro jogo (rádio, desmontar no inventário). Tecla
+/// gravada pelo menu e botão do mouse foram tentados e saíram: o botão do meio e os laterais não chegam ao `sendEvent:` com o mouse preso
+/// na câmera. O `sendEvent:` roda na thread do AppKit e só marca o pedido; o `cp77_tick` o consome na thread do jogo e chama o
+/// `BwmsSandevistanTecla(game)` dos scripts. Devolve se a tecla é a do Sandevistan, pra ela não seguir pro jogo.
 static SANDEVISTAN_PEDIDO: AtomicBool = AtomicBool::new(false);
-const GRAVANDO: &str = "bekle";
-const ESC: &str = "k53";
+const TECLA_Z: u16 = 6;
 
-pub(crate) fn entrada_do_sandevistan(codigo: &str, nome: impl FnOnce() -> String, repeticao: bool) -> bool {
-    use crate::configuracao::{modconfig_get, modconfig_set};
-    let atual = modconfig_get("sande_tecla");
-    if atual == GRAVANDO {
-        if codigo == ESC {
-            modconfig_set("sande_tecla", &modconfig_get("sande_tecla_onceki"));
-        } else {
-            modconfig_set("sande_tecla", codigo);
-            modconfig_set("sande_tecla_nome", &nome());
-        }
-        return true;
-    }
-    if atual.is_empty() || atual != codigo || modconfig_get("cheat_sande") != "1" {
+pub(crate) fn tecla_do_sandevistan(kc: u16, option: bool, repeticao: bool) -> bool {
+    if kc != TECLA_Z || !option || crate::configuracao::modconfig_get("cheat_sande") != "1" {
         return false;
     }
     if !repeticao {
         SANDEVISTAN_PEDIDO.store(true, Ordering::Relaxed);
     }
     true
-}
-
-/// Rótulo da tecla pro menu: o caractere dela em maiúscula, ou o nome das que não têm caractere visível.
-pub(crate) fn nome_da_tecla(kc: u16, ch: &str) -> String {
-    const NOMES: [(u16, &str); 19] = [
-        (49, "Space"), (48, "Tab"), (51, "Backspace"), (36, "Enter"), (117, "Delete"), (115, "Home"), (119, "End"), (116, "Page Up"),
-        (121, "Page Down"), (122, "F1"), (120, "F2"), (99, "F3"), (118, "F4"), (96, "F5"), (97, "F6"), (98, "F7"), (100, "F8"),
-        (101, "F9"), (109, "F10"),
-    ];
-    if let Some((_, n)) = NOMES.iter().find(|(k, _)| *k == kc) {
-        return n.to_string();
-    }
-    match ch.chars().next() {
-        Some(c) if !c.is_control() && !c.is_whitespace() && !('\u{f700}'..='\u{f8ff}').contains(&c) => c.to_uppercase().collect(),
-        _ => format!("#{kc}"),
-    }
 }
 
 pub(crate) fn sandevistan_pedido() -> bool {

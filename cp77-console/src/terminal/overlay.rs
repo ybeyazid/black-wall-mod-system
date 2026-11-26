@@ -719,9 +719,9 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                     } else if efeito != Efeito::Segue {
                         consume = true;
                     } else if !SHOW.load(Ordering::Relaxed)
-                        && crate::tempo::entrada_do_sandevistan(
-                            &format!("k{kc}"),
-                            || crate::tempo::nome_da_tecla(kc, ch),
+                        && crate::tempo::tecla_do_sandevistan(
+                            kc,
+                            atalho::modificador_seguro(msg_usize(event, sel!("modifierFlags")) as u64, atalho::OPTION),
                             msg!(event, "isARepeat" => bool),
                         )
                     {
@@ -829,15 +829,6 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                     // Modificadores mudaram (FlagsChanged): só contam para o atalho (gravação ou atalho com Ctrl/Option/Shift/Cmd).
                     let mods = msg_usize(event, sel!("modifierFlags")) as u64;
                     if crate::terminal::atalho::evento(12, 0, mods) != crate::terminal::atalho::Efeito::Segue {
-                        consume = true;
-                    }
-                }
-                25 => {
-                    // OtherMouseDown: meio e laterais podem ser a entrada do Sandevistan (`tempo::entrada_do_sandevistan`).
-                    let b = msg_usize(event, sel!("buttonNumber"));
-                    if !SHOW.load(Ordering::Relaxed)
-                        && crate::tempo::entrada_do_sandevistan(&format!("m{b}"), || format!("Mouse {}", b + 1), false)
-                    {
                         consume = true;
                     }
                 }
