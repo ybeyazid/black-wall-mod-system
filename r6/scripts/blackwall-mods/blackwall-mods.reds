@@ -11,13 +11,15 @@
 
 @addField(PauseMenuGameController) let m_bwInModsPage: Bool;
 
-// Ligado/desligado de cada cheat continuo fica na config externa (`cheat_npc`, `cheat_municao`, `cheat_ram`), como o `godmode`: fora do save e
+// Ligado/desligado de cada cheat continuo fica na config externa (`cheat_npc`, `cheat_municao`, `cheat_ram`, `cheat_pulo`), como o `godmode`: fora do save e
 // fora do PlayerPuppet, que nasce de novo a cada carga. Os efeitos do NPCs vao pro save; com o estado num campo do V, a carga mostrava
 // DESLIGADO com os NPCs ainda amigos. O `BwmsAoEntrarNoJogo` religa pela config. No PlayerPuppet fica so o que e da sessao.
 @addField(PlayerPuppet) let m_bwVisMod: ref<gameStatModifierData>;
 @addField(PlayerPuppet) let m_bwMagMod: ref<gameStatModifierData>;
 @addField(PlayerPuppet) let m_bwMagWeapon: wref<WeaponObject>;
 @addField(PlayerPuppet) let m_bwTicking: Bool;
+@addField(PlayerPuppet) let m_bwPuloMod: ref<gameStatModifierData>;
+@addField(PlayerPuppet) let m_bwPuloLigado: Bool;
 
 public func BwmsCheatLigado(chave: String) -> Bool {
   return Equals(BwmsConfigGet(chave), "1");
@@ -163,6 +165,34 @@ public func BWMSSetCloak(on: Bool) -> Void {
   BwmsCheatGravar("cheat_npc", on);
 }
 
+// Pulo sem limite no ar. O `DoubleJumpDecisions` conta os pulos no ar em `currentNumberOfJumps` e para no `numberOfMultiJumps` (1 com o
+// Reinforced Tendons); zerar o contador antes da decisao libera o proximo. Sem o implante a decisao recusa antes, pelo `HasDoubleJump`, entao
+// o cheat poe o flag tambem. O `EnterCondition` roda a cada quadro no ar: le o campo do V, nao a config, que e chamada nativa.
+@addMethod(PlayerPuppet)
+public func BWMSSetMultiJump(on: Bool) -> Void {
+  let ss: ref<StatsSystem> = GameInstance.GetStatsSystem(this.GetGame());
+  let soid: StatsObjectID = Cast<StatsObjectID>(this.GetEntityID());
+  if on && !IsDefined(this.m_bwPuloMod) {
+    this.m_bwPuloMod = RPGManager.CreateStatModifier(gamedataStatType.HasDoubleJump, gameStatModifierType.Additive, 1.00);
+    ss.AddModifier(soid, this.m_bwPuloMod);
+  };
+  if !on && IsDefined(this.m_bwPuloMod) {
+    ss.RemoveModifier(soid, this.m_bwPuloMod);
+    this.m_bwPuloMod = null;
+  };
+  this.m_bwPuloLigado = on;
+  BwmsCheatGravar("cheat_pulo", on);
+}
+
+@wrapMethod(DoubleJumpDecisions)
+protected const func EnterCondition(const stateContext: ref<StateContext>, const scriptInterface: ref<StateGameScriptInterface>) -> Bool {
+  let pp: ref<PlayerPuppet> = scriptInterface.executionOwner as PlayerPuppet;
+  if IsDefined(pp) && pp.m_bwPuloLigado {
+    stateContext.SetPermanentIntParameter(n"currentNumberOfJumps", 0, true);
+  };
+  return wrappedMethod(stateContext, scriptInterface);
+}
+
 // Desliga o God Mode do BWMS: a fonte atual e as antigas (`BlackwallMods` do botão MODS e `Console` do terminal até a 0.1.5). O jogo grava o
 // GodModeSystem no save, então um save antigo traz essas entradas e tirar só a `BWMS` deixa o V invulnerável. A chave `godmode` da config externa
 // zera junto: o `BwmsAoEntrarNoJogo` religa por ela na carga, e o OFF de qualquer caminho tem de valer no próximo save carregado.
@@ -214,6 +244,9 @@ public func BwmsAoEntrarNoJogo(game: GameInstance) -> Void {
   };
   if BwmsCheatLigado("cheat_municao") {
     pp.BWMSApplyMagazine();
+  };
+  if BwmsCheatLigado("cheat_pulo") {
+    pp.BWMSSetMultiJump(true);
   };
   pp.BWMSCheatSchedule();
 }
@@ -281,6 +314,8 @@ private final func BWShowModsPage() -> Void {
     + this.BWOnOff(BwmsCheatLigado("cheat_municao")), n"BWModsAmmo");
   this.AddMenuItem(this.L("NPCs leave you alone: ", "NPCs te deixam em paz: ", "NPC 不再攻击你：", "NPC'ler Saldırmasın: ")
     + this.BWOnOff(BwmsCheatLigado("cheat_npc")), n"BWModsCloak");
+  this.AddMenuItem(this.L("Unlimited air jumps: ", "Pulos ilimitados no ar: ", "无限空中跳跃：", "Sınırsız Havada Zıplama: ")
+    + this.BWOnOff(BwmsCheatLigado("cheat_pulo")), n"BWModsJump");
   this.AddMenuItem(this.L("Back", "Voltar", "返回", "Geri"), n"BWModsBack");
   this.m_menuListController.Refresh();
   this.SetCursorOverWidget(inkCompoundRef.GetWidgetByIndex(this.m_menuList, 0), 0.00, true);
@@ -366,6 +401,13 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
     this.PlaySound(n"Button", n"OnPress");
     if IsDefined(pp) {
       pp.BWMSSetCloak(!BwmsCheatLigado("cheat_npc"));
+    };
+    this.BWShowModsPage(); return true;
+  };
+  if Equals(data.eventName, n"BWModsJump") {
+    this.PlaySound(n"Button", n"OnPress");
+    if IsDefined(pp) {
+      pp.BWMSSetMultiJump(!BwmsCheatLigado("cheat_pulo"));
     };
     this.BWShowModsPage(); return true;
   };
