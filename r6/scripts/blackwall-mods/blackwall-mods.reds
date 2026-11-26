@@ -4,21 +4,193 @@
 //
 // Modo Imortal le o ESTADO REAL do God Mode via GodModeSystem.HasGodMode (sem campo proprio
 // que reseta). Precedente vanilla: cyberpunk/UI/Player/healthbar.script:683.
+//
+// RAM / NPCs / Municao seguem a mesma disciplina do resto do projeto: cada um usa o mecanismo
+// que o PROPRIO jogo usa, e cada escolha aqui saiu de medicao em jogo, nao de leitura de nome.
+// O que foi descartado, com o porque, esta anotado em cada bloco — pra ninguem refazer o caminho.
 
 @addField(PauseMenuGameController) let m_bwInModsPage: Bool;
+
+// Ligado/desligado de cada cheat continuo fica na config externa (`cheat_npc`, `cheat_municao`, `cheat_ram`), como o `godmode`: fora do save e
+// fora do PlayerPuppet, que nasce de novo a cada carga. Os efeitos do NPCs vao pro save; com o estado num campo do V, a carga mostrava
+// DESLIGADO com os NPCs ainda amigos. O `BwmsAoEntrarNoJogo` religa pela config. No PlayerPuppet fica so o que e da sessao.
+@addField(PlayerPuppet) let m_bwVisMod: ref<gameStatModifierData>;
+@addField(PlayerPuppet) let m_bwMagMod: ref<gameStatModifierData>;
+@addField(PlayerPuppet) let m_bwMagWeapon: wref<WeaponObject>;
+@addField(PlayerPuppet) let m_bwTicking: Bool;
+
+public func BwmsCheatLigado(chave: String) -> Bool {
+  return Equals(BwmsConfigGet(chave), "1");
+}
+
+public func BwmsCheatGravar(chave: String, on: Bool) -> Void {
+  BwmsConfigSet(chave, on ? "1" : "0");
+}
+
+// Callback do tick. Classe dedicada em vez do despacho por nome do BwmsDelay: aquele caminho
+// depende de uma nativa do BWMS, e este nao precisa de nenhuma — so API do jogo.
+public class BwmsCheatTick extends DelayCallback {
+  public let Player: wref<PlayerPuppet>;
+  public func Call() -> Void {
+    if IsDefined(this.Player) {
+      this.Player.BWMSCheatTick();
+    };
+  }
+}
+
+// Reagenda enquanto algum cheat continuo estiver ligado. `m_bwTicking` evita dois tickers
+// vivos ao mesmo tempo se o jogador ligar RAM e Municao em seguida.
+//
+// 2 segundos, nao um: o custo aqui nao e a conta, e o `GiveItem` — cada um levanta os eventos de
+// inventario do jogo. Nem a RAM nem a reserva de municao caem rapido o bastante pra justificar
+// mais que isso.
+@addMethod(PlayerPuppet)
+public func BWMSCheatSchedule() -> Void {
+  if this.m_bwTicking { return; };
+  if !BwmsCheatLigado("cheat_ram") && !BwmsCheatLigado("cheat_municao") { return; };
+  this.m_bwTicking = true;
+  let cb: ref<BwmsCheatTick> = new BwmsCheatTick();
+  cb.Player = this;
+  GameInstance.GetDelaySystem(this.GetGame()).DelayCallback(cb, 2.00, false);
+}
+
+@addMethod(PlayerPuppet)
+public func BWMSCheatTick() -> Void {
+  this.m_bwTicking = false;
+  // RAM ilimitada: o jogo nao expoe "custo zero", o que existe e o POOL. Entao "ilimitado" aqui
+  // e o pool Memory sendo enchido de volta — que e o que o jogador percebe.
+  if BwmsCheatLigado("cheat_ram") {
+    this.BWMSFillRam();
+  };
+  // Municao: o pente grande mata a recarga, mas a RESERVA continua caindo porque e dela que a
+  // recarga puxa. Repor a reserva e a outra metade — sem ela o cheat parece nao funcionar.
+  if BwmsCheatLigado("cheat_municao") {
+    this.BWMSTopUpAmmo(t"Ammo.HandgunAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.RifleAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.ShotgunAmmo");
+    this.BWMSTopUpAmmo(t"Ammo.SniperRifleAmmo");
+    this.BWMSApplyMagazine();
+  };
+  this.BWMSCheatSchedule();
+}
+
+@addMethod(PlayerPuppet)
+public func BWMSFillRam() -> Void {
+  GameInstance.GetStatPoolsSystem(this.GetGame()).RequestSettingStatPoolValue(
+    Cast<StatsObjectID>(this.GetEntityID()), gamedataStatPoolType.Memory, 100.00, this, true);
+}
+
+// So repoe o que FALTA. Dar municao de dois em dois segundos sem olhar quanto ja existe enche a
+// tela de "ALINDI: ..." — cada GiveItem levanta a notificacao de item recebido do jogo, mesmo
+// quando a reserva ja esta cheia. Perguntar a quantidade antes custa uma chamada e cala o resto.
+@addMethod(PlayerPuppet)
+public func BWMSTopUpAmmo(ammo: TweakDBID) -> Void {
+  let ts: ref<TransactionSystem> = GameInstance.GetTransactionSystem(this.GetGame());
+  let id: ItemID = ItemID.FromTDBID(ammo);
+  // Limiar alto e reposicao grande de proposito: assim a notificacao aparece raramente, e quando
+  // aparece corresponde a municao de verdade gasta.
+  if ts.GetItemQuantity(this, id) < 100 {
+    ts.GiveItem(this, id, 500);
+  };
+}
+
+// O modificador vive na ARMA, entao trocar de arma o deixaria para tras. Remover e reaplicar a
+// cada tick e mais simples e sempre correto — mais barato que guardar identidade de arma.
+@addMethod(PlayerPuppet)
+public func BWMSApplyMagazine() -> Void {
+  this.BWMSClearMagazine();
+  let w: ref<WeaponObject> = GameObject.GetActiveWeapon(this);
+  if !IsDefined(w) { return; };
+  this.m_bwMagMod = RPGManager.CreateStatModifier(
+    gamedataStatType.MagazineCapacity, gameStatModifierType.Additive, 999.00);
+  GameInstance.GetStatsSystem(this.GetGame())
+    .AddModifier(Cast<StatsObjectID>(w.GetEntityID()), this.m_bwMagMod);
+  this.m_bwMagWeapon = w;
+}
+
+@addMethod(PlayerPuppet)
+public func BWMSClearMagazine() -> Void {
+  if IsDefined(this.m_bwMagMod) && IsDefined(this.m_bwMagWeapon) {
+    GameInstance.GetStatsSystem(this.GetGame())
+      .RemoveModifier(Cast<StatsObjectID>(this.m_bwMagWeapon.GetEntityID()), this.m_bwMagMod);
+  };
+  this.m_bwMagMod = null;
+  this.m_bwMagWeapon = null;
+}
+
+// "Os NPCs te deixam em paz". Limite honesto, porque o nome promete mais: NAO e invisibilidade —
+// os NPCs continuam ENXERGANDO; o que muda e que param de atacar.
+//
+// Estes tres records vieram de medicao em jogo. O que foi descartado, e por que:
+//   BaseStatusEffect.Cloaked  — ENTRA no jogador (HasStatusEffect responde SIM) e a percepcao
+//                               nao muda: e o efeito do lado dos NPCs (Oda/MaxTac).
+//   OpticalCamoIsActive       — aceita a escrita (0 -> 1 confirmado) e nao liga nada: e um stat
+//                               que o jogo LE, nao um que obedece.
+//
+// Ligar so aplica o efeito que ainda nao esta no V: o save traz os efeitos, e o religar da carga somaria uma pilha a cada save carregado.
+// Desligar tira a pilha inteira pelo mesmo motivo.
+@addMethod(PlayerPuppet)
+public func BWMSSetCloak(on: Bool) -> Void {
+  let game: GameInstance = this.GetGame();
+  let ses: ref<StatusEffectSystem> = GameInstance.GetStatusEffectSystem(game);
+  let ss: ref<StatsSystem> = GameInstance.GetStatsSystem(game);
+  let id: EntityID = this.GetEntityID();
+  let soid: StatsObjectID = Cast<StatsObjectID>(id);
+  let efeitos: array<TweakDBID> = [t"BaseStatusEffect.BlockTargetingPlayer", t"BaseStatusEffect.DontShootAtMe", t"BaseStatusEffect.SetFriendly"];
+  if on {
+    for e in efeitos {
+      if !ses.HasStatusEffect(id, e) {
+        ses.ApplyStatusEffect(id, e);
+      };
+    };
+    if !IsDefined(this.m_bwVisMod) {
+      this.m_bwVisMod = RPGManager.CreateStatModifier(
+        gamedataStatType.Visibility, gameStatModifierType.Additive, -1000.00);
+      ss.AddModifier(soid, this.m_bwVisMod);
+    };
+  } else {
+    for e in efeitos {
+      ses.RemoveStatusEffect(id, e, 99u);
+    };
+    // Heranca: as tentativas anteriores aplicavam `Cloaked`, que entra de verdade e vai junto pro
+    // SAVE, deixando o personagem invisivel ao carregar. Desligar tem que limpa-lo.
+    ses.RemoveStatusEffect(id, t"BaseStatusEffect.Cloaked", 99u);
+    if IsDefined(this.m_bwVisMod) {
+      ss.RemoveModifier(soid, this.m_bwVisMod);
+      this.m_bwVisMod = null;
+    };
+  };
+  BwmsCheatGravar("cheat_npc", on);
+}
 
 // Desliga o God Mode do BWMS: a fonte atual e as antigas (`BlackwallMods` do botão MODS e `Console` do terminal até a 0.1.5). O jogo grava o
 // GodModeSystem no save, então um save antigo traz essas entradas e tirar só a `BWMS` deixa o V invulnerável. A chave `godmode` da config externa
 // zera junto: o `BwmsAoEntrarNoJogo` religa por ela na carga, e o OFF de qualquer caminho tem de valer no próximo save carregado.
+//
+// Os DOIS tipos, nao so um: `Invulnerable` e "nao toma dano" e `Immortal` e "nao morre". Ligar so um deixa um buraco de semantica.
 public func BwmsGodModeDesligar(sys: ref<GodModeSystem>, id: EntityID) -> Void {
   let fontes: array<CName> = [n"BWMS", n"BlackwallMods", n"Console"];
+  let tipos: array<gameGodModeType> = [gameGodModeType.Invulnerable, gameGodModeType.Immortal];
   for fonte in fontes {
-    let voltas: Int32 = 0;
-    while voltas < 8 && sys.RemoveGodMode(id, gameGodModeType.Invulnerable, fonte) {
-      voltas += 1;
+    for tipo in tipos {
+      let voltas: Int32 = 0;
+      while voltas < 8 && sys.RemoveGodMode(id, tipo, fonte) {
+        voltas += 1;
+      };
     };
   };
   BwmsConfigSet("godmode", "0");
+}
+
+// Liga os dois tipos com a fonte `BWMS`, cada um so se ainda nao estiver (o save pode trazer a entrada e duplicar a fonte).
+public func BwmsGodModeLigar(sys: ref<GodModeSystem>, id: EntityID) -> Void {
+  if !sys.HasGodMode(id, gameGodModeType.Invulnerable) {
+    sys.AddGodMode(id, gameGodModeType.Invulnerable, n"BWMS");
+  };
+  if !sys.HasGodMode(id, gameGodModeType.Immortal) {
+    sys.AddGodMode(id, gameGodModeType.Immortal, n"BWMS");
+  };
+  BwmsConfigSet("godmode", "1");
 }
 
 // Entrada no jogo: o Rust chama isto uma vez por player de gameplay real (fim do load), com a GameInstance do próprio player. Disparador
@@ -34,14 +206,20 @@ public func BwmsAoEntrarNoJogo(game: GameInstance) -> Void {
   // duplicar a fonte.
   let cfgGod: String = BwmsConfigGet("godmode");
   if Equals(cfgGod, "1") {
-    let gms: ref<GodModeSystem> = GameInstance.GetGodModeSystem(game);
-    if !gms.HasGodMode(pp.GetEntityID(), gameGodModeType.Invulnerable) {
-      gms.AddGodMode(pp.GetEntityID(), gameGodModeType.Invulnerable, n"BWMS");
-    };
+    BwmsGodModeLigar(GameInstance.GetGodModeSystem(game), pp.GetEntityID());
   };
+  // Os cheats continuos do menu MODS voltam pela config, como o God Mode.
+  if BwmsCheatLigado("cheat_npc") {
+    pp.BWMSSetCloak(true);
+  };
+  if BwmsCheatLigado("cheat_municao") {
+    pp.BWMSApplyMagazine();
+  };
+  pp.BWMSCheatSchedule();
 }
 
 // i18n: mesma deteccao do bwms-settings-poc (idioma do jogo via /language OnScreen, default EN).
+// Turco incluido porque o menu aparecia em ingles dentro de um jogo em turco.
 @addMethod(PauseMenuGameController)
 public func BWMSLang() -> Int32 {
   let v: ref<ConfigVarListName> =
@@ -50,13 +228,15 @@ public func BWMSLang() -> Int32 {
   let code: String = NameToString(v.GetValue());
   if StrBeginsWith(code, "pt") { return 1; };
   if StrBeginsWith(code, "zh") { return 2; };
+  if StrBeginsWith(code, "tr") { return 3; };
   return 0;
 }
 @addMethod(PauseMenuGameController)
-public func L(en: String, pt: String, zh: String) -> String {
+public func L(en: String, pt: String, zh: String, tr: String) -> String {
   switch this.BWMSLang() {
     case 1: return pt;
     case 2: return zh;
+    case 3: return tr;
   };
   return en;
 }
@@ -64,7 +244,7 @@ public func L(en: String, pt: String, zh: String) -> String {
 @wrapMethod(PauseMenuGameController)
 private func PopulateMenuItemList() -> Void {
   wrappedMethod();
-  this.AddMenuItem(this.L("MODS", "MODS", "模组"), n"BWModsRoot");
+  this.AddMenuItem(this.L("MODS", "MODS", "模组", "MODLAR"), n"BWModsRoot");
   this.m_menuListController.Refresh();
 }
 
@@ -72,18 +252,36 @@ private func PopulateMenuItemList() -> Void {
 private final func BWHasGodMode() -> Bool {
   let owner: ref<GameObject> = this.GetPlayerControlledObject();
   if !IsDefined(owner) { return false; };
-  return GameInstance.GetGodModeSystem(owner.GetGame())
-    .HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable);
+  let sys: ref<GodModeSystem> = GameInstance.GetGodModeSystem(owner.GetGame());
+  return sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable)
+      || sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Immortal);
+}
+
+@addMethod(PauseMenuGameController)
+private final func BWPlayer() -> ref<PlayerPuppet> {
+  return this.GetPlayerControlledObject() as PlayerPuppet;
+}
+
+// Sufixo de estado para os itens que ligam/desligam. Mostrar o estado no proprio rotulo e o que
+// o God Mode ja fazia; sem isso, apertar um toggle nao da retorno nenhum.
+@addMethod(PauseMenuGameController)
+private final func BWOnOff(on: Bool) -> String {
+  return on ? this.L("ON", "LIGADO", "开", "AÇIK") : this.L("OFF", "DESLIGADO", "关", "KAPALI");
 }
 
 @addMethod(PauseMenuGameController)
 private final func BWShowModsPage() -> Void {
   this.Clear();
-  let g: String = this.BWHasGodMode() ? this.L("God Mode: ON", "Modo Imortal: LIGADO", "上帝模式：开") : this.L("God Mode: OFF", "Modo Imortal: DESLIGADO", "上帝模式：关");
-  this.AddMenuItem(g, n"BWModsGod");
-  this.AddMenuItem(this.L("Heal", "Curar", "治疗"), n"BWModsHeal");
-  this.AddMenuItem(this.L("+10,000 Eddies", "+10.000 Eddies", "+10,000 欧元币"), n"BWModsMoney");
-  this.AddMenuItem(this.L("Back", "Voltar", "返回"), n"BWModsBack");
+  this.AddMenuItem(this.L("God Mode: ", "Modo Imortal: ", "上帝模式：", "Tanrı Modu: ") + this.BWOnOff(this.BWHasGodMode()), n"BWModsGod");
+  this.AddMenuItem(this.L("Heal", "Curar", "治疗", "İyileştir"), n"BWModsHeal");
+  this.AddMenuItem(this.L("+10,000 Eddies", "+10.000 Eddies", "+10,000 欧元币", "+10.000 Eddie"), n"BWModsMoney");
+  this.AddMenuItem(this.L("Unlimited RAM: ", "RAM ilimitada: ", "无限内存：", "Sınırsız RAM: ")
+    + this.BWOnOff(BwmsCheatLigado("cheat_ram")), n"BWModsRam");
+  this.AddMenuItem(this.L("Unlimited ammo: ", "Municao ilimitada: ", "无限弹药：", "Sınırsız Mermi: ")
+    + this.BWOnOff(BwmsCheatLigado("cheat_municao")), n"BWModsAmmo");
+  this.AddMenuItem(this.L("NPCs leave you alone: ", "NPCs te deixam em paz: ", "NPC 不再攻击你：", "NPC'ler Saldırmasın: ")
+    + this.BWOnOff(BwmsCheatLigado("cheat_npc")), n"BWModsCloak");
+  this.AddMenuItem(this.L("Back", "Voltar", "返回", "Geri"), n"BWModsBack");
   this.m_menuListController.Refresh();
   this.SetCursorOverWidget(inkCompoundRef.GetWidgetByIndex(this.m_menuList, 0), 0.00, true);
 }
@@ -93,6 +291,7 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
   let data: ref<PauseMenuListItemData> = target.GetData() as PauseMenuListItemData;
   if !IsDefined(data) { return wrappedMethod(index, target); };
   let owner: ref<GameObject> = this.GetPlayerControlledObject();
+  let pp: ref<PlayerPuppet> = this.BWPlayer();
 
   if Equals(data.eventName, n"BWModsRoot") {
     this.PlaySound(n"Button", n"OnPress");
@@ -106,11 +305,15 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
     this.PlaySound(n"Button", n"OnPress");
     if IsDefined(owner) {
       let sys: ref<GodModeSystem> = GameInstance.GetGodModeSystem(owner.GetGame());
-      if sys.HasGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable) {
+      if this.BWHasGodMode() {
         BwmsGodModeDesligar(sys, owner.GetEntityID());
       } else {
-        sys.AddGodMode(owner.GetEntityID(), gameGodModeType.Invulnerable, n"BWMS");
-        BwmsConfigSet("godmode", "1");
+        BwmsGodModeLigar(sys, owner.GetEntityID());
+        // O God Mode nao repoe o que ja foi perdido: sem isto, ligar com pouca vida deixa o
+        // jogador ligado e quase morto, o que se parece com "nao funcionou".
+        GameInstance.GetStatPoolsSystem(owner.GetGame())
+          .RequestSettingStatPoolValue(Cast<StatsObjectID>(owner.GetEntityID()),
+                                       gamedataStatPoolType.Health, 100.00, owner, true);
       };
     };
     this.BWShowModsPage(); return true;
@@ -131,6 +334,40 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
         .GiveItem(owner, ItemID.FromTDBID(t"Items.money"), 10000);
     };
     return true;
+  };
+  if Equals(data.eventName, n"BWModsRam") {
+    this.PlaySound(n"Button", n"OnPress");
+    if IsDefined(pp) {
+      let on: Bool = !BwmsCheatLigado("cheat_ram");
+      BwmsCheatGravar("cheat_ram", on);
+      if on {
+        // Enche na hora, sem esperar o primeiro tick: o retorno tem que ser imediato.
+        pp.BWMSFillRam();
+        pp.BWMSCheatSchedule();
+      };
+    };
+    this.BWShowModsPage(); return true;
+  };
+  if Equals(data.eventName, n"BWModsAmmo") {
+    this.PlaySound(n"Button", n"OnPress");
+    if IsDefined(pp) {
+      let on: Bool = !BwmsCheatLigado("cheat_municao");
+      BwmsCheatGravar("cheat_municao", on);
+      if on {
+        pp.BWMSApplyMagazine();
+        pp.BWMSCheatSchedule();
+      } else {
+        pp.BWMSClearMagazine();
+      };
+    };
+    this.BWShowModsPage(); return true;
+  };
+  if Equals(data.eventName, n"BWModsCloak") {
+    this.PlaySound(n"Button", n"OnPress");
+    if IsDefined(pp) {
+      pp.BWMSSetCloak(!BwmsCheatLigado("cheat_npc"));
+    };
+    this.BWShowModsPage(); return true;
   };
 
   return wrappedMethod(index, target);
