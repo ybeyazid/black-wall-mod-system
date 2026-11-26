@@ -718,6 +718,14 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                         consume = true;
                     } else if efeito != Efeito::Segue {
                         consume = true;
+                    } else if !SHOW.load(Ordering::Relaxed)
+                        && crate::tempo::entrada_do_sandevistan(
+                            &format!("k{kc}"),
+                            || crate::tempo::nome_da_tecla(kc, ch),
+                            msg!(event, "isARepeat" => bool),
+                        )
+                    {
+                        consume = true;
                     } else if !SHOW.load(Ordering::Relaxed) {
                         // CallbackSystem RawInput (2026-07-18, input cru com nome real): mapeia o
                         // keycode+char pro valor REAL de EInputKey + lê os modificadores AppKit,
@@ -821,6 +829,15 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                     // Modificadores mudaram (FlagsChanged): só contam para o atalho (gravação ou atalho com Ctrl/Option/Shift/Cmd).
                     let mods = msg_usize(event, sel!("modifierFlags")) as u64;
                     if crate::terminal::atalho::evento(12, 0, mods) != crate::terminal::atalho::Efeito::Segue {
+                        consume = true;
+                    }
+                }
+                25 => {
+                    // OtherMouseDown: meio e laterais podem ser a entrada do Sandevistan (`tempo::entrada_do_sandevistan`).
+                    let b = msg_usize(event, sel!("buttonNumber"));
+                    if !SHOW.load(Ordering::Relaxed)
+                        && crate::tempo::entrada_do_sandevistan(&format!("m{b}"), || format!("Mouse {}", b + 1), false)
+                    {
                         consume = true;
                     }
                 }
@@ -2923,6 +2940,46 @@ pub fn set_engagement_active(on: bool) {
 
 extern "C" fn my_present(this: Id, cmd: Sel, drawable: Id) {
     unsafe {
+        desenhar_por_cima(this, drawable);
+        let orig = ORIG_PRESENT.load(Ordering::Relaxed);
+        if !orig.is_null() {
+            let f: extern "C" fn(Id, Sel, Id) = std::mem::transmute(orig);
+            f(this, cmd, drawable);
+        }
+    }
+}
+
+// O jogo pode entregar pelas variantes com tempo, que não passam pelo `presentDrawable:` puro: o Epic 2.5.0 em macOS 27 usa só o
+// `presentDrawable:afterMinimumDuration:` (contado no boot: 2308 entregas por ele e 0 pelo puro em 38 s), e sem este gancho o splash compunha 0
+// quadros e o terminal abria sem aparecer. O desenho é o mesmo; só o original chamado muda.
+static ORIG_PRESENT_AT_TIME: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static ORIG_PRESENT_AFTER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn my_present_at_time(this: Id, cmd: Sel, drawable: Id, quando: f64) {
+    unsafe {
+        desenhar_por_cima(this, drawable);
+        let orig = ORIG_PRESENT_AT_TIME.load(Ordering::Relaxed);
+        if !orig.is_null() {
+            let f: extern "C" fn(Id, Sel, Id, f64) = std::mem::transmute(orig);
+            f(this, cmd, drawable, quando);
+        }
+    }
+}
+
+extern "C" fn my_present_after(this: Id, cmd: Sel, drawable: Id, duracao: f64) {
+    unsafe {
+        desenhar_por_cima(this, drawable);
+        let orig = ORIG_PRESENT_AFTER.load(Ordering::Relaxed);
+        if !orig.is_null() {
+            let f: extern "C" fn(Id, Sel, Id, f64) = std::mem::transmute(orig);
+            f(this, cmd, drawable, duracao);
+        }
+    }
+}
+
+/// Tudo o que o BWMS põe no quadro, codificado em `this` (um `MTLCommandBuffer` do Metal clássico) antes de o drawable ir para a tela.
+unsafe fn desenhar_por_cima(this: Id, drawable: Id) {
+    {
         #[cfg(feature = "devtools")]
         for linha in sonda_de_pixels::comecar_quadro(this, drawable) {
             crate::veredito_dev!("{linha}");
@@ -2942,11 +2999,6 @@ extern "C" fn my_present(this: Id, cmd: Sel, drawable: Id) {
         // Mesmo hook = VR e terminal juntos, um dylib. Só compila com `--features capture`.
         #[cfg(feature = "capture")]
         crate::vr::captura::on_present(this, drawable);
-        let orig = ORIG_PRESENT.load(Ordering::Relaxed);
-        if !orig.is_null() {
-            let f: extern "C" fn(Id, Sel, Id) = std::mem::transmute(orig);
-            f(this, cmd, drawable);
-        }
     }
 }
 
@@ -2978,6 +3030,16 @@ unsafe fn install_present_hook() {
     ORIG_PRESENT.store(method_getImplementation(m) as *mut c_void, Ordering::Relaxed);
     method_setImplementation(m, my_present as Imp);
     crate::log_dev!("[overlay] presentDrawable: swizzlado em {name}");
+    for (seletor, guarda, nosso) in [
+        (sel!("presentDrawable:atTime:"), &ORIG_PRESENT_AT_TIME, my_present_at_time as Imp),
+        (sel!("presentDrawable:afterMinimumDuration:"), &ORIG_PRESENT_AFTER, my_present_after as Imp),
+    ] {
+        let m = class_getInstanceMethod(cb_class, seletor);
+        if !m.is_null() {
+            guarda.store(method_getImplementation(m) as *mut c_void, Ordering::Relaxed);
+            method_setImplementation(m, nosso);
+        }
+    }
 }
 
 pub fn start() {

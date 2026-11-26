@@ -1729,6 +1729,17 @@ pub extern "C" fn cp77_tick() {
             }
         }
     }
+    // Tecla do Sandevistan (marcada no `sendEvent:`, `tempo::entrada_do_sandevistan`): o liga/desliga roda nos scripts, com a GameInstance pela
+    // mesma receita do `BwmsAoEntrarNoJogo`. Fora do gameplay o pedido cai.
+    if crate::tempo::sandevistan_pedido() && inicio::boot::gameplay_real() {
+        if let Some(gi) = unsafe { crate::jogo::sessao::game_instance(reg, player) } {
+            let f = unsafe { crate::register::get_function(reg, "BwmsSandevistanTecla") };
+            if crate::rtti::sane(f) {
+                let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
+                let _ = unsafe { crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) };
+            }
+        }
+    }
     // FULL-BODY auto-start (2026-07-15): chama o global redscript `BwmsBootFullbody` UMA vez, ~alguns
     // segundos após entrar em gameplay (t>120 ticks). Roda AQUI = game-thread (seguro): cria+agenda os
     // pollers do full-body SEM wrapar nenhuma classe de world-load (o @wrapMethod em PlayerPuppet/HUD
