@@ -195,12 +195,12 @@ protected const func EnterCondition(const stateContext: ref<StateContext>, const
   return wrappedMethod(stateContext, scriptInterface);
 }
 
-// Sandevistan: o mundo anda na fracao `sande_escala` (0.001, 10, 25, 50 ou 75 por cento; 25 sem a chave) e o V na velocidade normal. O menu MODS
+// Sandevistan: o mundo anda na fracao `sande_escala` (5, 10, 25, 50 ou 75 por cento; 25 sem a chave; 0.001 travava o V junto) e o V na velocidade normal. O menu MODS
 // liga a tecla (`cheat_sande`); Option+Z vem pelo Rust (`tempo::tecla_de_atalho`), que chama `BwmsSandevistanTecla` na thread do
 // jogo. O Z sozinho brigava com o radio e o desmontar do inventario. Ativo ou nao e da sessao: a dilatacao do TimeSystem nao vai pro save.
 public func BwmsSandevistanEscala() -> String {
   let v: String = BwmsConfigGet("sande_escala");
-  if Equals(v, "0.001") || Equals(v, "10") || Equals(v, "25") || Equals(v, "50") || Equals(v, "75") { return v; };
+  if Equals(v, "5") || Equals(v, "10") || Equals(v, "25") || Equals(v, "50") || Equals(v, "75") { return v; };
   return "25";
 }
 
@@ -503,7 +503,7 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
   if Equals(data.eventName, n"BWModsSandeEscala") {
     this.PlaySound(n"Button", n"OnPress");
     let e: String = BwmsSandevistanEscala();
-    let prox: String = Equals(e, "0.001") ? "10" : (Equals(e, "10") ? "25" : (Equals(e, "25") ? "50" : (Equals(e, "50") ? "75" : "0.001")));
+    let prox: String = Equals(e, "5") ? "10" : (Equals(e, "10") ? "25" : (Equals(e, "25") ? "50" : (Equals(e, "50") ? "75" : "5")));
     BwmsConfigSet("sande_escala", prox);
     if IsDefined(pp) && pp.m_bwSandeAtivo {
       pp.BWMSSandevistan(true);
