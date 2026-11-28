@@ -1,9 +1,4 @@
-// bwms-ui-screenhelper.reds — reimplementação PRÓPRIA do helper de tela (catálogo Codeware #112).
-//
-// POR QUE ESTE ARQUIVO EXISTE: a versão anterior foi removida em 2026-08-22 pela auditoria de
-// originalidade (corpo copiado de framework de terceiro). A capacidade é real e desejada, então
-// ela volta REESCRITA a partir do COMPORTAMENTO — nunca da fonte alheia. Só a API pública é
-// reconhecível, porque o nome que um mod chama é a forma do plugue e não é de ninguém.
+// bwms-ui-screenhelper.reds — o helper de tela. Só a API pública é reconhecível, porque o nome que um mod chama é a forma do plugue e não é de ninguém.
 //
 // DEPENDÊNCIAS, todas confirmadas por grep em `cp77-symbols/redscript-all.reds` ANTES de escrever:
 //   - `GameInstance.GetSettingsSystem(self) -> ref<UserSettings>`      (`:14212`, native vanilla)
@@ -12,7 +7,7 @@
 //   - `StrSplit`/`StringToInt`                                          (`:535769`/`:241042`)
 // Zero native próprio, zero endereço, zero forge de classe.
 //
-// DECISÕES DE DESIGN QUE SÃO NOSSAS (e divergem de propósito de qualquer porte):
+// DECISÕES DE DESIGN:
 //   1. A resolução vira um DADO TIPADO (`BwmsScreenSize`), não uma string que cada mod parseia de
 //      novo do seu jeito. Parsear string de configuração em N lugares é onde bug de UI nasce.
 //   2. O parse é DEFENSIVO: qualquer formato inesperado devolve o fallback 1920x1080 em vez de
@@ -27,6 +22,9 @@ public struct BwmsScreenSize {
     // `false` quando a leitura falhou e os campos são o fallback — deixa o chamador decidir se
     // aceita o palpite ou se prefere não desenhar nada.
     public let IsValid: Bool;
+    // A mesma medida em `Float`, com os nomes que os mods do Windows leem do `Vector2` (`ScreenHelper.GetScreenSize(game).X`).
+    public let X: Float;
+    public let Y: Float;
 }
 
 public abstract class ScreenHelper {
@@ -59,6 +57,8 @@ public abstract class ScreenHelper {
         out.Width = 1920;
         out.Height = 1080;
         out.IsValid = false;
+        out.X = 1920.0;
+        out.Y = 1080.0;
 
         if StrLen(text) == 0 {
             return out;
@@ -75,6 +75,8 @@ public abstract class ScreenHelper {
         }
         out.Width = w;
         out.Height = h;
+        out.X = Cast<Float>(w);
+        out.Y = Cast<Float>(h);
         out.IsValid = true;
         return out;
     }
