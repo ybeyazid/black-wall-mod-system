@@ -1729,11 +1729,17 @@ pub extern "C" fn cp77_tick() {
             }
         }
     }
-    // Tecla do Sandevistan (marcada no `sendEvent:`, `tempo::tecla_do_sandevistan`): o liga/desliga roda nos scripts, com a GameInstance pela
-    // mesma receita do `BwmsAoEntrarNoJogo`. Fora do gameplay o pedido cai.
-    if crate::tempo::sandevistan_pedido() && inicio::boot::gameplay_real() {
+    // Atalhos dos cheats (marcados no `sendEvent:`, `tempo::tecla_de_atalho`): o efeito roda nos scripts, com a GameInstance pela mesma
+    // receita do `BwmsAoEntrarNoJogo`. Fora do gameplay o pedido cai.
+    for (pedido, funcao) in [
+        (crate::tempo::sandevistan_pedido(), "BwmsSandevistanTecla"),
+        (crate::tempo::isinlan_pedido(), "BwmsIsinlanTecla"),
+    ] {
+        if !pedido || !inicio::boot::gameplay_real() {
+            continue;
+        }
         if let Some(gi) = unsafe { crate::jogo::sessao::game_instance(reg, player) } {
-            let f = unsafe { crate::register::get_function(reg, "BwmsSandevistanTecla") };
+            let f = unsafe { crate::register::get_function(reg, funcao) };
             if crate::rtti::sane(f) {
                 let rf = crate::rtti::ResolvedFn { func: f, ret_type: std::ptr::null_mut(), is_static: true };
                 let _ = unsafe { crate::rtti::call_func(&rf, std::ptr::null_mut(), &[crate::rtti::Arg::Raw(gi)]) };

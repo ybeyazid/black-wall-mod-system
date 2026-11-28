@@ -719,7 +719,7 @@ extern "C" fn my_sendevent(this: Id, cmd: Sel, event: Id) {
                     } else if efeito != Efeito::Segue {
                         consume = true;
                     } else if !SHOW.load(Ordering::Relaxed)
-                        && crate::tempo::tecla_do_sandevistan(
+                        && crate::tempo::tecla_de_atalho(
                             kc,
                             atalho::modificador_seguro(msg_usize(event, sel!("modifierFlags")) as u64, atalho::OPTION),
                             msg!(event, "isARepeat" => bool),

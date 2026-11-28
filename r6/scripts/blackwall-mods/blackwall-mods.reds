@@ -11,7 +11,7 @@
 
 @addField(PauseMenuGameController) let m_bwInModsPage: Bool;
 
-// Ligado/desligado de cada cheat continuo fica na config externa (`cheat_npc`, `cheat_municao`, `cheat_ram`, `cheat_pulo`, `cheat_sande`), como o `godmode`: fora do save e
+// Ligado/desligado de cada cheat continuo fica na config externa (`cheat_npc`, `cheat_municao`, `cheat_ram`, `cheat_pulo`, `cheat_sande`, `cheat_isinlan`), como o `godmode`: fora do save e
 // fora do PlayerPuppet, que nasce de novo a cada carga. Os efeitos do NPCs vao pro save; com o estado num campo do V, a carga mostrava
 // DESLIGADO com os NPCs ainda amigos. O `BwmsAoEntrarNoJogo` religa pela config. No PlayerPuppet fica so o que e da sessao.
 @addField(PlayerPuppet) let m_bwVisMod: ref<gameStatModifierData>;
@@ -21,6 +21,7 @@
 @addField(PlayerPuppet) let m_bwPuloMod: ref<gameStatModifierData>;
 @addField(PlayerPuppet) let m_bwPuloLigado: Bool;
 @addField(PlayerPuppet) let m_bwSandeAtivo: Bool;
+@addField(PlayerPuppet) let m_bwHarita: wref<WorldMapMenuGameController>;
 
 public func BwmsCheatLigado(chave: String) -> Bool {
   return Equals(BwmsConfigGet(chave), "1");
@@ -194,20 +195,20 @@ protected const func EnterCondition(const stateContext: ref<StateContext>, const
   return wrappedMethod(stateContext, scriptInterface);
 }
 
-// Sandevistan: o mundo anda na fracao `sande_escala` (10, 25, 50 ou 75 por cento; 25 sem a chave) e o V na velocidade normal. O menu MODS
-// liga a tecla (`cheat_sande`); Option+Z vem pelo Rust (`tempo::tecla_do_sandevistan`), que chama `BwmsSandevistanTecla` na thread do
+// Sandevistan: o mundo anda na fracao `sande_escala` (0.001, 10, 25, 50 ou 75 por cento; 25 sem a chave) e o V na velocidade normal. O menu MODS
+// liga a tecla (`cheat_sande`); Option+Z vem pelo Rust (`tempo::tecla_de_atalho`), que chama `BwmsSandevistanTecla` na thread do
 // jogo. O Z sozinho brigava com o radio e o desmontar do inventario. Ativo ou nao e da sessao: a dilatacao do TimeSystem nao vai pro save.
-public func BwmsSandevistanEscala() -> Int32 {
-  let v: Int32 = StringToInt(BwmsConfigGet("sande_escala"));
-  if v == 10 || v == 25 || v == 50 || v == 75 { return v; };
-  return 25;
+public func BwmsSandevistanEscala() -> String {
+  let v: String = BwmsConfigGet("sande_escala");
+  if Equals(v, "0.001") || Equals(v, "10") || Equals(v, "25") || Equals(v, "50") || Equals(v, "75") { return v; };
+  return "25";
 }
 
 @addMethod(PlayerPuppet)
 public func BWMSSandevistan(on: Bool) -> Void {
   let ts: ref<TimeSystem> = GameInstance.GetTimeSystem(this.GetGame());
   if on {
-    ts.SetTimeDilation(n"BwmsSandevistan", Cast<Float>(BwmsSandevistanEscala()) / 100.00);
+    ts.SetTimeDilation(n"BwmsSandevistan", StringToFloat(BwmsSandevistanEscala()) / 100.00);
     ts.SetIgnoreTimeDilationOnLocalPlayerZero(true);
   } else {
     ts.UnsetTimeDilation(n"BwmsSandevistan");
@@ -220,6 +221,51 @@ public func BwmsSandevistanTecla(game: GameInstance) -> Void {
   let pp: ref<PlayerPuppet> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject() as PlayerPuppet;
   if !IsDefined(pp) || !BwmsCheatLigado("cheat_sande") { return; };
   pp.BWMSSandevistan(!pp.m_bwSandeAtivo);
+}
+
+// Teleporte: com o mapa aberto, Option+X leva o V ao marcador sob o cursor (o seu, de missao, de viagem rapida). O mapa se anota no V ao
+// abrir, pra `BwmsIsinlanTecla` (chamada pelo Rust, `tempo::tecla_de_atalho`) achar o `selectedMappin`. Um teleporte so deixava o V cair: o
+// chao do destino ainda nao estava carregado. O `BwmsIsinlanTutucu` repete o teleporte a cada 0,1 s por 6 s de jogo, ate o mundo dali
+// carregar. O primeiro tambem vai pelo DelaySystem, que para com o menu aberto: teleportar com o mapa aberto deixava a cena 3D do mapa na
+// tela depois de fechar (preto com nuvens, ate abrir e fechar o ESC). A posicao vai em `isinlan_son` na config.
+@wrapMethod(WorldMapMenuGameController)
+protected cb func OnInitialize() -> Bool {
+  let r: Bool = wrappedMethod();
+  let pp: ref<PlayerPuppet> = this.GetPlayerControlledObject() as PlayerPuppet;
+  if IsDefined(pp) { pp.m_bwHarita = this; };
+  return r;
+}
+
+public class BwmsIsinlanTutucu extends DelayCallback {
+  public let Player: wref<PlayerPuppet>;
+  public let Hedef: Vector4;
+  public let Kalan: Int32;
+  public func Call() -> Void {
+    let pp: ref<PlayerPuppet> = this.Player;
+    if !IsDefined(pp) { return; };
+    GameInstance.GetTeleportationFacility(pp.GetGame()).Teleport(pp, this.Hedef, pp.GetWorldOrientation().ToEulerAngles());
+    this.Kalan -= 1;
+    if this.Kalan > 0 {
+      GameInstance.GetDelaySystem(pp.GetGame()).DelayCallback(this, 0.10, false);
+    };
+  }
+}
+
+public func BwmsIsinlanTecla(game: GameInstance) -> Void {
+  let pp: ref<PlayerPuppet> = GameInstance.GetPlayerSystem(game).GetLocalPlayerControlledGameObject() as PlayerPuppet;
+  if !IsDefined(pp) || !BwmsCheatLigado("cheat_isinlan") { return; };
+  let harita: ref<WorldMapMenuGameController> = pp.m_bwHarita;
+  if !IsDefined(harita) || !IsDefined(harita.selectedMappin) { return; };
+  let m: wref<IMappin> = harita.selectedMappin.GetMappin();
+  if !IsDefined(m) { return; };
+  let pos: Vector4 = m.GetWorldPosition();
+  BwmsConfigSet("isinlan_son", FloatToString(pos.X) + " " + FloatToString(pos.Y) + " " + FloatToString(pos.Z));
+  pos.Z += 1.00;
+  let t: ref<BwmsIsinlanTutucu> = new BwmsIsinlanTutucu();
+  t.Player = pp;
+  t.Hedef = pos;
+  t.Kalan = 60;
+  GameInstance.GetDelaySystem(game).DelayCallback(t, 0.30, false);
 }
 
 // Desliga o God Mode do BWMS: a fonte atual e as antigas (`BlackwallMods` do botão MODS e `Console` do terminal até a 0.1.5). O jogo grava o
@@ -349,7 +395,9 @@ private final func BWShowModsPage() -> Void {
     + this.BWOnOff(BwmsCheatLigado("cheat_pulo")), n"BWModsJump");
   this.AddMenuItem("Sandevistan (Option + Z): " + this.BWOnOff(BwmsCheatLigado("cheat_sande")), n"BWModsSande");
   this.AddMenuItem(this.L("Sandevistan world speed: ", "Velocidade do mundo no Sandevistan: ", "斯安威斯坦世界速度：", "Sandevistan dünya hızı: ")
-    + "%" + IntToString(BwmsSandevistanEscala()), n"BWModsSandeEscala");
+    + "%" + BwmsSandevistanEscala(), n"BWModsSandeEscala");
+  this.AddMenuItem(this.L("Map teleport (Option + X): ", "Teleporte no mapa (Option + X): ", "地图传送（Option + X）：", "Haritada ışınlanma (Option + X): ")
+    + this.BWOnOff(BwmsCheatLigado("cheat_isinlan")), n"BWModsIsinlan");
   this.AddMenuItem(this.L("Back", "Voltar", "返回", "Geri"), n"BWModsBack");
   this.m_menuListController.Refresh();
   this.SetCursorOverWidget(inkCompoundRef.GetWidgetByIndex(this.m_menuList, 0), 0.00, true);
@@ -447,11 +495,16 @@ protected cb func OnMenuItemActivated(index: Int32, target: ref<ListItemControll
     };
     this.BWShowModsPage(); return true;
   };
+  if Equals(data.eventName, n"BWModsIsinlan") {
+    this.PlaySound(n"Button", n"OnPress");
+    BwmsCheatGravar("cheat_isinlan", !BwmsCheatLigado("cheat_isinlan"));
+    this.BWShowModsPage(); return true;
+  };
   if Equals(data.eventName, n"BWModsSandeEscala") {
     this.PlaySound(n"Button", n"OnPress");
-    let e: Int32 = BwmsSandevistanEscala();
-    let prox: Int32 = e == 10 ? 25 : (e == 25 ? 50 : (e == 50 ? 75 : 10));
-    BwmsConfigSet("sande_escala", IntToString(prox));
+    let e: String = BwmsSandevistanEscala();
+    let prox: String = Equals(e, "0.001") ? "10" : (Equals(e, "10") ? "25" : (Equals(e, "25") ? "50" : (Equals(e, "50") ? "75" : "0.001")));
+    BwmsConfigSet("sande_escala", prox);
     if IsDefined(pp) && pp.m_bwSandeAtivo {
       pp.BWMSSandevistan(true);
     };

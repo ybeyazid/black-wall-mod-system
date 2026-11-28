@@ -8,25 +8,37 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::register::*;
 
-/// Sandevistan do menu MODS: Option+Z, só com `cheat_sande` ligado; o Z sozinho segue pro jogo (rádio, desmontar no inventário). Tecla
-/// gravada pelo menu e botão do mouse foram tentados e saíram: o botão do meio e os laterais não chegam ao `sendEvent:` com o mouse preso
-/// na câmera. O `sendEvent:` roda na thread do AppKit e só marca o pedido; o `cp77_tick` o consome na thread do jogo e chama o
-/// `BwmsSandevistanTecla(game)` dos scripts. Devolve se a tecla é a do Sandevistan, pra ela não seguir pro jogo.
+/// Atalhos dos cheats do menu MODS, com Option: Option+Z é o Sandevistan (`cheat_sande`), Option+X o teleporte pro marcador do mapa
+/// (`cheat_isinlan`). Só com o cheat ligado; a tecla sozinha segue pro jogo (Z é rádio e desmontar no inventário). Tecla gravada pelo menu e
+/// botão do mouse foram tentados e saíram: o botão do meio e os laterais não chegam ao `sendEvent:` com o mouse preso na câmera. O
+/// `sendEvent:` roda na thread do AppKit e só marca o pedido; o `cp77_tick` o consome na thread do jogo e chama a função dos scripts
+/// (`BwmsSandevistanTecla` ou `BwmsIsinlanTecla`). Devolve se a tecla é de um atalho, pra ela não seguir pro jogo.
 static SANDEVISTAN_PEDIDO: AtomicBool = AtomicBool::new(false);
+static ISINLAN_PEDIDO: AtomicBool = AtomicBool::new(false);
 const TECLA_Z: u16 = 6;
+const TECLA_X: u16 = 7;
 
-pub(crate) fn tecla_do_sandevistan(kc: u16, option: bool, repeticao: bool) -> bool {
-    if kc != TECLA_Z || !option || crate::configuracao::modconfig_get("cheat_sande") != "1" {
+pub(crate) fn tecla_de_atalho(kc: u16, option: bool, repeticao: bool) -> bool {
+    let (chave, pedido) = match kc {
+        TECLA_Z => ("cheat_sande", &SANDEVISTAN_PEDIDO),
+        TECLA_X => ("cheat_isinlan", &ISINLAN_PEDIDO),
+        _ => return false,
+    };
+    if !option || crate::configuracao::modconfig_get(chave) != "1" {
         return false;
     }
     if !repeticao {
-        SANDEVISTAN_PEDIDO.store(true, Ordering::Relaxed);
+        pedido.store(true, Ordering::Relaxed);
     }
     true
 }
 
 pub(crate) fn sandevistan_pedido() -> bool {
     SANDEVISTAN_PEDIDO.swap(false, Ordering::Relaxed)
+}
+
+pub(crate) fn isinlan_pedido() -> bool {
+    ISINLAN_PEDIDO.swap(false, Ordering::Relaxed)
 }
 
 /// Cadência por contagem: verdadeiro na volta 0 e a cada `periodo` voltas depois. `periodo` 0 entra em pânico, como o `%`.
